@@ -11,17 +11,26 @@
 #include "target_halt.h"
 #include "iap.h"
 #include "usb_msc.h"
+#include "led.h"
 
 #include <cstdio>
 
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 
+extern "C" void usb_stdio_init(void);
+extern "C" bool usb_stdio_connected(void);
+
 int main() {
     stdio_init_all();
+    led::init();
+    usb_stdio_init();
 
     // Bis zu 6 s auf USB-Host warten, damit erste Konsolenausgaben sichtbar sind.
-    for (int i = 0; i < 60 && !stdio_usb_connected(); ++i) sleep_ms(100);
+    for (int i = 0; i < 60 && !usb_stdio_connected(); ++i) {
+        sleep_ms(100);
+        led::poll();
+    }
 
     setup_fault_handlers();
     storage::init();

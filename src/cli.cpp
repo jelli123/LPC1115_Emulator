@@ -8,6 +8,7 @@
 #include "gdb_stub.h"
 #include "swd_target.h"
 #include "usb_msc.h"
+#include "led.h"
 
 #include <cstdio>
 #include <cstring>
@@ -250,6 +251,7 @@ void run() {
     std::size_t len = 0;
     std::printf("> ");
     while (true) {
+        led::poll();
         gdb_stub::poll();
         swd_target::poll();
         if (usb_msc::consume_pending_boot_request()) {

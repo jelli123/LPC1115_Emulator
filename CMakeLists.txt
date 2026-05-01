@@ -70,6 +70,8 @@ add_executable(emulator
     src/target_halt.cpp
     src/iap.cpp
     src/usb_msc.cpp
+    src/usb_stdio.cpp
+    src/led.cpp
 )
 
 target_include_directories(emulator PRIVATE src)
@@ -111,8 +113,11 @@ target_link_libraries(emulator PRIVATE
     tinyusb_board
 )
 
-# stdio über USB-CDC; UART-stdio abschalten (UART-Pins gehören dem Emulator-Mapping).
-pico_enable_stdio_usb(emulator 1)
+# stdio läuft über unseren eigenen TinyUSB-CDC-Bridge (src/usb_stdio.cpp);
+# pico_stdio_usb wird bewusst NICHT verwendet, da es eine eigene
+# tusb_config.h mitbringen würde, die mit unseren 2×CDC + MSC-Descriptoren
+# kollidiert. UART-stdio bleibt aus.
+pico_enable_stdio_usb(emulator 0)
 pico_enable_stdio_uart(emulator 0)
 
 pico_add_extra_outputs(emulator)
