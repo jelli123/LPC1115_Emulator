@@ -46,6 +46,8 @@ const struct pio_program edge_capture_program = {
     .instructions = edge_capture_program_instructions,
     .length       = 5,
     .origin       = -1,
+    .pio_version  = 0,
+    .used_gpio_ranges = 0,
 };
 
 constexpr unsigned MAX_HANDLES = 4;

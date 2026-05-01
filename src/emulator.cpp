@@ -22,7 +22,7 @@ std::atomic<bool>            g_request_stop{false};
 std::atomic<uint32_t>        g_pc{0};
 
 alignas(32) uint8_t g_guest_ram[emulator::LPC_GUEST_RAM_SIZE]
-    __attribute__((section(".guest_ram"))) = {};
+    __attribute__((used, section(".guest_ram"))) = {};
 
 // Externe Symbole der Fault-Handler — die linken weak im SDK; wir adressieren
 // sie hier, um die Firmware-Vector-Table darauf zu patchen.
@@ -35,7 +35,7 @@ extern "C" void isr_usagefault();
 // und springt mit BX in den Reset-Handler. Kehrt nie zurück (Gast läuft
 // in Endlos-Loop wie eine echte MCU).
 __attribute__((naked, noreturn))
-void enter_guest(uint32_t initial_sp, uint32_t reset_handler) {
+void enter_guest(uint32_t /*initial_sp*/, uint32_t /*reset_handler*/) {
     __asm volatile (
         "msr   psp, r0             \n"   // PSP = initial_sp
         "mov   r2, #3              \n"   // CONTROL.SPSEL=1, nPRIV=1

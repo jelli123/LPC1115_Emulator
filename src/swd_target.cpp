@@ -45,6 +45,8 @@ const struct pio_program swd_rx_program = {
     .instructions = swd_rx_instructions,
     .length       = 3,
     .origin       = -1,
+    .pio_version  = 0,
+    .used_gpio_ranges = 0,
 };
 
 // =============================================================================
@@ -66,6 +68,8 @@ const struct pio_program swd_tx_program = {
     .instructions = swd_tx_instructions,
     .length       = 3,
     .origin       = -1,
+    .pio_version  = 0,
+    .used_gpio_ranges = 0,
 };
 
 // =============================================================================

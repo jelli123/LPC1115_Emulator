@@ -7,6 +7,7 @@
 #include "pico/stdlib.h"
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>

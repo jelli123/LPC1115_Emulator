@@ -256,7 +256,7 @@ void handle_packet(const char* p, size_t n) {
         }
         case 'q': {
             if (n >= 10 && std::memcmp(p, "qSupported", 10) == 0) {
-                std::snprintf(rsp, sizeof rsp, "PacketSize=%x;swbreak+", MAX_PKT);
+                std::snprintf(rsp, sizeof rsp, "PacketSize=%lx;swbreak+", static_cast<unsigned long>(MAX_PKT));
                 put_str(rsp);
             } else if (n >= 9 && std::memcmp(p, "qAttached", 9) == 0) {
                 put_str("1");

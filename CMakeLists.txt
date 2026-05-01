@@ -84,11 +84,13 @@ target_compile_definitions(emulator PRIVATE
 # strikt. -Wpedantic global wirkt sonst auch in TinyUSB-Headern.
 target_compile_options(emulator PRIVATE
     -Wall -Wextra
-    -Wshadow -Wnon-virtual-dtor
+    -Wshadow
     -Wnull-dereference -Wdouble-promotion -Wformat=2
-    -fno-exceptions -fno-rtti
     -ffunction-sections -fdata-sections
     $<$<CONFIG:Release>:-O2>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
 )
 
 target_link_libraries(emulator PRIVATE
