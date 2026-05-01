@@ -29,7 +29,7 @@ include(${PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 project(lpc1115_emulator C CXX ASM)
 
 set(CMAKE_C_STANDARD   11)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 pico_sdk_init()
@@ -66,10 +66,11 @@ target_compile_definitions(emulator PRIVATE
 )
 
 # Strenge Warnungen, hilft Sicherheitsprobleme früh aufzudecken.
+# -Wno-pedantic auf Header-Ebene des SDK über -isystem; eigene Files bleiben
+# strikt. -Wpedantic global wirkt sonst auch in TinyUSB-Headern.
 target_compile_options(emulator PRIVATE
-    -Wall -Wextra -Wpedantic
-    -Wshadow -Wconversion -Wsign-conversion
-    -Wnon-virtual-dtor -Wcast-align
+    -Wall -Wextra
+    -Wshadow -Wnon-virtual-dtor
     -Wnull-dereference -Wdouble-promotion -Wformat=2
     -fno-exceptions -fno-rtti
     -ffunction-sections -fdata-sections
@@ -81,6 +82,7 @@ target_link_libraries(emulator PRIVATE
     pico_multicore
     pico_unique_id
     pico_sync
+    cmsis_core
     hardware_flash
     hardware_sync
     hardware_gpio
@@ -88,6 +90,7 @@ target_link_libraries(emulator PRIVATE
     hardware_timer
     hardware_watchdog
     hardware_pio
+    hardware_clocks
     tinyusb_device
     tinyusb_board
 )

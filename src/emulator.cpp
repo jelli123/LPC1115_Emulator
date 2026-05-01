@@ -13,7 +13,7 @@
 #include "pico/multicore.h"
 #include "pico/time.h"
 #include "hardware/sync.h"
-#include "RP2350.h"
+#include "RP2350.h"   // CMSIS, via cmsis_core lib
 
 namespace {
 

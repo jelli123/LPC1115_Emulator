@@ -16,6 +16,24 @@
 #include "hardware/structs/scb.h"
 #include "pico/stdlib.h"
 
+// Pico-SDK 2.x definiert in addressmap.h Makros wie WDT_BASE, ADC_BASE,
+// I2C_BASE, … für RP2350. Wir modellieren hier LPC1115-Adressen und
+// brauchen die RP2350-Adressen nicht — Makros wegnehmen.
+#undef  WDT_BASE
+#undef  ADC_BASE
+#undef  I2C_BASE
+#undef  PMU_BASE
+#undef  SSP0_BASE
+#undef  SSP1_BASE
+#undef  UART0_BASE
+#undef  UART_BASE
+#undef  IOCON_BASE
+#undef  GPIO_BASE
+#undef  SYSCON_BASE
+
+// Forward-Declaration für die WDT-Bridge nach emulator::request_guest_reset().
+extern "C" void peripherals_wdt_reset_guest();
+
 // LPC1115 Peripheral-Adressen (Auswahl).
 // SYSCON Block bei 0x40048000.
 namespace {
@@ -133,9 +151,9 @@ constexpr uint8_t lpc_pin_idx(uint8_t port, uint8_t pin) {
     return static_cast<uint8_t>(port * 12u + pin);
 }
 
-void gpio_apply_port(uint8_t port, uint32_t old_data, uint32_t new_data, uint32_t dir) {
-    uint32_t changed = (old_data ^ new_data) | (~0u);  // beim ersten Mal alle ausgeben
-    (void)changed;
+void apply_gpio_to_hw(uint8_t lpc_pin, bool out, bool level);
+
+void gpio_apply_port(uint8_t port, uint32_t /*old_data*/, uint32_t new_data, uint32_t dir) {
     for (uint8_t pin = 0; pin < 12; ++pin) {
         bool out = (dir >> pin) & 1u;
         bool lvl = (new_data >> pin) & 1u;
@@ -484,8 +502,7 @@ void wdt_advance() {
         g_wdt.tv = 0;
         g_wdt.mod |= 0x4u;       // WDTOF (timeout)
         if (g_wdt.mod & 0x2u) {  // WDRESET → Guest neustarten
-            extern "C" void peripherals_wdt_reset_guest();
-            peripherals_wdt_reset_guest();
+            ::peripherals_wdt_reset_guest();
         } else {
             g_wdt.mod |= 0x8u;   // WDINT, IRQ
             irq_inject::pend(lpc_irq::WWDT);
@@ -756,13 +773,13 @@ extern "C" void peripherals_lowpower_idle() {
         // Tief: Clocks heruntersetzen, dann WFI auf Host-Seite.
         clocks_hw->sleep_en0 = 0;
         clocks_hw->sleep_en1 = 0;
-        scb_hw->scr |= M0PLUS_SCR_SLEEPDEEP_BITS;
-        __wfi();
-        scb_hw->scr &= ~M0PLUS_SCR_SLEEPDEEP_BITS;
+        scb_hw->scr |= M33_SCR_SLEEPDEEP_BITS;
+        __asm volatile ("wfi");
+        scb_hw->scr &= ~M33_SCR_SLEEPDEEP_BITS;
         clocks_hw->sleep_en0 = ~0u;
         clocks_hw->sleep_en1 = ~0u;
     } else {
-        __wfi();
+        __asm volatile ("wfi");
     }
 }
 

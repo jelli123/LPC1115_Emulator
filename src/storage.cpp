@@ -262,7 +262,7 @@ bool firmware_write(std::size_t offset, const void* data, std::size_t len) {
     // Auf 256-Byte-Pages aufrunden, mit 0xFF füllen.
     std::size_t padded = ((len + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE)
                          * FLASH_PAGE_SIZE;
-    static alignas(4) uint8_t page[FLASH_PAGE_SIZE * 8];
+    alignas(4) static uint8_t page[FLASH_PAGE_SIZE * 8];
     if (padded > sizeof page) return false;
     std::memset(page, 0xFF, padded);
     std::memcpy(page, data, len);
