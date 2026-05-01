@@ -85,7 +85,7 @@ target_compile_definitions(emulator PRIVATE
 target_compile_options(emulator PRIVATE
     -Wall -Wextra
     -Wshadow
-    -Wnull-dereference -Wdouble-promotion -Wformat=2
+    -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wno-format-nonliteral
     -ffunction-sections -fdata-sections
     $<$<CONFIG:Release>:-O2>
     $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>
