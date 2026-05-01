@@ -3,7 +3,7 @@
 // USB-Mass-Storage-Class auf einem RAM/Flash-Backed FAT12-Volume.
 //
 // Layout:
-//   * LUN 0, 512-Byte-Sektoren, 256 Sektoren = 128 KiB.
+//   * LUN 0, 512-Byte-Sektoren, 512 Sektoren = 256 KiB.
 //   * FAT12 mit 1 FAT-Kopie, 1 reserviertem Sektor, 16 Root-Directory-
 //     Einträgen.
 //   * Daten persistieren in der Storage-Schicht (eigener Slot am Ende
@@ -25,7 +25,7 @@
 namespace usb_msc {
 
 constexpr uint32_t SECTOR_SIZE   = 512;
-constexpr uint32_t SECTOR_COUNT  = 256;          // 128 KiB Volume
+constexpr uint32_t SECTOR_COUNT  = 512;          // 256 KiB Volume (>= 64-KB-Hex)
 constexpr uint32_t VOLUME_BYTES  = SECTOR_SIZE * SECTOR_COUNT;
 
 // Beim Boot aus Storage-Slot laden (oder Default-FS erzeugen, falls leer).

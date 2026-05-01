@@ -36,7 +36,7 @@ Eine Pico-2- oder Pico-2-W-Platine genügt.
    * **CDC#0** – CLI (z. B. `COM7` / `/dev/ttyACM0`).
    * **CDC#1** – GDB-Remote-Stub (z. B. `COM8` / `/dev/ttyACM1`).
 4. Außerdem erscheint ein **Wechseldatenträger** namens `LPC1115EMU`
-   (FAT12, 128 KiB).
+   (FAT12, 256 KiB).
 5. Mit Terminal an CDC#0 verbinden (115200 8N1, Line-Ending CRLF).
 
 Es erscheint:
@@ -105,7 +105,7 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 ### Variante A: USB-Wechseldatenträger (empfohlen, kein CLI nötig)
 
 Der Emulator stellt sich auch als **USB-Mass-Storage-Volume** dar
-(LUN0, FAT12, 128 KiB, Label `LPC1115EMU`).
+(LUN0, FAT12, 256 KiB, Label `LPC1115EMU`).
 
 1. RP2350 anstecken → Volume erscheint im Datei-Manager / Finder.
 2. Datei `BOOT.HEX` (Intel-HEX, max. 64 KiB) hineinkopieren.

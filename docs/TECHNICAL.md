@@ -359,7 +359,7 @@ RX-Sampling-Latenz und den Trn-Pfad bestimmt; konservativ
 ## 16. USB-Mass-Storage-Boot
 
 [src/usb_msc.cpp](../src/usb_msc.cpp) stellt eine virtuelle FAT12-
-Diskette über TinyUSB-MSC bereit (LUN 0, 128 KiB). Der Host sieht
+Diskette über TinyUSB-MSC bereit (LUN 0, 256 KiB). Der Host sieht
 das Volume `LPC1115EMU`. Beim **Eject** (`SCSI START_STOP_UNIT
 load_eject=1, start=0`) parst der Emulator:
 
