@@ -10,6 +10,7 @@
 #include "swd_target.h"
 #include "target_halt.h"
 #include "iap.h"
+#include "usb_msc.h"
 
 #include <cstdio>
 
@@ -32,6 +33,7 @@ int main() {
     swd_target::init();
     target_halt::init();
     iap::init();
+    usb_msc::init();
     emulator::boot_core1();
 
     cli::init();

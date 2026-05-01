@@ -35,7 +35,9 @@ Eine Pico-2- oder Pico-2-W-Platine genügt.
 3. Zwei serielle Ports erscheinen:
    * **CDC#0** – CLI (z. B. `COM7` / `/dev/ttyACM0`).
    * **CDC#1** – GDB-Remote-Stub (z. B. `COM8` / `/dev/ttyACM1`).
-4. Mit Terminal an CDC#0 verbinden (115200 8N1, Line-Ending CRLF).
+4. Außerdem erscheint ein **Wechseldatenträger** namens `LPC1115EMU`
+   (FAT12, 128 KiB).
+5. Mit Terminal an CDC#0 verbinden (115200 8N1, Line-Ending CRLF).
 
 Es erscheint:
 
@@ -100,7 +102,38 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 
 ## 4. Firmware aufspielen
 
-### Variante A: Intel-HEX über CLI
+### Variante A: USB-Wechseldatenträger (empfohlen, kein CLI nötig)
+
+Der Emulator stellt sich auch als **USB-Mass-Storage-Volume** dar
+(LUN0, FAT12, 128 KiB, Label `LPC1115EMU`).
+
+1. RP2350 anstecken → Volume erscheint im Datei-Manager / Finder.
+2. Datei `BOOT.HEX` (Intel-HEX, max. 64 KiB) hineinkopieren.
+3. Optional: Datei `CONFIG.INI` mit Pinmap und Optionen hineinkopieren.
+4. **Volume auswerfen** ("sicheres Entfernen" / "Eject"). Beim Eject:
+   * `CONFIG.INI` wird geparst (siehe unten),
+   * `BOOT.HEX` wird in den Firmware-Slot geschrieben,
+   * `autostart on` ist Default → Guest läuft sofort weiter
+     (kein CLI-Eingriff nötig).
+
+`CONFIG.INI` Format (UTF-8, eine Direktive pro Zeile):
+
+```
+# Kommentare beginnen mit # oder ;
+autostart=on            # nach Reset automatisch starten
+freq_hz=48000000        # Wunsch-Coreclock (PLL-Soll)
+
+# Pinmap: pin.<port>_<pin>=<rp2350-gpio>
+pin.0_3=14
+pin.1_8=17              # KNX-RX -> uart0-RX
+pin.1_9=16              # KNX-TX -> uart0-TX
+pin.2_0=25              # Status-LED
+```
+
+> Wenn `BOOT.HEX` und `autostart=on` gesetzt sind, läuft der Emulator
+> nach jedem Power-Cycle **vollständig autonom** ohne USB-Konsole.
+
+### Variante B: Intel-HEX über CLI
 
 ```
 emu> upload
@@ -114,7 +147,7 @@ emu> run
 
 In *PuTTY*/*Tera Term*: „Send file" → Datei `.hex` wählen, Protocol: **plain**.
 
-### Variante B: GDB-Load über CDC#1
+### Variante C: GDB-Load über CDC#1
 
 ```
 arm-none-eabi-gdb fw.elf

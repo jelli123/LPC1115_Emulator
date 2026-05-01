@@ -143,16 +143,18 @@ IRQ-Tabelle: [src/lpc_irqs.h](../src/lpc_irqs.h) (UM10398 Tab. 51).
 | Block           | Status | Hinweise                                      |
 |-----------------|--------|-----------------------------------------------|
 | SYSCON / PLL    | ✅     | `MSEL`-Schreiben → `set_sys_clock_khz()`      |
-| GPIO0..GPIO3    | ✅     | echte RP-GPIOs via `pin_map`                  |
+| GPIO0..GPIO3    | ✅     | echte RP-GPIOs via `pin_map`, masked DATA     |
 | IOCON           | ✅     | RAM-Schatten, kein Effekt (RP-Pinmux ist los) |
 | UART0 (16550)   | ✅     | Backend = RP2350 `uart0`                      |
 | CT16B0/B1       | ✅     | Match-IRQ-Injection                           |
 | CT32B0/B1       | ✅     | Match-IRQ-Injection                           |
 | SysTick         | ✅     | echt (Cortex-M33-PPB)                         |
-| WDT             | ⚠️     | Schatten, kein Reset                          |
-| ADC             | ❌     | offen                                         |
-| SSP0/SSP1, I²C  | ❌     | offen                                         |
-| PMU / Power-Down| ❌     | offen                                         |
+| WDT (WWDT)      | ✅     | echtes Timeout, **soft-reset nur des Guests** |
+| ADC             | ✅     | sofortige Wandlung, deterministisches Sample  |
+| SSP0/SSP1       | ✅     | Loopback-Modell (RX=TX)                       |
+| I²C0            | ✅     | Stub (NAK auf Adress-Send) — ohne externen Slave |
+| PMU/PCON        | ✅     | siehe [§13 Energiemanagement](#13-energiemanagement) |
+| RTC             | ❌     | LPC1115 hat keinen RTC-Block (entfällt)       |
 
 PLL-Modell: `F_OUT = F_CLKIN × (M+1)`, gültig 156-320 MHz CCO.
 Re-Targeting wird in einem **Post-Hook** nach dem letzten Byte des
@@ -261,7 +263,115 @@ docs/
 ## 12. Bewusste Auslassungen
 
 * **Multi-Drop-SWD**, **JTAG**, **SWD-Dormant-State**, banked APs.
-* **ADC, SSP, I²C, RTC, PMU-Power-Down**.
-* **WDT-Reset** (Watchdog ist Schatten).
-* **Voll-PIO-SWD-TX** über die ~2-MHz-Grenze hinaus.
+* RTC (auf der LPC1115 nicht vorhanden).
+* I²C als reiner Stub (NAK ohne externen Slave).
+* SSP nur als Loopback (kein echtes RP-SPI-Backend).
 * **LittleFS** für Storage – aktuell ist nur einfaches Round-Robin-WL.
+
+---
+
+## 13. Energiemanagement
+
+LPC1115 → RP2350-Mapping, soweit das RP2350 vergleichbare Modi anbietet:
+
+| LPC-Modus               | LPC-Trigger                       | RP2350-Mapping                                    |
+|-------------------------|-----------------------------------|---------------------------------------------------|
+| Sleep                   | `WFI` mit `SCR.SLEEPDEEP=0`       | RP2350 Core 1 schläft bis IRQ (echt)              |
+| Deep-Sleep              | `WFI` mit `SCR.SLEEPDEEP=1`       | echtes RP2350 Deep-Sleep (Clocks gedrosselt)      |
+| Power-Down              | `PMU.PCON.PM=2` + WFI             | `clocks_hw->sleep_en{0,1}=0` + Deep-Sleep         |
+| Deep-Power-Down         | `PMU.PCON.PM=3` + WFI             | nicht 1:1 möglich (RP2350 Dormant würde USB+CLI killen) — ignoriert |
+| Wake-Up Quellen         | NVIC, BOD, WAKEUP-Pins            | jeder Cortex-M33-NVIC-IRQ + alle GPIO-Wake-Pins   |
+| BOD (Brown-Out-Detect)  | LPC SYSCON BOD-Block              | nicht modelliert (RP2350 hat eigenen Mechanismus) |
+
+Konkret:
+
+* `WFI` des Guests blockiert Core 1 nativ — RP2350 schaltet die
+  betroffenen Subsysteme automatisch ab. Ein Guest, der den
+  Energiesparmodus erwartet, profitiert davon **direkt**.
+* PCON-PM-Schatten ([src/peripherals.cpp](../src/peripherals.cpp)
+  `g_pmu`) wird gelesen/geschrieben. PM=2 (Power-Down) führt
+  beim nächsten Idle-Punkt zu `clocks_hw->sleep_en* = 0`,
+  `SCR.SLEEPDEEP=1`, `__wfi()`.
+* Deep-Power-Down (PM=3) wird absichtlich nicht in RP2350-Dormant
+  übersetzt, weil dann USB/CLI/SWD ebenfalls anhalten und der
+  Emulator die Verbindung zum Host verliert. Stattdessen wird der
+  Modus wie Power-Down behandelt.
+* SYSCON-PDRUNCFG wird als RAM-Schatten geführt; einzelne Power-
+  Domain-Bits werden im RP2350 nicht abgebildet.
+
+**Ergebnis**: Der Energieverbrauch des Emulators folgt grob dem
+Verhalten des Guests — wenn der Guest schläft, schläft auch das
+RP2350. Absoluter Verbrauch liegt naturgemäß über dem einer echten
+LPC1115, weil USB-CDC + Core 0 + SWD-Polling weiterlaufen.
+
+---
+
+## 14. WDT — echter Reset (nur Guest)
+
+[src/peripherals.cpp](../src/peripherals.cpp) `WdtModel` führt einen
+realen 24-Bit-Counter (`WDT_TC`/`WDT_TV`) mit der WDT-Clock-Frequenz
+(default ≈ 500 kHz). Bei jedem MMIO-Zugriff auf den WDT-Block wird
+`wdt_advance()` aufgerufen und der Zähler entsprechend der seither
+verstrichenen Zeit dekrementiert.
+
+Bei Ablauf:
+
+* `WDT_MOD.WDRESET=1` → `peripherals_wdt_reset_guest()` →
+  [src/emulator.cpp](../src/emulator.cpp) `request_guest_reset()`:
+  Core 1 wird via `multicore_reset_core1()` zurückgesetzt, MPU
+  reinitialisiert, das Image neu in RAM kopiert, Reset-Vector
+  ausgeführt. **Der RP2350 selbst bleibt aktiv** — USB/CLI/SWD
+  laufen weiter.
+* `WDT_MOD.WDRESET=0` → IRQ `WWDT` wird gepended.
+
+Feed-Sequenz `0xAA, 0x55` auf `WDT_FEED` lädt den Counter neu.
+
+---
+
+## 15. Voll-PIO-SWD-TX
+
+[src/swd_target.cpp](../src/swd_target.cpp) belegt **zwei** PIO-State-
+Machines am gleichen PIO-Block:
+
+| SM   | Programm                                          | Zweck                            |
+|------|---------------------------------------------------|----------------------------------|
+| RX   | `wait 1 pin1 / in pins,1 / wait 0 pin1`           | SWDIO sampling auf SWCLK rising  |
+| TX   | `wait 0 pin1 / out pins,1 / wait 1 pin1`          | SWDIO drive  auf SWCLK falling   |
+
+Der TX-SM ist permanent geladen; vor jedem Burst wird:
+
+1. PULL_THRESH dynamisch auf `n` Bits gesetzt (FIFO konsumiert genau
+   so viele OSR-Bits, bevor sie blockt),
+2. SWDIO-Pindir auf Output umgelegt
+   (`pio_sm_set_pindirs_with_mask`),
+3. Datenwort in die TX-FIFO geschoben,
+4. nach Bit `n-1` der Pindir wieder auf Input zurückgesetzt
+   (Trn-Bit / Read-Phase).
+
+Damit fällt der bisherige ~2 MHz-Limit der CPU-getriebenen TX weg —
+der TX läuft synchron zur PIO-Clock (typ. 150 MHz / Default-Clkdiv =
+1.0). Die effektive obere SWCLK-Frequenz wird dann durch die
+RX-Sampling-Latenz und den Trn-Pfad bestimmt; konservativ
+**≈ 25 MHz** SWCLK.
+
+---
+
+## 16. USB-Mass-Storage-Boot
+
+[src/usb_msc.cpp](../src/usb_msc.cpp) stellt eine virtuelle FAT12-
+Diskette über TinyUSB-MSC bereit (LUN 0, 128 KiB). Der Host sieht
+das Volume `LPC1115EMU`. Beim **Eject** (`SCSI START_STOP_UNIT
+load_eject=1, start=0`) parst der Emulator:
+
+* `CONFIG.INI` → `pin.<p>_<n>=<gpio>`, `autostart`, `freq_hz`.
+  Konfig wird in den Storage-Slot persistiert.
+* `BOOT.HEX` → Stream-Parser → Firmware-Slot.
+
+Ist `autostart=on` aktiv, wird die Firmware **sofort gestartet**.
+Beim nächsten Power-Cycle läuft der Emulator damit autonom — keine
+serielle Konsole, kein Host-PC erforderlich.
+
+Persistenz: das FAT12-Volume liegt aktuell als 128-KiB-RAM-Spiegel
+in SRAM; der Inhalt geht beim Power-Cycle verloren, **außer** für
+die geparsten Targets (Firmware-Slot, Konfig-KV) — die sind
+persistent und reichen für Auto-Boot.

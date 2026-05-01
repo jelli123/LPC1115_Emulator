@@ -55,6 +55,7 @@ add_executable(emulator
     src/swd_target.cpp
     src/target_halt.cpp
     src/iap.cpp
+    src/usb_msc.cpp
 )
 
 target_include_directories(emulator PRIVATE src)
@@ -87,6 +88,8 @@ target_link_libraries(emulator PRIVATE
     hardware_timer
     hardware_watchdog
     hardware_pio
+    tinyusb_device
+    tinyusb_board
 )
 
 # stdio über USB-CDC; UART-stdio abschalten (UART-Pins gehören dem Emulator-Mapping).

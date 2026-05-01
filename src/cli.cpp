@@ -7,6 +7,7 @@
 #include "peripherals.h"
 #include "gdb_stub.h"
 #include "swd_target.h"
+#include "usb_msc.h"
 
 #include <cstdio>
 #include <cstring>
@@ -251,6 +252,10 @@ void run() {
     while (true) {
         gdb_stub::poll();
         swd_target::poll();
+        if (usb_msc::consume_pending_boot_request()) {
+            std::printf("\n[BOOT] BOOT.HEX über USB-MSC erkannt → Start\n");
+            emulator::load_and_start();
+        }
         int c = getchar_timeout_us(50'000);
         if (c == PICO_ERROR_TIMEOUT) continue;
         if (c == '\r') continue;
