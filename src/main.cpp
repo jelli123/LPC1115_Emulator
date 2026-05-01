@@ -20,14 +20,18 @@
 
 extern "C" void usb_stdio_init(void);
 extern "C" bool usb_stdio_connected(void);
+extern "C" void usb_stdio_task(void);
 
 int main() {
-    stdio_init_all();
+    // LED zuerst, damit Lebenszeichen sichtbar ist, auch wenn spätere Init
+    // hängt (Heartbeat = bereit). Siehe led.cpp für Statemachine.
     led::init();
+    stdio_init_all();
     usb_stdio_init();
 
     // Bis zu 6 s auf USB-Host warten, damit erste Konsolenausgaben sichtbar sind.
     for (int i = 0; i < 60 && !usb_stdio_connected(); ++i) {
+        usb_stdio_task();
         sleep_ms(100);
         led::poll();
     }

@@ -46,6 +46,22 @@ LPC1115-Emu  rev <git-sha>  (RP2350)
 emu> 
 ```
 
+### Status-LED (Onboard-LED, GPIO 25)
+
+Die grüne LED auf dem Pi Pico 2 zeigt jederzeit den Zustand des Emulators
+an, ohne dass die CLI verbunden sein muss:
+
+| Muster                    | Bedeutung                                  |
+|---------------------------|--------------------------------------------|
+| 1 Hz Heartbeat (50 % duty)| Idle / bereit, keine Gast-Firmware aktiv   |
+| dauerhaft an              | Gast-Firmware läuft (`emulator running`)   |
+| Doppelblitz alle 2 s      | Gast-Firmware angehalten (`halt`/Breakpoint) |
+| schnelles Flackern (8 Hz) | Hard-/Bus-/Memmanage-Fault im Gast         |
+| dunkel                    | Emulator selbst ist gecrasht oder nicht geflasht |
+
+So kann man am USB-Stecker schon vor dem Öffnen des Terminals erkennen,
+ob die Firmware bereit ist.
+
 ---
 
 ## 3. CLI-Übersicht (CDC#0)
@@ -275,6 +291,8 @@ zwei PHYs:
 
 | Symptom                                   | Ursache / Abhilfe                                  |
 |-------------------------------------------|----------------------------------------------------|
+| LED dauerhaft dunkel nach Reset           | Firmware crasht früh / nicht geflasht – UF2 erneut kopieren |
+| LED blinkt 1 Hz, kein USB-Gerät sichtbar  | Host-USB-Kabel defekt / nur Ladekabel              |
 | `info` zeigt Reset = 0x0                  | HEX-Datei unvollständig empfangen → erneut         |
 | `run` führt sofort zu `HardFault`         | Stack-Top liegt außerhalb 0x10000000-0x10001FFF    |
 | GDB sagt „Remote connection closed"       | TinyUSB hat Re-Enum gemacht – Port neu öffnen      |

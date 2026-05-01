@@ -8,7 +8,6 @@
 #include "tusb.h"
 #include "pico/stdlib.h"
 #include "pico/stdio/driver.h"
-#include "pico/time.h"
 
 #include <cstring>
 
@@ -54,18 +53,17 @@ static stdio_driver_t s_stdio_cdc = {
 #endif
 };
 
-// Periodischer tud_task() im SDK-Repeating-Timer (1 ms).
-static repeating_timer_t s_tud_timer;
-
-static bool tud_task_timer_cb(repeating_timer_t* /*t*/) {
-    tud_task();
-    return true;
-}
+// Periodischer tud_task() wird aus dem Hauptloop (cli::run) aufgerufen.
+// WICHTIG: tud_task() darf NICHT aus IRQ-Kontext laufen (TinyUSB ist nicht
+// IRQ-safe; auf RP2350 führt das zu HardFault → Boot-ROM → BOOTSEL).
 
 void usb_stdio_init(void) {
     tusb_init();
-    add_repeating_timer_ms(1, tud_task_timer_cb, nullptr, &s_tud_timer);
     stdio_set_driver_enabled(&s_stdio_cdc, true);
+}
+
+void usb_stdio_task(void) {
+    tud_task();
 }
 
 bool usb_stdio_connected(void) {

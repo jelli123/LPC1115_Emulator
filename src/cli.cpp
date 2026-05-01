@@ -10,6 +10,7 @@
 #include "usb_msc.h"
 #include "led.h"
 
+extern "C" void usb_stdio_task(void);
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -251,6 +252,7 @@ void run() {
     std::size_t len = 0;
     std::printf("> ");
     while (true) {
+        usb_stdio_task();
         led::poll();
         gdb_stub::poll();
         swd_target::poll();

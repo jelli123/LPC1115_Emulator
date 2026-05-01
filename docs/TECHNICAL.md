@@ -371,7 +371,52 @@ Ist `autostart=on` aktiv, wird die Firmware **sofort gestartet**.
 Beim nächsten Power-Cycle läuft der Emulator damit autonom — keine
 serielle Konsole, kein Host-PC erforderlich.
 
-Persistenz: das FAT12-Volume liegt aktuell als 128-KiB-RAM-Spiegel
+Persistenz: das FAT12-Volume liegt aktuell als 256-KiB-RAM-Spiegel
 in SRAM; der Inhalt geht beim Power-Cycle verloren, **außer** für
 die geparsten Targets (Firmware-Slot, Konfig-KV) — die sind
 persistent und reichen für Auto-Boot.
+
+---
+
+## 17. Status-LED (Heartbeat)
+
+`led.cpp` blendet `emulator::state()` auf die Onboard-LED des Pi Pico 2
+(`PICO_DEFAULT_LED_PIN` = GPIO 25):
+
+| Zustand              | LED-Muster                |
+|----------------------|---------------------------|
+| `Idle`               | 1 Hz Heartbeat (50 % duty)|
+| `Running`            | dauerhaft an              |
+| `Halted`             | Doppelblitz alle 2 s      |
+| `Faulted`            | 8 Hz Flackern             |
+
+Implementierung: `led::poll()` wird aus dem CLI-Hauptloop aufgerufen,
+bestimmt den Zustand zeitbasiert über `to_ms_since_boot(...)` und
+schaltet GPIO 25 mit `gpio_put`. Keine Timer/IRQs, daher unkritisch
+gegenüber TinyUSB-Polling.
+
+`led::init()` wird **als allererstes** in `main()` ausgeführt, noch vor
+`stdio_init_all()` und `usb_stdio_init()` — so ist auch dann ein
+Lebenszeichen sichtbar, wenn die USB-Initialisierung später hängen
+sollte.
+
+---
+
+## 18. USB-Stack — eigene tusb_config.h, kein `pico_stdio_usb`
+
+Die SDK-Library `pico_stdio_usb` bringt eine eigene `tusb_config.h`
+mit (`CFG_TUD_CDC=1`, kein MSC), die mit unseren 2×CDC + MSC-
+Descriptoren kollidieren würde — Folge: das Device enumeriert gar
+nicht und der Host sieht VID:PID `cafe:4011` nicht.
+
+Daher:
+* `pico_enable_stdio_usb(emulator 0)` in [CMakeLists.txt](CMakeLists.txt) — die Bridge ist aus.
+* Eigene Datei [src/usb_stdio.cpp](src/usb_stdio.cpp): ruft `tusb_init()` auf, registriert einen
+  `stdio_driver_t`, der stdout/stdin auf CDC-Interface 0 (CLI) leitet.
+* `tud_task()` wird **aus dem Hauptloop** in `cli::run()` aufgerufen —
+  niemals aus IRQ-Kontext (TinyUSB ist nicht IRQ-safe; ein
+  Timer-Callback würde auf RP2350 zu HardFault → Boot-ROM →
+  BOOTSEL-Modus führen).
+
+VID:PID = `0xCAFE:0x4011` (TinyUSB-Test-VID, in [src/usb_descriptors.cpp](src/usb_descriptors.cpp)).
+Mit `lsusb -d cafe:4011 -v` zu prüfen.
