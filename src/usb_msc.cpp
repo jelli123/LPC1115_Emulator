@@ -12,6 +12,8 @@
 #include <cstring>
 #include <cstdlib>
 
+#include "pico/time.h"
+
 namespace usb_msc {
 
 namespace {
@@ -30,7 +32,13 @@ alignas(4) uint8_t g_disk[VOLUME_BYTES];
 
 std::atomic<bool> g_dirty{false};
 std::atomic<bool> g_boot_pending{false};
+std::atomic<bool> g_volume_processed{false};
 Stats             g_stats{};
+
+// Dirty-Timeout: wenn der Host N ms nicht mehr schreibt, gilt das Volume
+// als fertig (für Linux-Systeme, die kein Eject senden).
+constexpr uint32_t WRITE_IDLE_TIMEOUT_MS = 2000;
+volatile uint32_t  g_last_write_ms = 0;
 
 const char VOL_LABEL[11]  = { 'L','P','C','1','1','1','5','E','M','U',' ' };
 const char OEM_NAME[8]    = { 'M','S','D','O','S','5','.','0' };
@@ -244,8 +252,19 @@ bool consume_pending_boot_request() {
 }
 
 void poll() {
-    // Periodisches Persistieren wäre hier möglich. Aktuell flush nur
-    // beim Eject (siehe tud_msc_start_stop_cb).
+    // Dirty-Timeout: Falls der Host nach dem letzten Schreibzugriff
+    // WRITE_IDLE_TIMEOUT_MS nicht mehr geschrieben hat, gilt das Volume
+    // als fertig geschrieben. Deckt Linux-umount ohne explizites Eject ab.
+    if (g_dirty.load(std::memory_order_relaxed) &&
+        !g_volume_processed.load(std::memory_order_relaxed)) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        uint32_t last = g_last_write_ms;
+        if (last != 0 && (now - last) >= WRITE_IDLE_TIMEOUT_MS) {
+            g_dirty.store(false);
+            g_volume_processed.store(true);
+            on_volume_ready();
+        }
+    }
 }
 
 bool find_file(const char* name83, File& out) {
@@ -313,13 +332,22 @@ int32_t tud_msc_write10_cb(uint8_t /*lun*/, uint32_t lba, uint32_t offset,
     if (addr + bufsize > usb_msc::VOLUME_BYTES) return -1;
     std::memcpy(usb_msc::g_disk + addr, buffer, bufsize);
     usb_msc::g_dirty.store(true);
+    usb_msc::g_volume_processed.store(false);
+    usb_msc::g_last_write_ms = to_ms_since_boot(get_absolute_time());
     ++usb_msc::g_stats.writes;
     return static_cast<int32_t>(bufsize);
 }
 
-int32_t tud_msc_scsi_cb(uint8_t /*lun*/, const uint8_t /*scsi_cmd*/[16],
-                        void* /*buffer*/, uint16_t /*bufsize*/) {
-    return -1;     // ungehandhabte SCSI-Kommandos → INVALID
+int32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16],
+                        void* buffer, uint16_t bufsize) {
+    (void)lun; (void)buffer; (void)bufsize;
+    // PREVENT_ALLOW_MEDIUM_REMOVAL (0x1E): Linux sendet dies vor dem Eject.
+    // Ohne Success-Antwort bricht Linux den Eject ab und on_volume_ready()
+    // wird nie aufgerufen.
+    if (scsi_cmd[0] == 0x1E) return 0;   // Success
+    // SYNCHRONIZE_CACHE (0x35): Linux sendet dies beim umount/sync.
+    if (scsi_cmd[0] == 0x35) return 0;   // Success
+    return -1;
 }
 
 bool tud_msc_is_writable_cb(uint8_t /*lun*/) { return true; }

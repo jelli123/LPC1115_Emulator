@@ -179,6 +179,48 @@ Wear-Leveling-Slot des QSPI-Flash (überlebt Power-Cycle wenn `autostart on`).
 
 ## 5. Pinmap konfigurieren
 
+### Default-Pinmap (ohne CONFIG.INI)
+
+Wird keine `config.ini` gefunden (erster Start, nach Factory-Reset via
+`pinmap reset`), werden folgende Zuordnungen aktiv. Die Belegung orientiert
+sich an der physischen Lage am LPC1115-LQFP48-Gehäuse und der Pin-Seite
+des Pico 2:
+
+| LPC-Pin | Funktion (sblib / Peripherie) | RP2350-GPIO | Pico-2-Pad |
+|---------|-------------------------------|-------------|------------|
+| P0_0    | GPIO / SPI0-MISO              | GP2         | Pin 4      |
+| P0_1    | GPIO / SPI0-MOSI              | GP3         | Pin 5      |
+| P0_2    | GPIO / SPI0-SCK               | GP4         | Pin 6      |
+| P0_3    | GPIO / SPI0-CS                | GP5         | Pin 7      |
+| P0_4    | GPIO / I2C-SCL                | GP6         | Pin 9      |
+| P0_5    | GPIO / I2C-SDA                | GP7         | Pin 10     |
+| P0_6    | GPIO                          | GP8         | Pin 11     |
+| P0_7    | GPIO                          | GP9         | Pin 12     |
+| P0_8    | GPIO                          | GP10        | Pin 14     |
+| P0_9    | GPIO                          | GP11        | Pin 15     |
+| P0_10   | GPIO                          | GP12        | Pin 16     |
+| P0_11   | GPIO                          | GP13        | Pin 17     |
+| P1_0    | GPIO                          | GP14        | Pin 19     |
+| P1_1    | GPIO                          | GP15        | Pin 20     |
+| P1_2    | GPIO                          | GP16        | Pin 21     |
+| P1_3    | GPIO                          | GP17        | Pin 22     |
+| P1_4    | GPIO                          | GP18        | Pin 24     |
+| P1_5    | GPIO                          | GP19        | Pin 25     |
+| P1_6    | GPIO                          | GP20        | Pin 26     |
+| P1_7    | GPIO                          | GP21        | Pin 27     |
+| P1_8    | UART RX (KNX-Bus / TPUART)   | GP1         | Pin 2      |
+| P1_9    | UART TX (KNX-Bus / TPUART)   | GP0         | Pin 1      |
+| P1_10   | GPIO                          | GP22        | Pin 29     |
+| P1_11   | GPIO / ADC                    | GP26        | Pin 31     |
+| P2_0    | GPIO (Status-LED / Prog)      | GP27        | Pin 32     |
+| P2_1    | GPIO / ADC                    | GP28        | Pin 34     |
+
+> **GP25** (Onboard-LED) ist für die Status-Anzeige reserviert und steht
+> nicht als LPC-Pin zur Verfügung. Port 3 ist im Default nicht gemappt
+> (zu wenige freie GPIOs).
+
+### Selfbus-Apps
+
 Selfbus-Apps wie *bim112* benutzen meist:
 
 | sblib-Konstante  | LPC-Pin   | typische Funktion              |

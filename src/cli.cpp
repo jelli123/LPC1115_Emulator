@@ -7,6 +7,8 @@
 #include "peripherals.h"
 #include "gdb_stub.h"
 #include "swd_target.h"
+#include "target_halt.h"
+#include "pio_glue.h"
 #include "usb_msc.h"
 #include "led.h"
 
@@ -63,6 +65,7 @@ void cmd_help() {
         "",
         "  swd start <swdio> <swclk>  SWD-Target aktivieren",
         "  swd stop                   SWD-Target deaktivieren",
+        "  pio capture <pin> <count>  Edge-Capture-Trace (Zyklen)",
         "",
         "  freq <Hz>                  Ziel-CPU-Frequenz",
         "  flash hex                  Intel-Hex-Stream (alias fuer upload)",
@@ -172,10 +175,44 @@ void handle_command(char* line) {
     }
     if (std::strcmp(tokens[0], "run") == 0)   { emulator::load_and_start(); return; }
     if (std::strcmp(tokens[0], "halt") == 0 ||
-        std::strcmp(tokens[0], "stop") == 0)  { emulator::stop(); std::puts("halted"); return; }
-    if (std::strcmp(tokens[0], "step") == 0)  {
-        std::puts("(step nicht implementiert — halt)");
-        emulator::stop();
+        std::strcmp(tokens[0], "stop") == 0) {
+        if (emulator::state() == emulator::State::Running) {
+            target_halt::request_halt();
+            // Kurz warten bis der Gast im PendSV hängt
+            for (int w = 0; w < 100 && !target_halt::is_halted(); ++w)
+                sleep_ms(1);
+            if (target_halt::is_halted()) {
+                auto* s = target_halt::snapshot();
+                std::printf("halted at PC=0x%08lX\n",
+                            static_cast<unsigned long>(s ? s->r[15] : 0));
+            } else {
+                emulator::stop();
+                std::puts("halted (forced core reset)");
+            }
+        } else {
+            std::puts("nicht gestartet");
+        }
+        return;
+    }
+    if (std::strcmp(tokens[0], "step") == 0) {
+        if (target_halt::is_halted()) {
+            target_halt::request_step();
+            // Warten bis erneut gehaltet
+            for (int w = 0; w < 200 && !target_halt::is_halted(); ++w)
+                sleep_ms(1);
+            auto* s = target_halt::snapshot();
+            std::printf("step -> PC=0x%08lX\n",
+                        static_cast<unsigned long>(s ? s->r[15] : 0));
+        } else if (emulator::state() == emulator::State::Running) {
+            target_halt::request_halt();
+            for (int w = 0; w < 100 && !target_halt::is_halted(); ++w)
+                sleep_ms(1);
+            auto* s = target_halt::snapshot();
+            std::printf("halted at PC=0x%08lX (use 'step' again)\n",
+                        static_cast<unsigned long>(s ? s->r[15] : 0));
+        } else {
+            std::puts("Guest nicht aktiv");
+        }
         return;
     }
     if (std::strcmp(tokens[0], "reset") == 0) {
@@ -329,15 +366,41 @@ void handle_command(char* line) {
 
     if (std::strcmp(tokens[0], "bp") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "clr") == 0 && n >= 3) {
-            std::puts("(bp clr: nicht implementiert)");
+            long a;
+            if (!parse_int(tokens[2], 0, 0x7FFFFFFF, a)) {
+                std::puts("err: bp clr <addr>"); return;
+            }
+            std::puts(target_halt::clear_breakpoint(static_cast<uint32_t>(a))
+                      ? "bp cleared" : "err: bp not found");
         } else {
-            std::puts("(bp: nicht implementiert)");
+            long a;
+            if (!parse_int(tokens[1], 0, 0x7FFFFFFF, a)) {
+                std::puts("err: bp <addr>"); return;
+            }
+            std::puts(target_halt::set_breakpoint(static_cast<uint32_t>(a))
+                      ? "bp set" : "err: max 8 bp or invalid addr");
         }
         return;
     }
 
     if (std::strcmp(tokens[0], "regs") == 0) {
-        std::puts("(regs: nicht implementiert — nutze GDB)");
+        auto* s = target_halt::snapshot();
+        if (!s) {
+            std::puts("(Guest nicht gehaltet — zuerst 'halt')");
+            return;
+        }
+        for (int i = 0; i < 16; i += 4) {
+            std::printf("r%-2d=0x%08lX  r%-2d=0x%08lX  r%-2d=0x%08lX  r%-2d=0x%08lX\n",
+                        i,   static_cast<unsigned long>(s->r[i]),
+                        i+1, static_cast<unsigned long>(s->r[i+1]),
+                        i+2, static_cast<unsigned long>(s->r[i+2]),
+                        i+3, static_cast<unsigned long>(s->r[i+3]));
+        }
+        std::printf("xPSR=0x%08lX  SP=0x%08lX  LR=0x%08lX  PC=0x%08lX\n",
+                    static_cast<unsigned long>(s->xpsr),
+                    static_cast<unsigned long>(s->r[13]),
+                    static_cast<unsigned long>(s->r[14]),
+                    static_cast<unsigned long>(s->r[15]));
         return;
     }
 
@@ -347,18 +410,45 @@ void handle_command(char* line) {
             !parse_int(tokens[2], 1, 256, len)) {
             std::puts("err: mem <addr> <len 1..256>"); return;
         }
-        const uint8_t* base = storage::firmware_data();
-        std::size_t fw_sz = storage::firmware_size();
         uint32_t a = static_cast<uint32_t>(addr);
         uint32_t l = static_cast<uint32_t>(len);
-        if (a + l > fw_sz) { std::puts("err: out of range"); return; }
+        uint8_t buf[256];
+        if (!target_halt::read_memory(a, buf, l)) {
+            std::puts("err: read failed"); return;
+        }
         for (uint32_t i = 0; i < l; i += 16) {
             std::printf("%08lX: ", static_cast<unsigned long>(a + i));
             for (uint32_t j = 0; j < 16 && i + j < l; ++j)
-                std::printf("%02X ", base[a + i + j]);
+                std::printf("%02X ", buf[i + j]);
             std::putchar('\n');
         }
         return;
+    }
+
+    if (std::strcmp(tokens[0], "pio") == 0 && n >= 2) {
+        if (std::strcmp(tokens[1], "capture") == 0 && n >= 4) {
+            long pin_arg, count;
+            if (!parse_int(tokens[2], 0, 47, pin_arg) ||
+                !parse_int(tokens[3], 1, 1000, count)) {
+                std::puts("err: pio capture <pin> <count>"); return;
+            }
+            uint16_t h = pio_glue::setup_capture(static_cast<uint8_t>(pin_arg), true);
+            if (h == 0xFFFF) { std::puts("err: PIO voll"); return; }
+            std::printf("[PIO] capturing %ld edges on GP%ld...\n",
+                        count, pin_arg);
+            for (long i = 0; i < count; ++i) {
+                uint32_t val = 0;
+                int timeout = 5000;
+                while (!pio_glue::capture_read(h, val) && --timeout > 0)
+                    sleep_ms(1);
+                if (timeout <= 0) {
+                    std::printf("  [%ld] timeout\n", i); break;
+                }
+                std::printf("  [%ld] %lu cycles\n", i,
+                            static_cast<unsigned long>(val));
+            }
+            return;
+        }
     }
 
     if (std::strcmp(tokens[0], "swd") == 0 && n >= 2) {
