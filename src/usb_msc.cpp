@@ -201,7 +201,9 @@ void on_volume_ready() {
         auto writer = [](uint32_t address, const uint8_t* data,
                          std::size_t len) -> bool {
             if (address + len > 64u * 1024u) { g_ctx->overflow = true; return false; }
-            storage::firmware_write(address, data, len);
+            if (!storage::firmware_write(address, data, len)) {
+                g_ctx->overflow = true; return false;
+            }
             uint32_t end = address + static_cast<uint32_t>(len);
             if (end > g_ctx->total) g_ctx->total = end;
             return true;

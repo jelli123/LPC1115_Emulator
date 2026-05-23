@@ -31,5 +31,6 @@ void        set_target_frequency_hz(uint32_t hz);
 
 const PinMap& pin_map();
 bool         set_pin_map(uint8_t lpc_pin, int rp2350_gpio);
+void         apply_default_pinmap();
 
 } // namespace config

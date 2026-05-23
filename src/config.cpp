@@ -29,8 +29,39 @@ bool parse_uint32(const char* s, uint32_t& out) {
     return true;
 }
 
-void apply_defaults() {
+// Default-Pinmap: Weist LPC1115-Pins sinnvolle RP2350-GPIOs zu.
+// Layout orientiert sich an der physischen Anordnung am LQFP48-Gehäuse:
+//   Port 0 (P0_0..P0_11) → GP2..GP13 (linke Seite des Pico 2)
+//   Port 1 (P1_0..P1_7)  → GP14..GP21 (rechte Seite)
+//   Port 1 UART: P1_8 → GP1 (UART0 RX), P1_9 → GP0 (UART0 TX)
+//   P1_10 → GP22, P1_11 → GP26
+//   Port 2: P2_0 → GP27, P2_1 → GP28 (ADC-fähig)
+//   Port 3: nicht gemappt (zu wenige freie Pins)
+// GP25 = Onboard-LED (reserviert für Status).
+void apply_default_pinmap_impl() {
     for (auto& v : g_pin_map.lpc_to_rp) v = -1;
+
+    // Port 0: P0_0..P0_11 → GP2..GP13
+    for (int i = 0; i <= 11; ++i)
+        g_pin_map.lpc_to_rp[0 * 12 + i] = static_cast<int8_t>(2 + i);
+
+    // Port 1: P1_0..P1_7 → GP14..GP21
+    for (int i = 0; i <= 7; ++i)
+        g_pin_map.lpc_to_rp[1 * 12 + i] = static_cast<int8_t>(14 + i);
+
+    // Port 1 UART (KNX-Bus): P1_8=RX → GP1, P1_9=TX → GP0
+    g_pin_map.lpc_to_rp[1 * 12 + 8]  = 1;   // UART0 RX
+    g_pin_map.lpc_to_rp[1 * 12 + 9]  = 0;   // UART0 TX
+    g_pin_map.lpc_to_rp[1 * 12 + 10] = 22;
+    g_pin_map.lpc_to_rp[1 * 12 + 11] = 26;
+
+    // Port 2: P2_0 → GP27, P2_1 → GP28
+    g_pin_map.lpc_to_rp[2 * 12 + 0] = 27;
+    g_pin_map.lpc_to_rp[2 * 12 + 1] = 28;
+}
+
+void apply_defaults() {
+    apply_default_pinmap_impl();
     g_target_freq = 48'000'000;
     g_autostart   = false;
 }
@@ -99,6 +130,10 @@ bool set_pin_map(uint8_t lpc_pin, int rp2350_gpio) {
     if (rp2350_gpio < -1 || rp2350_gpio > MAX_GPIO) return false;
     g_pin_map.lpc_to_rp[lpc_pin] = static_cast<int8_t>(rp2350_gpio);
     return true;
+}
+
+void apply_default_pinmap() {
+    apply_default_pinmap_impl();
 }
 
 } // namespace config

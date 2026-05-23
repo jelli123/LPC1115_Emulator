@@ -17,6 +17,7 @@ extern "C" void usb_stdio_task(void);
 #include <cctype>
 
 #include "pico/stdlib.h"
+#include "pico/version.h"
 
 namespace {
 
@@ -34,23 +35,39 @@ void cmd_help() {
     static const char* lines[] = {
         "Befehle:",
         "  help                       diese Hilfe",
-        "  status                     Emulatorstatus & Stats",
-        "  config get <key>           Konfigwert lesen",
-        "  config set <key> <value>   Konfigwert schreiben",
-        "  config save                Konfig persistieren",
-        "  config dump                alle Konfig-KVs ausgeben",
-        "  pin set <lpc> <rp2350|-1>  Pin-Mapping setzen",
-        "  pin show                   Pin-Mapping anzeigen",
-        "  freq <Hz>                  Ziel-CPU-Frequenz",
-        "  flash erase                Firmware-Slot löschen",
-        "  flash hex                  Intel-Hex-Stream starten (mit ':' Zeilen, Ende = leere Zeile)",
-        "  flash finalize <bytes>     Firmware abschließen + CRC-Marker",
-        "  run                        Emulation starten",
-        "  stop                       Emulation anhalten (Core1 reset)",
-        "  reset                      Wie stop",
-        "  gdb on|off|status          GDB Remote Stub (zweite USB-CDC)",
-        "  swd start <clk> <dio>      SWD-Target auf RP-GPIOs aktivieren (Skelett)",
+        "  version                    Build-Info",
+        "  stats / status             Emulatorstatus & Zaehler",
+        "  reset                      Emulator-Core neu starten",
+        "",
+        "  upload                     Intel-Hex-Stream starten (alias: flash hex)",
+        "  info                       Reset-Vektor, Stack, Groesse, CRC",
+        "  erase                      Firmware-Slot loeschen (alias: flash erase)",
+        "  run                        Guest starten",
+        "  halt / stop                Guest anhalten",
+        "  step                       ein Befehl, dann halten",
+        "  autostart on|off           nach Reset automatisch starten",
+        "",
+        "  cfg list                   alle KV-Paare ausgeben",
+        "  cfg get <key>              Wert lesen",
+        "  cfg set <key> <value>      Wert setzen",
+        "  cfg save                   RAM-Snapshot in Flash schreiben",
+        "  pinmap show                Tabelle LPC-Pin -> RP2350-GPIO",
+        "  pinmap set <port_pin> <rp> Pin zuweisen (z.B. pinmap set 1_8 17)",
+        "  pinmap reset               Default-Tabelle wiederherstellen",
+        "",
+        "  gdb on|off|status          GDB-Stub auf CDC#1",
+        "  bp <addr>                  SW-Breakpoint setzen",
+        "  bp clr <addr>              Breakpoint loeschen",
+        "  regs                       Register anzeigen (r0-r15, xPSR)",
+        "  mem <addr> <len>           Hex-Dump Guest-Adressraum",
+        "",
+        "  swd start <swdio> <swclk>  SWD-Target aktivieren",
         "  swd stop                   SWD-Target deaktivieren",
+        "",
+        "  freq <Hz>                  Ziel-CPU-Frequenz",
+        "  flash hex                  Intel-Hex-Stream (alias fuer upload)",
+        "  flash erase                Firmware-Slot loeschen",
+        "  flash finalize <bytes>     Firmware abschliessen + CRC-Marker",
         nullptr
     };
     for (int i = 0; lines[i]; ++i) std::puts(lines[i]);
@@ -84,6 +101,33 @@ bool parse_int(const char* s, long min_v, long max_v, long& out) {
     return true;
 }
 
+void cmd_version() {
+    std::printf("LPC1115-Emu  RP2350  SDK=%s\n", PICO_SDK_VERSION_STRING);
+}
+
+void cmd_info() {
+    std::size_t sz = storage::firmware_size();
+    if (sz == 0) { std::puts("(kein Firmware-Image)"); return; }
+    const uint8_t* fw = storage::firmware_data();
+    uint32_t sp   = *reinterpret_cast<const uint32_t*>(fw);
+    uint32_t rst  = *reinterpret_cast<const uint32_t*>(fw + 4);
+    std::printf("Reset: 0x%08lX  Stack: 0x%08lX  Size: %lu\n",
+                static_cast<unsigned long>(rst),
+                static_cast<unsigned long>(sp),
+                static_cast<unsigned long>(sz));
+}
+
+// Port_Pin-String (z.B. "1_8") in LPC-Pin-Index konvertieren
+bool parse_port_pin(const char* s, long& out) {
+    int port, pin;
+    if (std::sscanf(s, "%d_%d", &port, &pin) == 2) {
+        out = static_cast<long>(port * 12 + pin);
+        return out >= 0 && out < static_cast<long>(config::LPC_PIN_COUNT);
+    }
+    // Fallback: numerischer Index
+    return parse_int(s, 0, static_cast<long>(config::LPC_PIN_COUNT - 1), out);
+}
+
 void emit_line(const char* l) { std::puts(l); }
 
 void handle_command(char* line) {
@@ -101,9 +145,82 @@ void handle_command(char* line) {
 
     if (n == 0) return;
 
-    if (std::strcmp(tokens[0], "help") == 0)   { cmd_help(); return; }
-    if (std::strcmp(tokens[0], "status") == 0) { cmd_status(); return; }
+    // --- Allgemein ---
+    if (std::strcmp(tokens[0], "help") == 0)    { cmd_help(); return; }
+    if (std::strcmp(tokens[0], "version") == 0) { cmd_version(); return; }
+    if (std::strcmp(tokens[0], "stats") == 0 ||
+        std::strcmp(tokens[0], "status") == 0)  { cmd_status(); return; }
 
+    // --- Firmware ---
+    if (std::strcmp(tokens[0], "upload") == 0 ||
+        (std::strcmp(tokens[0], "flash") == 0 && n >= 2 &&
+         std::strcmp(tokens[1], "hex") == 0)) {
+        storage::firmware_erase();
+        static hex::Parser parser(hex_writer, 0x0000'0000, 64u * 1024u);
+        parser = hex::Parser(hex_writer, 0x0000'0000, 64u * 1024u);
+        g_hex_parser = &parser;
+        g_in_hex_upload = true;
+        std::puts("hex: stream Intel-Hex Zeilen, Ende mit leerer Zeile");
+        return;
+    }
+    if (std::strcmp(tokens[0], "info") == 0)  { cmd_info(); return; }
+    if (std::strcmp(tokens[0], "erase") == 0 ||
+        (std::strcmp(tokens[0], "flash") == 0 && n >= 2 &&
+         std::strcmp(tokens[1], "erase") == 0)) {
+        std::puts(storage::firmware_erase() ? "erased" : "err");
+        return;
+    }
+    if (std::strcmp(tokens[0], "run") == 0)   { emulator::load_and_start(); return; }
+    if (std::strcmp(tokens[0], "halt") == 0 ||
+        std::strcmp(tokens[0], "stop") == 0)  { emulator::stop(); std::puts("halted"); return; }
+    if (std::strcmp(tokens[0], "step") == 0)  {
+        std::puts("(step nicht implementiert — halt)");
+        emulator::stop();
+        return;
+    }
+    if (std::strcmp(tokens[0], "reset") == 0) {
+        emulator::stop();
+        std::puts("reset");
+        return;
+    }
+    if (std::strcmp(tokens[0], "autostart") == 0 && n >= 2) {
+        if (std::strcmp(tokens[1], "on") == 0) {
+            config::set_autostart(true);
+            config::save();
+            std::puts("autostart=on (saved)");
+        } else {
+            config::set_autostart(false);
+            config::save();
+            std::puts("autostart=off (saved)");
+        }
+        return;
+    }
+
+    // --- Konfiguration: cfg list/get/set/save (USERGUIDE-kompatibel) ---
+    if (std::strcmp(tokens[0], "cfg") == 0 && n >= 2) {
+        if (std::strcmp(tokens[1], "list") == 0 ||
+            std::strcmp(tokens[1], "dump") == 0) {
+            storage::config_dump(emit_line);
+            return;
+        }
+        if (std::strcmp(tokens[1], "get") == 0 && n >= 3) {
+            char buf[96];
+            if (storage::config_get(tokens[2], buf, sizeof buf))
+                std::printf("%s=%s\n", tokens[2], buf);
+            else std::puts("(unset)");
+            return;
+        }
+        if (std::strcmp(tokens[1], "set") == 0 && n >= 4) {
+            std::puts(storage::config_set(tokens[2], tokens[3])
+                      ? "ok" : "err");
+            return;
+        }
+        if (std::strcmp(tokens[1], "save") == 0) {
+            std::puts(config::save() ? "saved" : "err");
+            return;
+        }
+    }
+    // Legacy-Alias: "config" = "cfg"
     if (std::strcmp(tokens[0], "config") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "get") == 0 && n >= 3) {
             char buf[96];
@@ -127,12 +244,42 @@ void handle_command(char* line) {
         }
     }
 
+    // --- Pinmap: pinmap show/set/reset (USERGUIDE) ---
+    if (std::strcmp(tokens[0], "pinmap") == 0 && n >= 2) {
+        if (std::strcmp(tokens[1], "show") == 0) {
+            const auto& m = config::pin_map();
+            for (std::size_t i = 0; i < config::LPC_PIN_COUNT; ++i) {
+                if (m.lpc_to_rp[i] >= 0)
+                    std::printf("LPC P%u_%u -> GP%d\n",
+                                static_cast<unsigned>(i / 12),
+                                static_cast<unsigned>(i % 12),
+                                m.lpc_to_rp[i]);
+            }
+            return;
+        }
+        if (std::strcmp(tokens[1], "set") == 0 && n == 4) {
+            long lpc, rp;
+            if (!parse_port_pin(tokens[2], lpc) ||
+                !parse_int(tokens[3], -1, 47, rp)) {
+                std::puts("err: pinmap set <port_pin> <rp-gpio>"); return;
+            }
+            std::puts(config::set_pin_map(static_cast<uint8_t>(lpc), static_cast<int>(rp))
+                      ? "ok" : "err");
+            return;
+        }
+        if (std::strcmp(tokens[1], "reset") == 0) {
+            config::apply_default_pinmap();
+            std::puts("pinmap defaults restored");
+            return;
+        }
+    }
+    // Legacy-Alias: "pin" = "pinmap"
     if (std::strcmp(tokens[0], "pin") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "set") == 0 && n == 4) {
             long lpc, rp;
-            if (!parse_int(tokens[2], 0, static_cast<long>(config::LPC_PIN_COUNT - 1), lpc) ||
+            if (!parse_port_pin(tokens[2], lpc) ||
                 !parse_int(tokens[3], -1, 47, rp)) {
-                std::puts("err: pin set <lpc 0..63> <rp -1..47>"); return;
+                std::puts("err: pin set <port_pin|idx> <rp-gpio>"); return;
             }
             std::puts(config::set_pin_map(static_cast<uint8_t>(lpc), static_cast<int>(rp))
                       ? "ok" : "err");
@@ -142,8 +289,10 @@ void handle_command(char* line) {
             const auto& m = config::pin_map();
             for (std::size_t i = 0; i < config::LPC_PIN_COUNT; ++i) {
                 if (m.lpc_to_rp[i] >= 0)
-                    std::printf("LPC.P%u -> GP%d\n",
-                                static_cast<unsigned>(i), m.lpc_to_rp[i]);
+                    std::printf("LPC P%u_%u -> GP%d\n",
+                                static_cast<unsigned>(i / 12),
+                                static_cast<unsigned>(i % 12),
+                                m.lpc_to_rp[i]);
             }
             return;
         }
@@ -153,23 +302,11 @@ void handle_command(char* line) {
         long hz;
         if (!parse_int(tokens[1], 1, 150'000'000, hz)) { std::puts("err"); return; }
         config::set_target_frequency_hz(static_cast<uint32_t>(hz));
-        std::puts("ok (gespeichert in Konfig; eine Soft-PLL gibt es im\n     Native-Modus nicht — RP2350 läuft mit System-Clock)");
+        std::puts("ok");
         return;
     }
 
     if (std::strcmp(tokens[0], "flash") == 0 && n >= 2) {
-        if (std::strcmp(tokens[1], "erase") == 0) {
-            std::puts(storage::firmware_erase() ? "erased" : "err");
-            return;
-        }
-        if (std::strcmp(tokens[1], "hex") == 0) {
-            static hex::Parser parser(hex_writer, 0x0000'0000, 64u * 1024u);
-            parser = hex::Parser(hex_writer, 0x0000'0000, 64u * 1024u);
-            g_hex_parser = &parser;
-            g_in_hex_upload = true;
-            std::puts("hex: stream Intel-Hex Zeilen, Ende mit leerer Zeile");
-            return;
-        }
         if (std::strcmp(tokens[1], "finalize") == 0 && n == 3) {
             long len;
             if (!parse_int(tokens[2], 1, 64L * 1024, len)) { std::puts("err"); return; }
@@ -178,10 +315,7 @@ void handle_command(char* line) {
         }
     }
 
-    if (std::strcmp(tokens[0], "run") == 0)   { emulator::load_and_start(); return; }
-    if (std::strcmp(tokens[0], "stop") == 0)  { emulator::stop();  return; }
-    if (std::strcmp(tokens[0], "reset") == 0) { emulator::stop(); std::puts("reset"); return; }
-
+    // --- Debugger ---
     if (std::strcmp(tokens[0], "gdb") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "on") == 0)     { gdb_stub::start(); return; }
         if (std::strcmp(tokens[1], "off") == 0)    { gdb_stub::stop();  return; }
@@ -191,6 +325,40 @@ void handle_command(char* line) {
                         gdb_stub::port_index());
             return;
         }
+    }
+
+    if (std::strcmp(tokens[0], "bp") == 0 && n >= 2) {
+        if (std::strcmp(tokens[1], "clr") == 0 && n >= 3) {
+            std::puts("(bp clr: nicht implementiert)");
+        } else {
+            std::puts("(bp: nicht implementiert)");
+        }
+        return;
+    }
+
+    if (std::strcmp(tokens[0], "regs") == 0) {
+        std::puts("(regs: nicht implementiert — nutze GDB)");
+        return;
+    }
+
+    if (std::strcmp(tokens[0], "mem") == 0 && n >= 3) {
+        long addr, len;
+        if (!parse_int(tokens[1], 0, 0x7FFFFFFF, addr) ||
+            !parse_int(tokens[2], 1, 256, len)) {
+            std::puts("err: mem <addr> <len 1..256>"); return;
+        }
+        const uint8_t* base = storage::firmware_data();
+        std::size_t fw_sz = storage::firmware_size();
+        uint32_t a = static_cast<uint32_t>(addr);
+        uint32_t l = static_cast<uint32_t>(len);
+        if (a + l > fw_sz) { std::puts("err: out of range"); return; }
+        for (uint32_t i = 0; i < l; i += 16) {
+            std::printf("%08lX: ", static_cast<unsigned long>(a + i));
+            for (uint32_t j = 0; j < 16 && i + j < l; ++j)
+                std::printf("%02X ", base[a + i + j]);
+            std::putchar('\n');
+        }
+        return;
     }
 
     if (std::strcmp(tokens[0], "swd") == 0 && n >= 2) {
@@ -216,8 +384,14 @@ void handle_command(char* line) {
 void process_hex_line(const char* line) {
     if (*line == '\0') {
         // Leerzeile beendet Upload-Modus.
-        std::printf("hex: %lu bytes empfangen\n",
-                    static_cast<unsigned long>(g_hex_parser ? g_hex_parser->bytes_written() : 0));
+        uint32_t bw = g_hex_parser ? g_hex_parser->bytes_written() : 0;
+        if (bw > 0) {
+            storage::firmware_finalize(bw);
+            std::printf("[upload] %lu bytes, CRC ok\n",
+                        static_cast<unsigned long>(bw));
+        } else {
+            std::puts("[upload] abgebrochen (keine Daten)");
+        }
         g_in_hex_upload = false;
         g_hex_parser = nullptr;
         return;
@@ -232,8 +406,10 @@ void process_hex_line(const char* line) {
         g_in_hex_upload = false;
         g_hex_parser = nullptr;
     } else if (r == R::EndOfFile) {
-        std::printf("hex eof: %lu bytes\n",
-                    static_cast<unsigned long>(g_hex_parser->bytes_written()));
+        uint32_t bw = g_hex_parser->bytes_written();
+        storage::firmware_finalize(bw);
+        std::printf("[upload] %lu bytes, CRC ok\n",
+                    static_cast<unsigned long>(bw));
         g_in_hex_upload = false;
         g_hex_parser = nullptr;
     }
@@ -250,25 +426,27 @@ void init() {
 void run() {
     char line[LINE_MAX];
     std::size_t len = 0;
-    std::printf("> ");
+    std::printf("emu> ");
     while (true) {
         usb_stdio_task();
         led::poll();
         gdb_stub::poll();
         swd_target::poll();
         if (usb_msc::consume_pending_boot_request()) {
-            std::printf("\n[BOOT] BOOT.HEX über USB-MSC erkannt → Start\n");
+            std::printf("\n[BOOT] BOOT.HEX ueber USB-MSC erkannt -> Start\n");
             emulator::load_and_start();
+            std::printf("emu> ");
         }
-        int c = getchar_timeout_us(50'000);
+        int c = getchar_timeout_us(1'000);
         if (c == PICO_ERROR_TIMEOUT) continue;
         if (c == '\r') continue;
         if (c == '\n') {
+            std::putchar('\n');
             line[len] = '\0';
             if (g_in_hex_upload) process_hex_line(line);
             else                 handle_command(line);
             len = 0;
-            std::printf("> ");
+            std::printf("emu> ");
             continue;
         }
         if (c == 0x7F /* DEL */ || c == 0x08 /* BS */) {

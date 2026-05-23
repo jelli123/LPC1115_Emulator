@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cstdint>
 #include <algorithm>
 
 #include "hardware/flash.h"
@@ -247,7 +248,23 @@ void config_dump(void (*emit)(const char*)) {
 
 // --- Firmware-Slot ---------------------------------------------------------
 
+// Page-Buffer: sammelt Schreibvorgänge bis eine volle 256-Byte-Page vorliegt,
+// bevor sie in den Flash programmiert wird. Nötig, weil Intel-HEX-Records
+// typischerweise 16/32-Byte-Blöcke mit beliebigem Alignment liefern.
+alignas(4) static uint8_t fw_page_buf[FLASH_PAGE_SIZE];
+static std::size_t fw_page_base = SIZE_MAX; // Startoffset der gepufferten Page
+
+static bool fw_flush_page() {
+    if (fw_page_base == SIZE_MAX) return true;
+    FlashGuard guard;
+    flash_range_program(firmware_region_offset + fw_page_base,
+                        fw_page_buf, FLASH_PAGE_SIZE);
+    fw_page_base = SIZE_MAX;
+    return true;
+}
+
 bool firmware_erase() {
+    fw_page_base = SIZE_MAX;
     FlashGuard guard;
     flash_range_erase(firmware_region_offset, firmware_region_size);
     firmware_length   = 0;
@@ -257,22 +274,28 @@ bool firmware_erase() {
 
 bool firmware_write(std::size_t offset, const void* data, std::size_t len) {
     if (offset + len > FIRMWARE_SLOT_BYTES) return false;
-    if (offset % FLASH_PAGE_SIZE != 0)      return false;
 
-    // Auf 256-Byte-Pages aufrunden, mit 0xFF füllen.
-    std::size_t padded = ((len + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE)
-                         * FLASH_PAGE_SIZE;
-    alignas(4) static uint8_t page[FLASH_PAGE_SIZE * 8];
-    if (padded > sizeof page) return false;
-    std::memset(page, 0xFF, padded);
-    std::memcpy(page, data, len);
-
-    FlashGuard guard;
-    flash_range_program(firmware_region_offset + offset, page, padded);
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    while (len > 0) {
+        std::size_t page_start = (offset / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
+        if (fw_page_base != page_start) {
+            if (!fw_flush_page()) return false;
+            fw_page_base = page_start;
+            std::memset(fw_page_buf, 0xFF, FLASH_PAGE_SIZE);
+        }
+        std::size_t page_off = offset - page_start;
+        std::size_t chunk = FLASH_PAGE_SIZE - page_off;
+        if (chunk > len) chunk = len;
+        std::memcpy(fw_page_buf + page_off, src, chunk);
+        src    += chunk;
+        offset += chunk;
+        len    -= chunk;
+    }
     return true;
 }
 
 bool firmware_finalize(std::size_t total_len) {
+    fw_flush_page(); // Restliche Daten in Flash schreiben
     if (total_len == 0 || total_len > FIRMWARE_SLOT_BYTES - sizeof(FirmwareHeader)) {
         return false;
     }
