@@ -522,6 +522,7 @@ void run() {
         led::poll();
         gdb_stub::poll();
         swd_target::poll();
+        usb_msc::poll();
         if (usb_msc::consume_pending_boot_request()) {
             std::printf("\n[BOOT] BOOT.HEX ueber USB-MSC erkannt -> Start\n");
             emulator::load_and_start();

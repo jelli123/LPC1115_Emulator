@@ -33,6 +33,7 @@ alignas(4) uint8_t g_disk[VOLUME_BYTES];
 std::atomic<bool> g_dirty{false};
 std::atomic<bool> g_boot_pending{false};
 std::atomic<bool> g_volume_processed{false};
+std::atomic<bool> g_eject_pending{false};
 Stats             g_stats{};
 
 // Dirty-Timeout: wenn der Host N ms nicht mehr schreibt, gilt das Volume
@@ -124,8 +125,19 @@ bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size) {
         const uint8_t* e = root + i * 32;
         if (e[0] == 0x00) break;
         if (e[0] == 0xE5) continue;
+        // LFN-Einträge überspringen (Attribut = 0x0F)
+        if (e[11] == 0x0F) continue;
         if ((e[11] & 0x18) != 0) continue;             // Vol/Dir
-        if (std::memcmp(e, want, 11) != 0) continue;
+        // Case-insensitiver Vergleich: Linux kann 8.3-Einträge klein schreiben
+        // (NTRes-Flag in byte 12 gesetzt).
+        bool match = true;
+        for (int j = 0; j < 11; ++j) {
+            if (toupper(static_cast<unsigned char>(e[j])) !=
+                toupper(static_cast<unsigned char>(want[j]))) {
+                match = false; break;
+            }
+        }
+        if (!match) continue;
         cluster = static_cast<uint16_t>(e[26] | (e[27] << 8));
         size    = static_cast<uint32_t>(e[28]) |
                   (static_cast<uint32_t>(e[29]) << 8) |
@@ -252,6 +264,15 @@ bool consume_pending_boot_request() {
 }
 
 void poll() {
+    // Eject-Flag: wurde im USB-Callback gesetzt, jetzt im Hauptloop sicher
+    // verarbeiten (Flash-Operationen brauchen lange + deaktivieren IRQs).
+    if (g_eject_pending.exchange(false)) {
+        g_dirty.store(false);
+        g_volume_processed.store(true);
+        on_volume_ready();
+        return;
+    }
+
     // Dirty-Timeout: Falls der Host nach dem letzten Schreibzugriff
     // WRITE_IDLE_TIMEOUT_MS nicht mehr geschrieben hat, gilt das Volume
     // als fertig geschrieben. Deckt Linux-umount ohne explizites Eject ab.
@@ -309,8 +330,10 @@ void tud_msc_capacity_cb(uint8_t /*lun*/, uint32_t* block_count,
 bool tud_msc_start_stop_cb(uint8_t /*lun*/, uint8_t /*power_condition*/,
                            bool start, bool load_eject) {
     if (load_eject && !start) {
-        // Host hat das Volume ausgeworfen → unsere Trigger-Stelle.
-        usb_msc::on_volume_ready();
+        // Host hat das Volume ausgeworfen. NICHT hier Flash-Operationen
+        // ausführen (wir sind im TinyUSB-Callback-Kontext, Interrupts
+        // dürfen nicht lange blockiert werden). Nur Flag setzen.
+        usb_msc::g_eject_pending.store(true);
     }
     return true;
 }
