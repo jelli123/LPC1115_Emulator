@@ -71,6 +71,7 @@ add_executable(emulator
     src/iap.cpp
     src/usb_msc.cpp
     src/usb_stdio.cpp
+    src/uart_bridge.cpp
     src/led.cpp
 )
 

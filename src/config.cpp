@@ -13,6 +13,9 @@ namespace {
 PinMap   g_pin_map{};
 uint32_t g_target_freq = 48'000'000;
 bool     g_autostart   = false;
+bool     g_uart_bridge_en = false;
+int      g_uart_bridge_tx = -1;
+int      g_uart_bridge_rx = -1;
 
 constexpr uint32_t MAX_FREQ_HZ = 150'000'000; // RP2350-Limit, defensiv
 constexpr int      MAX_GPIO    = 47;          // RP2350-Pinanzahl konservativ
@@ -64,6 +67,9 @@ void apply_defaults() {
     apply_default_pinmap_impl();
     g_target_freq = 48'000'000;
     g_autostart   = false;
+    g_uart_bridge_en = false;
+    g_uart_bridge_tx = -1;
+    g_uart_bridge_rx = -1;
 }
 
 void load_pin_map_from_storage() {
@@ -93,6 +99,19 @@ bool load() {
         uint32_t v;
         if (parse_uint32(buf, v) && v > 0 && v <= MAX_FREQ_HZ) g_target_freq = v;
     }
+    if (storage::config_get(KEY_UART_BRIDGE_EN, buf, sizeof buf)) {
+        g_uart_bridge_en = (buf[0] == '1');
+    }
+    if (storage::config_get(KEY_UART_BRIDGE_TX, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32(buf, v) && v <= static_cast<uint32_t>(MAX_GPIO))
+            g_uart_bridge_tx = static_cast<int>(v);
+    }
+    if (storage::config_get(KEY_UART_BRIDGE_RX, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32(buf, v) && v <= static_cast<uint32_t>(MAX_GPIO))
+            g_uart_bridge_rx = static_cast<int>(v);
+    }
     load_pin_map_from_storage();
     return true;
 }
@@ -103,6 +122,16 @@ bool save() {
     if (!storage::config_set(KEY_AUTOSTART, buf)) return false;
     std::snprintf(buf, sizeof buf, "%lu", static_cast<unsigned long>(g_target_freq));
     if (!storage::config_set(KEY_TARGET_FREQ_HZ, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_uart_bridge_en ? 1 : 0));
+    if (!storage::config_set(KEY_UART_BRIDGE_EN, buf)) return false;
+    if (g_uart_bridge_tx >= 0) {
+        std::snprintf(buf, sizeof buf, "%d", g_uart_bridge_tx);
+        if (!storage::config_set(KEY_UART_BRIDGE_TX, buf)) return false;
+    }
+    if (g_uart_bridge_rx >= 0) {
+        std::snprintf(buf, sizeof buf, "%d", g_uart_bridge_rx);
+        if (!storage::config_set(KEY_UART_BRIDGE_RX, buf)) return false;
+    }
     char key[24];
     for (std::size_t i = 0; i < LPC_PIN_COUNT; ++i) {
         if (g_pin_map.lpc_to_rp[i] < 0) continue;
@@ -135,5 +164,12 @@ bool set_pin_map(uint8_t lpc_pin, int rp2350_gpio) {
 void apply_default_pinmap() {
     apply_default_pinmap_impl();
 }
+
+bool uart_bridge_enabled()           { return g_uart_bridge_en; }
+void set_uart_bridge_enabled(bool v) { g_uart_bridge_en = v; }
+int  uart_bridge_tx_pin()            { return g_uart_bridge_tx; }
+void set_uart_bridge_tx_pin(int gpio){ g_uart_bridge_tx = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
+int  uart_bridge_rx_pin()            { return g_uart_bridge_rx; }
+void set_uart_bridge_rx_pin(int gpio){ g_uart_bridge_rx = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
 
 } // namespace config

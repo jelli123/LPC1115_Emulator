@@ -11,8 +11,10 @@ Die Implementierungs-Interna stehen in [TECHNICAL.md](TECHNICAL.md).
 |--------------------------|----------------------------------------------|
 | USB CDC#0 (CLI)          | USB-Port (TinyUSB)                           |
 | USB CDC#1 (GDB-RSP)      | USB-Port (TinyUSB, zweite CDC-Schnittstelle) |
+| USB CDC#2 (UART-Bridge)  | USB-Port (TinyUSB, dritte CDC-Schnittstelle) |
 | LPC-GPIO0 → RP-GPIO      | konfigurierbar, siehe Abschnitt 5            |
 | LPC-UART0 (TX/RX)        | RP2350 `uart0` (Default GP0/GP1)             |
+| UART-Bridge TX/RX        | frei wählbare GPIOs (PIO-basiert)            |
 | KNX-Bus (TPUART o. ä.)   | frei wählbar, siehe Abschnitt 7              |
 | SWD-Target-Pins          | 2 freie GPIO, **SWCLK = SWDIO + 1**          |
 
@@ -32,9 +34,10 @@ Eine Pico-2- oder Pico-2-W-Platine genügt.
    Ergebnis: `build/lpc1115_emulator.uf2`.
 
 2. RP2350 in BOOTSEL halten, einstecken, UF2 kopieren.
-3. Zwei serielle Ports erscheinen:
+3. Drei serielle Ports erscheinen:
    * **CDC#0** – CLI (z. B. `COM7` / `/dev/ttyACM0`).
    * **CDC#1** – GDB-Remote-Stub (z. B. `COM8` / `/dev/ttyACM1`).
+   * **CDC#2** – UART-Bridge (z. B. `COM9` / `/dev/ttyACM2`).
 4. Außerdem erscheint ein **Wechseldatenträger** namens `LPC1115EMU`
    (FAT12, 256 KiB).
 5. Mit Terminal an CDC#0 verbinden (115200 8N1, Line-Ending CRLF).
@@ -114,6 +117,14 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 | `swd stop`                    | SWD-Target deaktivieren                          |
 | `pio capture <pin> <count>`   | Edge-Capture-Trace (Mikrosekunden)               |
 
+### UART-Bridge (CDC#2)
+
+| Befehl                        | Wirkung                                          |
+|-------------------------------|--------------------------------------------------|
+| `uart start <tx> <rx>`        | PIO-UART-Bridge starten, Pins zuweisen           |
+| `uart stop`                   | Bridge stoppen                                   |
+| `uart status`                 | TX/RX-Pins, Baudrate, Status anzeigen            |
+
 ---
 
 ## 4. Firmware aufspielen
@@ -144,6 +155,11 @@ pin.0_3=14
 pin.1_8=17              # KNX-RX -> uart0-RX
 pin.1_9=16              # KNX-TX -> uart0-TX
 pin.2_0=25              # Status-LED
+
+# UART-Bridge (CDC#2 ↔ PIO-UART)
+uart_bridge_en=1        # Bridge beim Boot starten
+uart_bridge_tx=4        # TX-Pin (RP2350 → extern)
+uart_bridge_rx=5        # RX-Pin (extern → RP2350)
 ```
 
 > Wenn `BOOT.HEX` und `autostart=on` gesetzt sind, läuft der Emulator
@@ -315,6 +331,80 @@ zwei PHYs:
 
 3. Firmware mit sblib-Default `BCU::begin(0x004C, 0x6049, 1)` läuft
    ohne Anpassung.
+
+---
+
+## 7a. UART-Bridge (CDC#2 ↔ PIO-UART)
+
+Der Emulator stellt eine **dritte serielle USB-Schnittstelle** (CDC#2)
+bereit, die transparent auf zwei frei wählbare RP2350-GPIOs gemappt wird.
+Die Datenübertragung läuft über **PIO-basiertes UART** — die Hardware-
+UARTs des RP2350 werden **nicht** belegt und stehen dem Emulator (z. B.
+für die LPC1115-UART0-Emulation) weiterhin zur Verfügung.
+
+### Anwendungsfälle
+
+* Direkte Kommunikation mit einem TP-UART-Modul vom PC aus (Debugging)
+* Transparenter serieller Durchgriff zu beliebiger externer Hardware
+* Log-Ausgabe der Gast-Firmware über einen zweiten UART-Kanal
+
+### Aktivierung
+
+**Variante A — über CLI:**
+
+```
+emu> uart start 4 5            # TX=GP4, RX=GP5
+[uart-bridge] TX=GP4 RX=GP5 baud=115200
+```
+
+Zum Persistieren (startet dann automatisch beim nächsten Boot):
+
+```
+emu> cfg set uart_bridge_en 1
+emu> cfg set uart_bridge_tx 4
+emu> cfg set uart_bridge_rx 5
+emu> cfg save
+```
+
+**Variante B — über CONFIG.INI (USB-Volume):**
+
+```ini
+uart_bridge_en=1
+uart_bridge_tx=4
+uart_bridge_rx=5
+```
+
+### Baudrate setzen
+
+Die Baudrate wird **vom Host-PC** über den Standard-CDC-Mechanismus
+gesetzt (`SET_LINE_CODING`). Jedes Terminal-Programm, das die Baudrate
+konfigurieren kann, funktioniert:
+
+```bash
+# Linux
+stty -F /dev/ttyACM2 19200
+picocom -b 19200 /dev/ttyACM2
+
+# Windows (PowerShell)
+mode COM9: BAUD=19200 PARITY=N DATA=8 STOP=1
+```
+
+Die PIO-Clock wird **live** angepasst — ein Neustart der Bridge ist
+nicht nötig.
+
+### Status abfragen
+
+```
+emu> uart status
+uart-bridge=active TX=GP4 RX=GP5 baud=19200
+```
+
+### Stoppen
+
+```
+emu> uart stop
+[uart-bridge] stopped
+```
 
 ---
 

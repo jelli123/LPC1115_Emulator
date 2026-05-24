@@ -405,9 +405,9 @@ sollte.
 ## 18. USB-Stack — eigene tusb_config.h, kein `pico_stdio_usb`
 
 Die SDK-Library `pico_stdio_usb` bringt eine eigene `tusb_config.h`
-mit (`CFG_TUD_CDC=1`, kein MSC), die mit unseren 2×CDC + MSC-
+mit (`CFG_TUD_CDC=1`, kein MSC), die mit unseren 3×CDC + MSC-
 Descriptoren kollidieren würde — Folge: das Device enumeriert gar
-nicht und der Host sieht VID:PID `cafe:4011` nicht.
+nicht und der Host sieht VID:PID `cafe:4012` nicht.
 
 Daher:
 * `pico_enable_stdio_usb(emulator 0)` in [CMakeLists.txt](CMakeLists.txt) — die Bridge ist aus.
@@ -418,5 +418,81 @@ Daher:
   Timer-Callback würde auf RP2350 zu HardFault → Boot-ROM →
   BOOTSEL-Modus führen).
 
-VID:PID = `0xCAFE:0x4011` (TinyUSB-Test-VID, in [src/usb_descriptors.cpp](src/usb_descriptors.cpp)).
-Mit `lsusb -d cafe:4011 -v` zu prüfen.
+VID:PID = `0xCAFE:0x4012` (TinyUSB-Test-VID, in [src/usb_descriptors.cpp](src/usb_descriptors.cpp)).
+Mit `lsusb -d cafe:4012 -v` zu prüfen.
+
+---
+
+## 19. UART-Bridge (CDC#2 ↔ PIO-UART)
+
+[src/uart_bridge.cpp](../src/uart_bridge.cpp) stellt eine transparente
+serielle Bridge bereit: USB CDC#2 wird bidirektional auf zwei frei
+wählbare RP2350-GPIOs gemappt — **ohne die Hardware-UARTs zu belegen**.
+
+### Architektur
+
+```
+Host (PC)                    RP2350 (Core 0)
+   │                              │
+   │  USB CDC#2                   │
+   │  SET_LINE_CODING(baud)  ───► │  tud_cdc_line_coding_cb()
+   │  Bulk OUT (TX-Daten)    ───► │  poll(): tud_cdc_n_read(2)
+   │  Bulk IN  (RX-Daten)   ◄─── │  poll(): tud_cdc_n_write(2)
+   │                              │
+                                  │  PIO1 (oder PIO2)
+                                  │  ┌─────────────┐
+                     TX-GPIO ◄────┤  │ SM-TX: 8N1  │ ◄── TX-FIFO
+                                  │  └─────────────┘
+                                  │  ┌─────────────┐
+                     RX-GPIO ────►┤  │ SM-RX: 8N1  │ ──► RX-FIFO
+                                  │  └─────────────┘
+```
+
+### PIO-Programme
+
+**TX** (4 Instruktionen, `side_set 1 opt`):
+```
+.wrap_target
+    pull       side 1 [7]   ; Idle-High / Stop-Bit, auf FIFO warten
+    set  x, 7 side 0 [7]   ; Start-Bit (low), 8 Bits laden
+bitloop:
+    out  pins, 1            ; 1 Bit ausgeben
+    jmp  x-- bitloop  [6]  ; 8 Zyklen/Bit
+.wrap
+```
+
+**RX** (5 Instruktionen, kein side-set):
+```
+.wrap_target
+    wait 0 pin 0            ; Start-Bit abwarten
+    set  x, 7         [10] ; Mitte erstes Datenbit (12 Zyklen nach Flanke)
+bitloop:
+    in   pins, 1            ; Bit sampeln
+    jmp  x-- bitloop  [6]  ; 8 Zyklen/Bit
+    push                    ; 8-Bit-Wort in RX-FIFO
+.wrap
+```
+
+Clock-Divider: `clk_sys / (baud × 8)`.
+
+### Baudraten-Steuerung
+
+Der Host setzt die Baudrate über CDC `SET_LINE_CODING` (Standard-
+Mechanismus, z. B. `stty -F /dev/ttyACM2 19200` oder Terminal-App).
+TinyUSB ruft `tud_cdc_line_coding_cb(itf=2, ...)` auf → der PIO-
+Clock-Divider wird live aktualisiert, ohne die Bridge neu zu starten.
+
+### PIO-Block-Wahl
+
+Die Bridge versucht **PIO1**, dann **PIO2**. PIO0 bleibt für
+`pio_glue` (Edge-Capture) und SWD-Target reserviert.
+
+### Konfiguration
+
+| Key in config.ini        | Wirkung                              |
+|--------------------------|--------------------------------------|
+| `uart_bridge_en=1`       | Bridge beim Boot automatisch starten |
+| `uart_bridge_tx=<gpio>`  | TX-Pin (Datenrichtung: RP→extern)    |
+| `uart_bridge_rx=<gpio>`  | RX-Pin (Datenrichtung: extern→RP)    |
+
+CLI: `uart start <tx> <rx>`, `uart stop`, `uart status`.

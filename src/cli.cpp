@@ -10,6 +10,7 @@
 #include "target_halt.h"
 #include "pio_glue.h"
 #include "usb_msc.h"
+#include "uart_bridge.h"
 #include "led.h"
 
 extern "C" void usb_stdio_task(void);
@@ -66,6 +67,10 @@ void cmd_help() {
         "  swd start <swdio> <swclk>  SWD-Target aktivieren",
         "  swd stop                   SWD-Target deaktivieren",
         "  pio capture <pin> <count>  Edge-Capture-Trace (Zyklen)",
+        "",
+        "  uart start <tx> <rx>       UART-Bridge starten (PIO, CDC#2)",
+        "  uart stop                  UART-Bridge stoppen",
+        "  uart status                TX/RX-Pins, Baudrate, aktiv?",
         "",
         "  freq <Hz>                  Ziel-CPU-Frequenz",
         "  flash hex                  Intel-Hex-Stream (alias fuer upload)",
@@ -468,6 +473,36 @@ void handle_command(char* line) {
         }
     }
 
+    // --- UART-Bridge (CDC#2 ↔ PIO-UART) ---
+    if (std::strcmp(tokens[0], "uart") == 0 && n >= 2) {
+        if (std::strcmp(tokens[1], "start") == 0) {
+            if (n == 4) {
+                long tx, rx;
+                if (!parse_int(tokens[2], 0, 47, tx) ||
+                    !parse_int(tokens[3], 0, 47, rx)) {
+                    std::puts("err: uart start <tx-gpio> <rx-gpio>"); return;
+                }
+                uart_bridge::set_tx_pin(static_cast<int>(tx));
+                uart_bridge::set_rx_pin(static_cast<int>(rx));
+                config::set_uart_bridge_tx_pin(static_cast<int>(tx));
+                config::set_uart_bridge_rx_pin(static_cast<int>(rx));
+            }
+            std::puts(uart_bridge::start() ? "ok" : "err: Pins nicht gesetzt oder PIO voll");
+            return;
+        }
+        if (std::strcmp(tokens[1], "stop") == 0) {
+            uart_bridge::stop();
+            return;
+        }
+        if (std::strcmp(tokens[1], "status") == 0) {
+            std::printf("uart-bridge=%s TX=GP%d RX=GP%d baud=%lu\n",
+                        uart_bridge::active() ? "active" : "off",
+                        uart_bridge::tx_pin(), uart_bridge::rx_pin(),
+                        static_cast<unsigned long>(uart_bridge::baud_rate()));
+            return;
+        }
+    }
+
     std::puts("unknown command — try 'help'");
 }
 
@@ -523,6 +558,7 @@ void run() {
         gdb_stub::poll();
         swd_target::poll();
         usb_msc::poll();
+        uart_bridge::poll();
         if (usb_msc::consume_pending_boot_request()) {
             std::printf("\n[BOOT] BOOT.HEX ueber USB-MSC erkannt -> Start\n");
             emulator::load_and_start();

@@ -1,0 +1,268 @@
+#include "uart_bridge.h"
+
+#include "tusb.h"
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+#include "pico/stdlib.h"
+
+#include <cstdio>
+#include <cstring>
+#include <atomic>
+
+// ---------------------------------------------------------------------------
+// PIO-Programme für 8N1 UART TX und RX.
+//
+// TX (side_set 1 opt, OUT-Pin = side-set-Pin = TX-GPIO):
+//   .wrap_target
+//   pull       side 1 [7]   ; Stop-Bit halten / idle high, auf Daten warten
+//   set  x, 7 side 0 [7]   ; Start-Bit (low) senden, 8 Bit laden
+//   bitloop:
+//   out  pins, 1            ; 1 Bit aus OSR ausgeben
+//   jmp  x-- bitloop  [6]  ; 8 Zyklen pro Bit
+//   .wrap
+//
+// RX (kein side-set, IN-Pin = RX-GPIO):
+//   .wrap_target
+//   wait 0 pin 0            ; Auf Start-Bit warten (fallende Flanke)
+//   set  x, 7         [10] ; Mitte des ersten Datenbits (12 Zyklen ab Flanke)
+//   bitloop:
+//   in   pins, 1            ; 1 Bit sampeln
+//   jmp  x-- bitloop  [6]  ; 8 Zyklen pro Bit
+//   push                    ; 8-Bit-Wort in RX-FIFO
+//   .wrap
+// ---------------------------------------------------------------------------
+
+namespace uart_bridge {
+
+namespace {
+
+// --- TX-Programm (4 Instruktionen, side_set 1 opt) ---
+constexpr uint16_t uart_tx_program_instructions[] = {
+    0x9fa0, // 0: pull   block           side 1 [7]
+    0xf727, // 1: set    x, 7            side 0 [7]
+    0x6001, // 2: out    pins, 1
+    0x0642, // 3: jmp    x--, 2                 [6]
+};
+
+const struct pio_program uart_tx_program = {
+    .instructions = uart_tx_program_instructions,
+    .length       = 4,
+    .origin       = -1,
+    .pio_version  = 0,
+    .used_gpio_ranges = 0,
+};
+
+// --- RX-Programm (5 Instruktionen, kein side-set) ---
+constexpr uint16_t uart_rx_program_instructions[] = {
+    0x2020, // 0: wait   0 pin, 0
+    0xea27, // 1: set    x, 7                   [10]
+    0x4001, // 2: in     pins, 1
+    0x0642, // 3: jmp    x--, 2                 [6]
+    0x8020, // 4: push   block
+};
+
+const struct pio_program uart_rx_program = {
+    .instructions = uart_rx_program_instructions,
+    .length       = 5,
+    .origin       = -1,
+    .pio_version  = 0,
+    .used_gpio_ranges = 0,
+};
+
+// --- Zustand ---
+constexpr uint8_t CDC_ITF = 2;  // dritte CDC-Schnittstelle
+
+int      g_tx_pin   = -1;
+int      g_rx_pin   = -1;
+bool     g_active   = false;
+uint32_t g_baud     = 115200;
+
+PIO      g_pio      = nullptr;
+uint     g_sm_tx    = 0;
+uint     g_sm_rx    = 0;
+int      g_offset_tx = -1;
+int      g_offset_rx = -1;
+
+// Puffer für RX → CDC#2 TX (PIO liefert Wort-weise, CDC will Bulk)
+uint8_t  g_rx_buf[64];
+uint     g_rx_buf_len = 0;
+
+// Clock-Divider berechnen: 8 PIO-Zyklen pro Bit
+float calc_clkdiv(uint32_t baud) {
+    if (baud == 0) baud = 115200;
+    float clk = static_cast<float>(clock_get_hz(clk_sys));
+    return clk / (8.0f * static_cast<float>(baud));
+}
+
+void configure_tx(PIO pio, uint sm, int offset, uint pin, uint32_t baud) {
+    pio_sm_config c = pio_get_default_sm_config();
+
+    sm_config_set_wrap(&c, offset, offset + 3);
+    sm_config_set_sideset(&c, 2, true, false); // 1 bit side-set + opt flag
+
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_shift(&c, true, false, 32); // shift right, no autopull
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&c, calc_clkdiv(baud));
+
+    pio_gpio_init(pio, pin);
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin); // idle high
+    pio_sm_set_pindirs_with_mask(pio, sm, 1u << pin, 1u << pin); // output
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+void configure_rx(PIO pio, uint sm, int offset, uint pin, uint32_t baud) {
+    pio_sm_config c = pio_get_default_sm_config();
+
+    sm_config_set_wrap(&c, offset, offset + 4);
+
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+    sm_config_set_in_shift(&c, true, true, 8); // shift right, autopush at 8 bits
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, calc_clkdiv(baud));
+
+    pio_gpio_init(pio, pin);
+    gpio_pull_up(pin); // Idle-High bei offenem Pin
+    pio_sm_set_pindirs_with_mask(pio, sm, 0, 1u << pin); // input
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+void teardown() {
+    if (!g_pio) return;
+    if (g_active) {
+        pio_sm_set_enabled(g_pio, g_sm_tx, false);
+        pio_sm_set_enabled(g_pio, g_sm_rx, false);
+        pio_sm_unclaim(g_pio, g_sm_tx);
+        pio_sm_unclaim(g_pio, g_sm_rx);
+        if (g_offset_tx >= 0) pio_remove_program(g_pio, &uart_tx_program, g_offset_tx);
+        if (g_offset_rx >= 0) pio_remove_program(g_pio, &uart_rx_program, g_offset_rx);
+    }
+    g_offset_tx = -1;
+    g_offset_rx = -1;
+    g_pio = nullptr;
+    g_active = false;
+}
+
+bool setup_pio() {
+    // Versuche PIO1, dann PIO2 (PIO0 bleibt für pio_glue / edge-capture)
+    PIO candidates[] = { pio1, pio2 };
+
+    for (auto pio : candidates) {
+        if (!pio_can_add_program(pio, &uart_tx_program)) continue;
+        if (!pio_can_add_program(pio, &uart_rx_program)) continue;
+
+        int sm_tx_claim = pio_claim_unused_sm(pio, false);
+        if (sm_tx_claim < 0) continue;
+        int sm_rx_claim = pio_claim_unused_sm(pio, false);
+        if (sm_rx_claim < 0) {
+            pio_sm_unclaim(pio, sm_tx_claim);
+            continue;
+        }
+
+        g_pio = pio;
+        g_sm_tx = static_cast<uint>(sm_tx_claim);
+        g_sm_rx = static_cast<uint>(sm_rx_claim);
+        g_offset_tx = pio_add_program(pio, &uart_tx_program);
+        g_offset_rx = pio_add_program(pio, &uart_rx_program);
+        return true;
+    }
+    return false;
+}
+
+void apply_baud(uint32_t baud) {
+    if (!g_active || !g_pio) return;
+    float div = calc_clkdiv(baud);
+    pio_sm_set_clkdiv(g_pio, g_sm_tx, div);
+    pio_sm_set_clkdiv(g_pio, g_sm_rx, div);
+    // Restart damit neuer Divider sofort wirkt
+    pio_sm_clkdiv_restart(g_pio, g_sm_tx);
+    pio_sm_clkdiv_restart(g_pio, g_sm_rx);
+}
+
+} // namespace
+
+void init() {
+    // Nichts zu tun — start() aktiviert die Bridge.
+}
+
+bool start() {
+    if (g_active) return true;
+    if (g_tx_pin < 0 || g_rx_pin < 0) return false;
+    if (g_tx_pin > 47 || g_rx_pin > 47) return false;
+
+    if (!setup_pio()) {
+        std::puts("[uart-bridge] PIO voll");
+        return false;
+    }
+
+    configure_tx(g_pio, g_sm_tx, g_offset_tx, static_cast<uint>(g_tx_pin), g_baud);
+    configure_rx(g_pio, g_sm_rx, g_offset_rx, static_cast<uint>(g_rx_pin), g_baud);
+
+    g_active = true;
+    std::printf("[uart-bridge] TX=GP%d RX=GP%d baud=%lu\n",
+                g_tx_pin, g_rx_pin, static_cast<unsigned long>(g_baud));
+    return true;
+}
+
+void stop() {
+    if (!g_active) return;
+    teardown();
+    std::puts("[uart-bridge] stopped");
+}
+
+bool active() { return g_active; }
+
+void set_tx_pin(int gpio) { g_tx_pin = gpio; }
+void set_rx_pin(int gpio) { g_rx_pin = gpio; }
+int  tx_pin()             { return g_tx_pin; }
+int  rx_pin()             { return g_rx_pin; }
+uint32_t baud_rate()      { return g_baud; }
+
+void poll() {
+    if (!g_active) return;
+
+    // --- CDC#2 RX → PIO UART TX ---
+    if (tud_cdc_n_connected(CDC_ITF) && tud_cdc_n_available(CDC_ITF)) {
+        uint8_t buf[64];
+        uint32_t count = tud_cdc_n_read(CDC_ITF, buf, sizeof buf);
+        for (uint32_t i = 0; i < count; ++i) {
+            // Warten, falls TX-FIFO voll (sollte selten sein bei normalen Baudraten)
+            while (pio_sm_is_tx_fifo_full(g_pio, g_sm_tx)) tight_loop_contents();
+            pio_sm_put(g_pio, g_sm_tx, static_cast<uint32_t>(buf[i]));
+        }
+    }
+
+    // --- PIO UART RX → CDC#2 TX ---
+    g_rx_buf_len = 0;
+    while (!pio_sm_is_rx_fifo_empty(g_pio, g_sm_rx) &&
+           g_rx_buf_len < sizeof(g_rx_buf)) {
+        uint32_t raw = pio_sm_get(g_pio, g_sm_rx);
+        g_rx_buf[g_rx_buf_len++] = static_cast<uint8_t>(raw >> 24);
+    }
+    if (g_rx_buf_len > 0 && tud_cdc_n_connected(CDC_ITF)) {
+        tud_cdc_n_write(CDC_ITF, g_rx_buf, g_rx_buf_len);
+        tud_cdc_n_write_flush(CDC_ITF);
+    }
+}
+
+} // namespace uart_bridge
+
+// ---------------------------------------------------------------------------
+// TinyUSB-Callback: Host setzt Line-Coding (Baudrate) auf CDC#2.
+// ---------------------------------------------------------------------------
+extern "C" void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* p_line_coding) {
+    if (itf != 2) return;
+    if (!p_line_coding || p_line_coding->bit_rate == 0) return;
+
+    uart_bridge::g_baud = p_line_coding->bit_rate;
+    if (uart_bridge::g_active) {
+        uart_bridge::apply_baud(uart_bridge::g_baud);
+    }
+}

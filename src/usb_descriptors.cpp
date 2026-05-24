@@ -3,16 +3,17 @@
 
 #include <cstring>
 
-// Eigene USB-Descriptoren mit ZWEI CDC-Interfaces:
+// Eigene USB-Descriptoren mit DREI CDC-Interfaces:
 //   CDC #0 → stdio / CLI
 //   CDC #1 → GDB Remote Serial Protocol (gdb_stub.cpp)
+//   CDC #2 → UART-Bridge (uart_bridge.cpp, PIO-UART ↔ USB)
 //
 // Pico-SDK lässt mit TINYUSB_OPT_USE_CUSTOM_USBD_DESCRIPTORS=1 (in
 // CMakeLists per pico_enable_stdio_usb(...) und Override) eigene
-// Descriptoren zu. Wir folgen dem TinyUSB-CDC-Dual-Beispiel.
+// Descriptoren zu. Wir folgen dem TinyUSB-CDC-Multi-Beispiel.
 
 #define USB_VID   0xCAFE
-#define USB_PID   0x4011
+#define USB_PID   0x4012
 #define USB_BCD   0x0200
 
 enum {
@@ -20,6 +21,8 @@ enum {
     ITF_NUM_CDC0_DATA,
     ITF_NUM_CDC1_NOTIF,
     ITF_NUM_CDC1_DATA,
+    ITF_NUM_CDC2_NOTIF,
+    ITF_NUM_CDC2_DATA,
     ITF_NUM_MSC,
     ITF_NUM_TOTAL
 };
@@ -30,10 +33,13 @@ enum {
 #define EPNUM_CDC1_NOTIF  0x83
 #define EPNUM_CDC1_OUT    0x04
 #define EPNUM_CDC1_IN     0x84
-#define EPNUM_MSC_OUT     0x05
-#define EPNUM_MSC_IN      0x85
+#define EPNUM_CDC2_NOTIF  0x85
+#define EPNUM_CDC2_OUT    0x06
+#define EPNUM_CDC2_IN     0x86
+#define EPNUM_MSC_OUT     0x07
+#define EPNUM_MSC_IN      0x87
 
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + 2 * TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN)
+#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + 3 * TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN)
 
 static tusb_desc_device_t const desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
@@ -65,6 +71,9 @@ static uint8_t const desc_fs_configuration[] = {
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1_NOTIF, 5, EPNUM_CDC1_NOTIF, 8,
                        EPNUM_CDC1_OUT, EPNUM_CDC1_IN, 64),
 
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC2_NOTIF, 7, EPNUM_CDC2_NOTIF, 8,
+                       EPNUM_CDC2_OUT, EPNUM_CDC2_IN, 64),
+
     TUD_MSC_DESCRIPTOR(ITF_NUM_MSC, 6, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
 };
 
@@ -80,6 +89,7 @@ static char const* string_desc_arr[] = {
     "LPC-Emu CLI",                        // 4: CDC #0 name
     "LPC-Emu GDB",                        // 5: CDC #1 name
     "LPC-Emu MSC",                        // 6: MSC name
+    "LPC-Emu UART",                       // 7: CDC #2 name (UART-Bridge)
 };
 
 static uint16_t _desc_str[32];

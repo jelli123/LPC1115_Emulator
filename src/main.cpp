@@ -11,6 +11,7 @@
 #include "target_halt.h"
 #include "iap.h"
 #include "usb_msc.h"
+#include "uart_bridge.h"
 #include "led.h"
 
 #include <cstdio>
@@ -47,6 +48,15 @@ int main() {
     target_halt::init();
     iap::init();
     usb_msc::init();
+    uart_bridge::init();
+
+    // UART-Bridge aus Config starten, falls aktiviert
+    if (config::uart_bridge_enabled()) {
+        uart_bridge::set_tx_pin(config::uart_bridge_tx_pin());
+        uart_bridge::set_rx_pin(config::uart_bridge_rx_pin());
+        uart_bridge::start();
+    }
+
     emulator::boot_core1();
 
     cli::init();

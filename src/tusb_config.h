@@ -1,6 +1,6 @@
 #pragma once
 //
-// TinyUSB-Konfiguration für 2 CDC-Interfaces (CLI + GDB).
+// TinyUSB-Konfiguration für 3 CDC-Interfaces (CLI + GDB + UART-Bridge).
 // Diese Datei MUSS im Include-Pfad von TinyUSB als `tusb_config.h`
 // gefunden werden — wir setzen das in CMakeLists.txt mit
 // target_include_directories(... PRIVATE src/) und stellen sicher, dass
@@ -14,7 +14,7 @@
 #define CFG_TUD_ENABLED           1
 #define CFG_TUD_ENDPOINT0_SIZE    64
 
-#define CFG_TUD_CDC               2     /* zwei CDC-Endpoints */
+#define CFG_TUD_CDC               3     /* drei CDC-Endpoints: CLI + GDB + UART-Bridge */
 #define CFG_TUD_CDC_RX_BUFSIZE    256
 #define CFG_TUD_CDC_TX_BUFSIZE    256
 #define CFG_TUD_CDC_EP_BUFSIZE    64
