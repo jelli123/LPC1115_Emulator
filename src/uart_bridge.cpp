@@ -1,5 +1,6 @@
 #include "uart_bridge.h"
 
+#include "config.h"
 #include "tusb.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
@@ -196,6 +197,22 @@ bool start() {
     if (g_active) return true;
     if (g_tx_pin < 0 || g_rx_pin < 0) return false;
     if (g_tx_pin > 47 || g_rx_pin > 47) return false;
+
+    // Konflikte mit dem Emulator-Pin-Mapping auflösen: Bridge-Pins aus
+    // der LPC→RP2350-Tabelle entfernen, damit peripherals.cpp nicht
+    // versucht, die gleichen GPIOs zu treiben.
+    {
+        const auto& pm = config::pin_map();
+        for (std::size_t i = 0; i < config::LPC_PIN_COUNT; ++i) {
+            if (pm.lpc_to_rp[i] == g_tx_pin || pm.lpc_to_rp[i] == g_rx_pin) {
+                std::printf("[uart-bridge] entferne Konflikt: LPC P%u_%u -> GP%d\n",
+                            static_cast<unsigned>(i / 12),
+                            static_cast<unsigned>(i % 12),
+                            pm.lpc_to_rp[i]);
+                config::set_pin_map(static_cast<uint8_t>(i), -1);
+            }
+        }
+    }
 
     if (!setup_pio()) {
         std::puts("[uart-bridge] PIO voll");
