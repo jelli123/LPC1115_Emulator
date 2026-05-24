@@ -21,8 +21,15 @@ std::atomic<emulator::State> g_state{emulator::State::Idle};
 std::atomic<bool>            g_request_stop{false};
 std::atomic<uint32_t>        g_pc{0};
 
+// --- Guest-Speicherbereiche als echte Arrays ---
+// Der Linker platziert sie automatisch ohne Kollision mit anderem BSS.
+// VTOR verlangt 256-Byte-Alignment (128-Byte reicht ab ARMv7-M, aber
+// 256 ist auf der sicheren Seite für 48 Vektoren × 4 = 192 → nächste 2^n = 256).
+alignas(256) uint8_t g_firmware_image[emulator::LPC_LOAD_MAX_SIZE]
+    __attribute__((used)) = {};
+
 alignas(32) uint8_t g_guest_ram[emulator::LPC_GUEST_RAM_SIZE]
-    __attribute__((used, section(".guest_ram"))) = {};
+    __attribute__((used)) = {};
 
 // Externe Symbole der Fault-Handler — die linken weak im SDK; wir adressieren
 // sie hier, um die Firmware-Vector-Table darauf zu patchen.
@@ -46,14 +53,21 @@ void enter_guest(uint32_t /*initial_sp*/, uint32_t /*reset_handler*/) {
     );
 }
 
-// Patch-Helper: relocate Vector-Table-Eintrag, falls er auf den LPC-Flash-
-// Bereich (< 0x10000000) zeigt.
+// Patch-Helper: relocate Vector-Table-Eintrag.
+// Flash (< 0x10000000) → g_firmware_image base + offset
+// RAM (0x10000000..+LPC_GUEST_RAM_SIZE) → g_guest_ram base + offset
 uint32_t relocate_vector(uint32_t v) {
     uint32_t plain = v & ~1u;
     bool thumb = v & 1u;
+    uint32_t load_base = reinterpret_cast<uint32_t>(g_firmware_image);
+    uint32_t ram_base  = reinterpret_cast<uint32_t>(g_guest_ram);
     if (plain < 0x1000'0000u) {
         // LPC-Flash-Range: nach RP2350 SRAM relocaten
-        plain += emulator::LPC_LOAD_BASE;
+        plain += load_base;
+    } else if (plain >= 0x1000'0000u &&
+               plain < 0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE) {
+        // LPC-RAM-Range: nach RP2350 Guest-RAM relocaten
+        plain = ram_base + (plain - 0x1000'0000u);
     }
     return plain | (thumb ? 1u : 0u);
 }
@@ -77,7 +91,7 @@ void core1_main() {
             continue;
         }
 
-        auto* dst = reinterpret_cast<uint32_t*>(emulator::LPC_LOAD_BASE);
+        auto* dst = reinterpret_cast<uint32_t*>(g_firmware_image);
         std::memcpy(dst, fw, sz);
         if (sz < emulator::LPC_LOAD_MAX_SIZE) {
             std::memset(reinterpret_cast<uint8_t*>(dst) + sz, 0xFF,
@@ -93,7 +107,7 @@ void core1_main() {
             // Initial-SP: falls in LPC-RAM-Range, auf Gast-RAM-Top umsetzen.
             uint32_t isp = dst[0];
             if (isp >= 0x1000'0000u && isp < 0x1000'0000u + 0x10000u) {
-                dst[0] = emulator::LPC_GUEST_RAM_BASE
+                dst[0] = reinterpret_cast<uint32_t>(g_guest_ram)
                        + emulator::LPC_GUEST_RAM_SIZE;
             }
             // System-Faults: unsere Handler eintragen.
@@ -104,17 +118,19 @@ void core1_main() {
         }
 
         // RAM-Adressen aus Literal-Pools relocaten (LPC RAM 0x10000000+8KB
-        // → RP2350 0x20060000+8KB).
+        // → RP2350 g_guest_ram).
+        uint32_t ram_base = reinterpret_cast<uint32_t>(g_guest_ram);
         auto pr = hex_patcher::relocate_ram_refs(
             reinterpret_cast<uint8_t*>(dst), sz,
-            0x1000'0000u, 0x2000u,
-            emulator::LPC_GUEST_RAM_BASE);
-        std::printf("[EMU] hex-patch: %u/%u Wörter relociert\n",
+            0x1000'0000u, emulator::LPC_GUEST_RAM_SIZE,
+            ram_base);
+        std::printf("[EMU] hex-patch: %u/%u Woerter relociert\n",
                     static_cast<unsigned>(pr.patched_words),
                     static_cast<unsigned>(pr.scanned_words));
 
-        // VTOR setzen (muss 128-Byte-aligned sein → 0x40 Bits frei).
-        SCB->VTOR = emulator::LPC_LOAD_BASE;
+        // VTOR setzen (muss 256-Byte-aligned sein, Array ist alignas(256)).
+        uint32_t load_base = reinterpret_cast<uint32_t>(g_firmware_image);
+        SCB->VTOR = load_base;
         __DSB(); __ISB();
 
         // MPU für den Gast scharf schalten.
@@ -125,7 +141,7 @@ void core1_main() {
         std::printf("[EMU] starting: SP=0x%08lx PC=0x%08lx (load=0x%08lx, %u B)\n",
                     static_cast<unsigned long>(initial_sp),
                     static_cast<unsigned long>(reset_h),
-                    static_cast<unsigned long>(emulator::LPC_LOAD_BASE),
+                    static_cast<unsigned long>(load_base),
                     static_cast<unsigned>(sz));
 
         // Sprung in den Gast — kommt nicht zurück.
@@ -179,5 +195,13 @@ void request_guest_reset() {
 State    state()    { return g_state.load(); }
 uint32_t pc()       { return g_pc.load(); }
 uint64_t mem_traps(){ return faultsys::stats().mem_traps; }
+
+uint32_t load_base() {
+    return reinterpret_cast<uint32_t>(g_firmware_image);
+}
+
+uint32_t guest_ram_base() {
+    return reinterpret_cast<uint32_t>(g_guest_ram);
+}
 
 } // namespace emulator

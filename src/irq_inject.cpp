@@ -53,9 +53,9 @@ struct StackFrame {
 };
 static_assert(sizeof(StackFrame) == 32, "frame size");
 
-// Liest aus der Gast-Vector-Tabelle (an LPC_LOAD_BASE) den IRQ-Handler.
+// Liest aus der Gast-Vector-Tabelle den IRQ-Handler.
 uint32_t lookup_handler(uint8_t lpc_irq) {
-    auto* vt = reinterpret_cast<uint32_t*>(emulator::LPC_LOAD_BASE);
+    auto* vt = reinterpret_cast<uint32_t*>(emulator::load_base());
     uint32_t v = vt[16 + lpc_irq];
     return v;                  // mit Thumb-Bit
 }

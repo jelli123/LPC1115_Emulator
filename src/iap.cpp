@@ -19,7 +19,7 @@ uint16_t g_prepared_mask = 0;       // Bit n => Sektor n vorbereitet (cmd 50)
 bool g_dirty = false;
 
 uint8_t* flash_image() {
-    return reinterpret_cast<uint8_t*>(emulator::LPC_LOAD_BASE);
+    return reinterpret_cast<uint8_t*>(emulator::load_base());
 }
 
 bool sector_valid(uint32_t s) { return s < LPC_NUM_SECTORS; }

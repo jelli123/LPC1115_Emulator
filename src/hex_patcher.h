@@ -4,23 +4,23 @@
 //
 // Die LPC1115 platziert ihren SRAM bei 0x10000000-0x10001FFF (8 KB). Auf
 // dem RP2350 ist dieser Adressbereich vom XIP belegt; wir ordnen den
-// Gast-SRAM stattdessen bei 0x20060000 an (siehe emulator.h).
+// Gast-SRAM stattdessen dynamisch an (siehe emulator.h, emulator.cpp).
 //
 // Der Code-Generator von Keil/GCC legt SRAM-Adressen als 32-Bit-Konstanten
-// in Literal-Pools ab (für `LDR Rx, =sym`). Der Patcher scannt das gesamte
-// Firmware-Image nach 4-byte-aligned Wörtern, deren Wert exakt im
-// Bereich [0x10000000, 0x10002000) liegt, und ersetzt sie durch
-// 0x20060000 + (orig - 0x10000000).
+// in Literal-Pools ab (fuer `LDR Rx, =sym`). Der Patcher scannt das gesamte
+// Firmware-Image nach 4-byte-aligned Woertern, deren Wert exakt im
+// Bereich [0x10000000, 0x10000000 + LPC_GUEST_RAM_SIZE) liegt, und ersetzt
+// sie durch guest_ram_base + (orig - 0x10000000).
 //
 // Heuristik-Hinweis (im README dokumentiert):
-//   - False-Positive-Wahrscheinlichkeit ~ 8 KB / 2^32 ≈ 1 / 524288 pro Wort.
-//     Eine 64 KB Firmware hat 16384 Wörter ⇒ Erwartungswert ~ 0.03 false
-//     positives. Praktisch vernachlässigbar, aber nicht 0.
-//   - Werden ausschließlich 4-byte-aligned Stellen geändert; Befehlsstrom
+//   - False-Positive-Wahrscheinlichkeit ~ 8 KB / 2^32 ~ 1 / 524288 pro Wort.
+//     Eine 64 KB Firmware hat 16384 Woerter => Erwartungswert ~ 0.03 false
+//     positives. Praktisch vernachlaessigbar.
+//   - Werden ausschliesslich 4-byte-aligned Stellen geaendert; Befehlsstrom
 //     im Thumb-Code ist 2-byte-aligned, daher kann eine BL-Instruktion
-//     nicht versehentlich an ihrer 32-Bit-Form verändert werden, wenn sie
-//     nicht zufällig 4-byte-aligned beginnt UND dieselbe Bitkombination
-//     trägt. Das ist astronomisch unwahrscheinlich.
+//     nicht versehentlich an ihrer 32-Bit-Form veraendert werden, wenn sie
+//     nicht zufaellig 4-byte-aligned beginnt UND dieselbe Bitkombination
+//     traegt. Das ist astronomisch unwahrscheinlich.
 //
 
 #include <cstdint>

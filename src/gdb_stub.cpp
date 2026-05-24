@@ -106,8 +106,8 @@ uint32_t* reg_ptr(unsigned idx) {
 }
 
 bool addr_in_guest_ram(uint32_t a) {
-    return a >= emulator::LPC_LOAD_BASE
-        && a <  emulator::LPC_LOAD_BASE + emulator::LPC_LOAD_MAX_SIZE;
+    uint32_t base = emulator::load_base();
+    return a >= base && a < base + emulator::LPC_LOAD_MAX_SIZE;
 }
 
 bool insert_breakpoint(uint32_t addr) {

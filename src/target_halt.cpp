@@ -153,14 +153,13 @@ bool read_register(unsigned idx, uint32_t& value) {
 }
 
 uint32_t map_guest_address(uint32_t lpc_addr) {
-    // LPC1115 Flash: 0x0000_0000 – 0x0000_FFFF → RP2350 SRAM bei
-    // emulator::LPC_LOAD_BASE.
+    // LPC1115 Flash: 0x0000_0000 – 0x0000_FFFF → RP2350 SRAM.
     if (lpc_addr < 0x1000'0000u) {
-        return emulator::LPC_LOAD_BASE + lpc_addr;
+        return emulator::load_base() + lpc_addr;
     }
-    // LPC1115 SRAM: 0x1000_0000 – 0x1000_1FFF → emulator::LPC_GUEST_RAM_BASE.
-    if (lpc_addr >= 0x1000'0000u && lpc_addr < 0x1000'2000u) {
-        return emulator::LPC_GUEST_RAM_BASE + (lpc_addr - 0x1000'0000u);
+    // LPC1115 SRAM: 0x1000_0000 – 0x1000_1FFF → Guest-RAM.
+    if (lpc_addr >= 0x1000'0000u && lpc_addr < 0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE) {
+        return emulator::guest_ram_base() + (lpc_addr - 0x1000'0000u);
     }
     // Peripherie/PPB/Sonstiges: identisch durchreichen.
     return lpc_addr;
