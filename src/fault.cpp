@@ -3,9 +3,12 @@
 #include "peripherals.h"
 #include "gdb_stub.h"
 #include "iap.h"
+#include "emulator.h"
+#include "storage.h"
 
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include "hardware/watchdog.h"
 #include "pico/stdlib.h"
 #include "RP2350.h"
@@ -49,6 +52,29 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
         return;
     }
 
+    // IACCVIOL: Guest versuchte Code an einer nicht-relocierten LPC-Adresse
+    // auszufuehren (Flash-Funktionspointer in Literal-Pool / .data).
+    // Wir leiten den PC auf die tatsaechliche Position im RP2350-SRAM um.
+    uint32_t cfsr = SCB->CFSR;
+    if (cfsr & 0x01u) {  // MMFSR.IACCVIOL
+        uint32_t fpc = frame->pc;
+        // LPC Flash [0, firmware_size) → load_base + offset
+        if (fpc < storage::firmware_size()) {
+            frame->pc = emulator::load_base() + fpc;
+            SCB->CFSR = cfsr;
+            ++faultsys::g_stats.mem_traps;
+            return;
+        }
+        // LPC SRAM [0x10000000, 0x10000000 + RAM_SIZE) → guest_ram + offset
+        if (fpc >= 0x1000'0000u &&
+            fpc <  0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE) {
+            frame->pc = emulator::guest_ram_base() + (fpc - 0x1000'0000u);
+            SCB->CFSR = cfsr;
+            ++faultsys::g_stats.mem_traps;
+            return;
+        }
+    }
+
     uint32_t* r4_r11 = r4_r11_lr;       // 8 Werte
     uint32_t  guest_sp = reinterpret_cast<uint32_t>(frame) + 0x20;
 
@@ -69,6 +95,46 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
 
     // Emulieren
     bool ok = true;
+
+    // LPC-Flash-Bereich: Daten aus dem geladenen Firmware-Image liefern.
+    // Der Guest liest z. B. .data-Initialisierungswerte ueber einen
+    // nicht-relocierten Flash-Pointer (Scatter-Load-Tabelle).
+    if (acc.address < emulator::LPC_LOAD_MAX_SIZE &&
+        acc.address < storage::firmware_size()) {
+        if (acc.is_load) {
+            auto* img = reinterpret_cast<const uint8_t*>(emulator::load_base());
+            uint32_t value = 0;
+            switch (acc.size) {
+                case AccessSize::B: {
+                    uint8_t v = img[acc.address];
+                    value = acc.is_signed
+                        ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v)))
+                        : v;
+                    break;
+                }
+                case AccessSize::H: {
+                    uint16_t h;
+                    std::memcpy(&h, img + acc.address, 2);
+                    value = acc.is_signed
+                        ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h)))
+                        : h;
+                    break;
+                }
+                case AccessSize::W: {
+                    std::memcpy(&value, img + acc.address, 4);
+                    break;
+                }
+            }
+            uint32_t* dst = reg_ptr(frame, r4_r11, &guest_sp, acc.rt);
+            if (dst) *dst = value;
+        }
+        // Writes to Flash: silently ignore (Flash is read-only).
+        frame->pc += acc.instr_size;
+        SCB->CFSR = SCB->CFSR;
+        ++faultsys::g_stats.mem_traps;
+        return;
+    }
+
     if (acc.is_load) {
         uint32_t value = 0;
         switch (acc.size) {
