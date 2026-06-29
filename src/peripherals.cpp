@@ -11,6 +11,7 @@
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
 #include "hardware/uart.h"
+#include "hardware/i2c.h"
 #include "hardware/timer.h"
 #include "hardware/structs/clocks.h"
 #include "hardware/structs/scb.h"
@@ -56,6 +57,11 @@ constexpr uint32_t PDRUNCFG           = SYSCON_BASE + 0x238;
 // IOCON Block bei 0x40044000 — Pinmux. Modellieren wir als RAM (kein Effekt).
 constexpr uint32_t IOCON_BASE         = 0x4004'4000;
 constexpr uint32_t IOCON_END          = 0x4004'4100;
+
+// PINTSEL0..7 (Kanal→Pin-Auswahl der Pin-Interrupts) im SYSCON-Block.
+// LPC11Exx-Map: 0x40048178..0x40048194 (8 Register).
+constexpr uint32_t PINTSEL0           = SYSCON_BASE + 0x178;
+constexpr uint32_t PINTSEL_END        = SYSCON_BASE + 0x198;
 
 // GPIO0..GPIO3 @ 0x50000000 + N*0x10000.
 // Pro Port:  0x0000-0x3FFC = maskierter DATA-Zugriff (Adress-Bits[11:2] = pin-mask)
@@ -169,6 +175,7 @@ uint32_t        g_mainclksel   = 0;       // 0 = IRC, 2 = SYSPLLOUT
 uint32_t        g_sysahbclkdiv = 1;
 uint32_t        g_pdruncfg     = 0xFFFF;
 uint8_t         g_iocon[256]{};
+uint8_t         g_pintsel[8]{};            // Kanal n → LPC-Pin-Index (PINTSEL0..7)
 uint32_t        g_current_hz   = 12'000'000; // Default IRC
 
 peripherals::Stats g_stats{};
@@ -235,7 +242,11 @@ void syscon_write32(uint32_t addr, uint32_t value) {
         case MAINCLKUEN:
             if (value & 1u) g_pll_reconfig_pending = true;
             break;
-        default: break;
+        default:
+            if (addr >= PINTSEL0 && addr < PINTSEL_END) {
+                g_pintsel[(addr - PINTSEL0) >> 2] = static_cast<uint8_t>(value & 0x3Fu);
+            }
+            break;
     }
 }
 
@@ -249,7 +260,10 @@ uint32_t syscon_read32(uint32_t addr) {
         case MAINCLKUEN:   return 1;
         case SYSAHBCLKDIV: return g_sysahbclkdiv;
         case PDRUNCFG:     return g_pdruncfg;
-        default: return 0;
+        default:
+            if (addr >= PINTSEL0 && addr < PINTSEL_END)
+                return g_pintsel[(addr - PINTSEL0) >> 2];
+            return 0;
     }
 }
 
@@ -688,21 +702,102 @@ void ssp_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
 }
 
 // =========================================================================
-// I²C0 — sehr minimaler Modell. Liefert STAT=0xF8 (idle) und NAK auf jeden
-// Adress-Send. Reicht damit die meisten sblib-Apps booten, auch wenn kein
-// I²C-Slave angeschlossen ist.
+// I²C0 — echte Bridge auf RP2350-Hardware-I²C (i2c0/i2c1), konfigurierbar.
+//
+// Wir bilden die LPC-I²C-Master-Statemachine (CONSET STA/STO/SI/AA/I2EN +
+// STAT-Codes) auf SDK-Transfers ab:
+//   • Schreib-Transaktionen werden gepuffert und beim STOP bzw. beim
+//     wiederholten START (nostop=true) auf den Bus geschrieben.
+//   • Lese-Transaktionen lesen Byte-für-Byte lazy (nostop bis zum letzten,
+//     gesteuert über das AA-Bit) — funktioniert für die üblichen
+//     Auto-Increment-Slaves (Sensoren, EEPROMs, write-reg-then-read).
+//
+// Ist die Bridge nicht aktiviert/initialisiert, fällt das Modell auf das
+// alte Stub-Verhalten zurück (STAT=0xF8 idle, NAK 0x20 auf START), damit
+// Apps ohne angeschlossenen Slave weiter booten.
+//
+// Bekannte Grenze: Adress-ACK bei reinen Schreib-Transaktionen wird optimi-
+// stisch (0x18/0x28) gemeldet; das echte NAK-Ergebnis steht erst beim Flush
+// (STOP/RepStart) fest. Reine Bus-Scans über Schreibzugriffe erkennen daher
+// fehlende Slaves erst verzögert; Lese-basierte Probes funktionieren korrekt.
 // =========================================================================
 struct I2cModel {
     uint32_t conset, conclr, stat, dat;
+    // Bridge-Transaktionszustand
+    uint8_t  addr7;       // 7-Bit-Slave-Adresse der aktuellen Transaktion
+    bool     is_read;     // Richtung
+    bool     started;     // START gesendet, Adresse noch nicht
+    bool     addr_done;   // Adressbyte verarbeitet
+    bool     any_started; // schon mindestens ein START in dieser Sitzung
+    uint8_t  wbuf[64];    // Puffer für Schreibdaten
+    uint8_t  wlen;
 };
 I2cModel g_i2c{};
+
+// CONSET/CONCLR-Bits
+constexpr uint32_t I2C_AA   = 0x04u;
+constexpr uint32_t I2C_SI   = 0x08u;
+constexpr uint32_t I2C_STO  = 0x10u;
+constexpr uint32_t I2C_STA  = 0x20u;
+constexpr uint32_t I2C_I2EN = 0x40u;
+
+i2c_inst_t* g_i2c_hw    = nullptr;   // nullptr → Bridge inaktiv (Stub)
+bool        g_i2c_ready = false;
+
+void i2c_bridge_init() {
+    g_i2c_hw    = nullptr;
+    g_i2c_ready = false;
+    if (!config::i2c_bridge_enabled()) return;
+    int sda = config::i2c_bridge_sda_pin();
+    int scl = config::i2c_bridge_scl_pin();
+    if (sda < 0 || scl < 0) return;
+    g_i2c_hw = config::i2c_bridge_instance() ? i2c1 : i2c0;
+    i2c_init(g_i2c_hw, config::i2c_bridge_hz());
+    gpio_set_function(static_cast<uint>(sda), GPIO_FUNC_I2C);
+    gpio_set_function(static_cast<uint>(scl), GPIO_FUNC_I2C);
+    gpio_pull_up(static_cast<uint>(sda));
+    gpio_pull_up(static_cast<uint>(scl));
+    g_i2c_ready = true;
+}
+
+// Puffer-Schreibtransaktion auf den Bus schieben. nostop=true hält den Bus
+// für einen folgenden (Repeated-START-)Lesezugriff offen.
+void i2c_flush_write(bool nostop) {
+    if (!g_i2c_ready || g_i2c.wlen == 0) { g_i2c.wlen = 0; return; }
+    int r = i2c_write_timeout_us(g_i2c_hw, g_i2c.addr7, g_i2c.wbuf,
+                                 g_i2c.wlen, nostop, 5000u * (g_i2c.wlen + 1));
+    if (r < 0) g_i2c.stat = 0x30u;  // Datentransfer NAK
+    g_i2c.wlen = 0;
+}
+
+void i2c_reset_txn() {
+    g_i2c.started   = false;
+    g_i2c.addr_done = false;
+    g_i2c.wlen      = 0;
+    g_i2c.stat      = 0xF8u;
+}
 
 uint8_t i2c_read_byte(uint32_t addr) {
     uint32_t lane = (addr & 3u) * 8u;
     switch (addr & ~3u) {
         case I2C_CONSET: return static_cast<uint8_t>((g_i2c.conset >> lane) & 0xFFu);
         case I2C_STAT:   return static_cast<uint8_t>((g_i2c.stat   >> lane) & 0xFFu);
-        case I2C_DAT:    return static_cast<uint8_t>((g_i2c.dat    >> lane) & 0xFFu);
+        case I2C_DAT: {
+            // Lazy-Read: nächstes Byte vom realen Slave holen.
+            if (g_i2c_ready && g_i2c.addr_done && g_i2c.is_read) {
+                bool last = (g_i2c.conset & I2C_AA) == 0;   // AA=0 → letztes Byte
+                uint8_t b = 0;
+                int r = i2c_read_timeout_us(g_i2c_hw, g_i2c.addr7, &b, 1,
+                                            /*nostop=*/!last, 5000u);
+                if (r < 0) {
+                    g_i2c.stat = 0x48u;        // (Adress-)NAK beim Empfang
+                } else {
+                    g_i2c.dat  = b;
+                    g_i2c.stat = last ? 0x58u : 0x50u;
+                }
+            }
+            return static_cast<uint8_t>((g_i2c.dat >> lane) & 0xFFu);
+        }
         default: return 0;
     }
 }
@@ -712,18 +807,57 @@ void i2c_write_byte(uint32_t addr, uint8_t val) {
     auto patch = [&](uint32_t& v) {
         v = (v & ~(0xFFu << lane)) | (static_cast<uint32_t>(val) << lane);
     };
-    switch (addr & ~3u) {
-        case I2C_CONSET: patch(g_i2c.conset); break;
-        case I2C_CONCLR: g_i2c.conset &= ~(static_cast<uint32_t>(val) << lane); break;
-        case I2C_DAT:    patch(g_i2c.dat);    break;
-        default: break;
+    uint32_t reg = addr & ~3u;
+
+    if (reg == I2C_CONCLR) {
+        g_i2c.conset &= ~(static_cast<uint32_t>(val) << lane);
+        return;
     }
-    // STA gesetzt → "START gesendet, kein Slave da" → NAK-Status 0x20.
-    if (g_i2c.conset & 0x20u) {
-        g_i2c.stat = 0x20u;
-        if (g_i2c.conset & 0x40u) irq_inject::pend(lpc_irq::I2C0);
-    } else {
-        g_i2c.stat = 0xF8u;  // idle
+    if (reg == I2C_DAT) {
+        if (g_i2c.started && !g_i2c.addr_done) {
+            // Adressbyte (SLA + R/W)
+            g_i2c.addr7     = static_cast<uint8_t>(val >> 1);
+            g_i2c.is_read   = (val & 1u) != 0;
+            g_i2c.addr_done = true;
+            g_i2c.stat      = g_i2c.is_read ? 0x40u : 0x18u;  // SLA+R/W ACK (optimistisch)
+        } else if (g_i2c.addr_done && !g_i2c.is_read) {
+            // Schreibdaten puffern
+            if (g_i2c.wlen < sizeof g_i2c.wbuf) g_i2c.wbuf[g_i2c.wlen++] = static_cast<uint8_t>(val);
+            g_i2c.stat = 0x28u;  // Daten gesendet, ACK
+        }
+        patch(g_i2c.dat);
+        if (g_i2c.conset & I2C_I2EN) irq_inject::pend(lpc_irq::I2C0);
+        return;
+    }
+    if (reg != I2C_CONSET) { patch(g_i2c.dat); return; }
+
+    // --- CONSET ---
+    patch(g_i2c.conset);
+
+    if (g_i2c.conset & I2C_STO) {
+        // STOP: ausstehende Schreibtransaktion abschließen.
+        if (g_i2c.addr_done && !g_i2c.is_read) i2c_flush_write(/*nostop=*/false);
+        g_i2c.conset &= ~I2C_STO;   // STO ist selbstlöschend
+        i2c_reset_txn();
+        return;
+    }
+    if (g_i2c.conset & I2C_STA) {
+        // (Wiederholter) START. Bei laufender Schreibtransaktion zuerst den
+        // Bus mit nostop=true offenhalten, dann neu adressieren.
+        if (g_i2c.addr_done && !g_i2c.is_read && g_i2c.wlen > 0)
+            i2c_flush_write(/*nostop=*/true);
+        bool repeated = g_i2c.any_started;
+        g_i2c.started     = true;
+        g_i2c.any_started = true;
+        g_i2c.addr_done   = false;
+        if (!g_i2c_ready) {
+            // Stub: kein Slave → START gemeldet, danach NAK beim Adress-Send.
+            g_i2c.stat = 0x20u;
+        } else {
+            g_i2c.stat = repeated ? 0x10u : 0x08u;
+        }
+        if (g_i2c.conset & I2C_I2EN) irq_inject::pend(lpc_irq::I2C0);
+        return;
     }
 }
 
@@ -783,11 +917,35 @@ extern "C" void peripherals_lowpower_idle() {
     }
 }
 
+// --- Zustand für generischen MMIO-Schatten, PINT und GINT (siehe unten) ---
+struct ShadowEntry { uint32_t addr; uint8_t val; bool used; };
+constexpr uint32_t SHADOW_SLOTS = 1024;
+ShadowEntry g_mmio_shadow[SHADOW_SLOTS]{};
+
+struct PintModel {
+    uint8_t isel, ienr, ienf;            // Konfiguration (1 Bit/Kanal)
+    uint8_t rise, fall, ist;             // Status
+};
+PintModel g_pint{};
+uint16_t  g_pint_prev = 0;               // letzter Pegel je Kanal
+
+struct GintModel {
+    uint32_t ctrl, pol[2], ena[2];
+    uint8_t  irq_num;
+    bool     prev_match;
+};
+GintModel g_gint[2]{};
+
 } // namespace
 
 namespace peripherals {
 
-void init() { reset(); }
+void init() {
+    reset();
+    i2c_bridge_init();
+}
+
+void i2c_bridge_reinit() { i2c_bridge_init(); }
 
 void reset() {
     std::memset(g_gpio, 0, sizeof g_gpio);
@@ -819,7 +977,16 @@ void reset() {
     g_ssp[1].irq_num = lpc_irq::SSP1;
     g_i2c = {};
     g_i2c.stat = 0xF8u;
+    i2c_reset_txn();
+    g_i2c.any_started = false;
     std::memset(g_pmu, 0, sizeof g_pmu);
+    std::memset(g_pintsel, 0, sizeof g_pintsel);
+    std::memset(g_mmio_shadow, 0, sizeof g_mmio_shadow);
+    g_pint = {};
+    g_pint_prev = 0;
+    for (auto& g : g_gint) g = {};
+    g_gint[0].irq_num = lpc_irq::GINT0;
+    g_gint[1].irq_num = lpc_irq::GINT1;
 }
 
 // Bridge zum Emulator: WDT-Reset wird drüben asynchron behandelt.
@@ -840,8 +1007,216 @@ void on_post_write_hook() {
 
 uint32_t current_cpu_hz() { return g_current_hz; }
 
+// =========================================================================
+// A) Generischer Schatten für NICHT modellierte MMIO-Adressen.
+// Unbekannte Schreibzugriffe landen hier statt im Watchdog-Reset; Rücklesen
+// bleibt konsistent. Damit kann KEIN Programm mehr an einer nicht
+// modellierten Peripherie abstürzen — es verliert dort nur die Funktion.
+// Direkt-gemappte Tabelle (Kollision = Overwrite), ausreichend für die
+// üblichen Konfig-Register-Rücklesemuster. (Datendefinition siehe oben.)
+// =========================================================================
+inline uint32_t shadow_slot(uint32_t addr) {
+    return (addr * 2654435761u) >> 22;   // 32→10 Bit
+}
+void shadow_store(uint32_t addr, uint8_t val) {
+    ShadowEntry& e = g_mmio_shadow[shadow_slot(addr)];
+    e.addr = addr; e.val = val; e.used = true;
+}
+bool shadow_load(uint32_t addr, uint8_t& out) {
+    const ShadowEntry& e = g_mmio_shadow[shadow_slot(addr)];
+    if (e.used && e.addr == addr) { out = e.val; return true; }
+    return false;
+}
+
+// =========================================================================
+// GPIO-Eingänge: echte RP2350-Pins lesen (für Input-konfigurierte LPC-Pins).
+// Output-Pins kommen weiter aus dem Schatten g_gpio[].data.
+// =========================================================================
+uint32_t gpio_live_port_data(uint32_t port) {
+    if (port >= 4) return 0;
+    uint32_t dir  = g_gpio[port].dir;
+    uint32_t data = g_gpio[port].data;
+    const auto& pm = config::pin_map();
+    for (uint8_t pin = 0; pin < 12; ++pin) {
+        if ((dir >> pin) & 1u) continue;            // Output → Schatten
+        uint8_t lpc = lpc_pin_idx(static_cast<uint8_t>(port), pin);
+        if (lpc >= config::LPC_PIN_COUNT) continue;
+        int g = pm.lpc_to_rp[lpc];
+        if (g < 0) continue;
+        bool lvl = gpio_get(static_cast<uint>(g));
+        data = (data & ~(1u << pin)) | (static_cast<uint32_t>(lvl) << pin);
+    }
+    return data;
+}
+
+// =========================================================================
+// PINT (Pin-Interrupts, LPC11Exx-flexint) @ 0x4004C000, 8 Kanäle → IRQ 0..7.
+// =========================================================================
+constexpr uint32_t PINT_BASE  = 0x4004'C000;
+constexpr uint32_t PINT_ISEL  = 0x000;   // 0=edge, 1=level
+constexpr uint32_t PINT_IENR  = 0x004;   // enable rising / level
+constexpr uint32_t PINT_SIENR = 0x008;   // set IENR (W)
+constexpr uint32_t PINT_CIENR = 0x00C;   // clear IENR (W)
+constexpr uint32_t PINT_IENF  = 0x010;   // enable falling / level-polarität
+constexpr uint32_t PINT_SIENF = 0x014;   // set IENF (W)
+constexpr uint32_t PINT_CIENF = 0x018;   // clear IENF (W)
+constexpr uint32_t PINT_RISE  = 0x01C;   // rising-edge detect (W1C)
+constexpr uint32_t PINT_FALL  = 0x020;   // falling-edge detect (W1C)
+constexpr uint32_t PINT_IST   = 0x024;   // interrupt status (W1C)
+constexpr uint32_t PINT_END   = PINT_BASE + 0x100;
+
+// =========================================================================
+// GINT0/GINT1 (Group-Interrupts) @ 0x4005C000 / 0x40060000 → IRQ 8/9.
+// =========================================================================
+constexpr uint32_t GINT0_BASE      = 0x4005'C000;
+constexpr uint32_t GINT1_BASE      = 0x4006'0000;
+constexpr uint32_t GINT_BLOCK      = 0x4000;
+constexpr uint32_t GINT_CTRL       = 0x000;   // [0]=INT(W1C) [1]=COMB(0=OR,1=AND) [2]=TRIG
+constexpr uint32_t GINT_PORT_POL0  = 0x020;
+constexpr uint32_t GINT_PORT_POL1  = 0x024;
+constexpr uint32_t GINT_PORT_ENA0  = 0x040;
+constexpr uint32_t GINT_PORT_ENA1  = 0x044;
+
+uint32_t gint_idx_for(uint32_t addr) {
+    if (addr >= GINT0_BASE && addr < GINT0_BASE + GINT_BLOCK) return 0;
+    if (addr >= GINT1_BASE && addr < GINT1_BASE + GINT_BLOCK) return 1;
+    return 0xFFFFFFFFu;
+}
+uint32_t gint_base_for(uint32_t i) { return i ? GINT1_BASE : GINT0_BASE; }
+
+// Wird bei jedem MMIO-Trap aufgerufen: liest echte Eingänge, erkennt Flanken
+// und pendet PINT-/GINT-IRQs. Da der Gast nativ ohne Host-Loop läuft, ist der
+// MMIO-Trap der einzige synchrone Injektionspunkt — eine reine WFI-Warteschleife
+// ganz ohne MMIO-Zugriff lässt sich so nicht wecken (Architektur-Grenze).
+void sample_pin_interrupts() {
+    uint32_t live[4];
+    for (uint32_t p = 0; p < 4; ++p) live[p] = gpio_live_port_data(p);
+
+    // --- PINT ---
+    uint16_t cur = 0;
+    for (uint8_t ch = 0; ch < 8; ++ch) {
+        uint8_t  lpc  = g_pintsel[ch];
+        uint32_t port = lpc / 12u, pin = lpc % 12u;
+        if (port < 4 && ((live[port] >> pin) & 1u)) cur |= (1u << ch);
+    }
+    uint16_t changed = static_cast<uint16_t>(cur ^ g_pint_prev);
+    uint16_t rose = static_cast<uint16_t>(changed &  cur);
+    uint16_t fell = static_cast<uint16_t>(changed & ~cur);
+    g_pint_prev = cur;
+
+    for (uint8_t ch = 0; ch < 8; ++ch) {
+        uint8_t m = static_cast<uint8_t>(1u << ch);
+        bool fire = false;
+        if ((g_pint.isel & m) == 0u) {                 // Edge-sensitiv
+            if ((rose & m) && (g_pint.ienr & m)) { g_pint.rise |= m; fire = true; }
+            if ((fell & m) && (g_pint.ienf & m)) { g_pint.fall |= m; fire = true; }
+        } else {                                       // Level-sensitiv
+            bool active_high = (g_pint.ienf & m);      // IENF wählt Pegel
+            bool lvl = (cur >> ch) & 1u;
+            if ((g_pint.ienr & m) && (lvl == active_high) && ((g_pint.ist & m) == 0u))
+                fire = true;
+        }
+        if (fire) {
+            g_pint.ist |= m;
+            irq_inject::pend(static_cast<uint8_t>(lpc_irq::PIN_INT0 + ch));
+        }
+    }
+
+    // --- GINT0/GINT1 ---
+    for (uint32_t gi = 0; gi < 2; ++gi) {
+        GintModel& g = g_gint[gi];
+        bool comb_and = (g.ctrl & 0x2u);
+        bool match = comb_and;          // AND: true-Start, OR: false-Start
+        bool any = false;
+        for (uint32_t p = 0; p < 2; ++p) {
+            uint32_t ena = g.ena[p];
+            for (uint8_t pin = 0; pin < 12; ++pin) {
+                if (!((ena >> pin) & 1u)) continue;
+                any = true;
+                bool active = (((live[p] >> pin) & 1u) == ((g.pol[p] >> pin) & 1u));
+                if (comb_and) match = match && active;
+                else          match = match || active;
+            }
+        }
+        if (!any) match = false;
+        if (match && !g.prev_match) {
+            g.ctrl |= 0x1u;
+            irq_inject::pend(g.irq_num);
+        }
+        g.prev_match = match;
+    }
+}
+
+uint8_t pint_read_byte(uint32_t off) {
+    uint32_t lane = (off & 3u) * 8u;
+    switch (off & ~3u) {
+        case PINT_ISEL: return static_cast<uint8_t>((g_pint.isel >> lane) & 0xFFu);
+        case PINT_IENR: case PINT_SIENR: case PINT_CIENR:
+            return static_cast<uint8_t>((g_pint.ienr >> lane) & 0xFFu);
+        case PINT_IENF: case PINT_SIENF: case PINT_CIENF:
+            return static_cast<uint8_t>((g_pint.ienf >> lane) & 0xFFu);
+        case PINT_RISE: return static_cast<uint8_t>((g_pint.rise >> lane) & 0xFFu);
+        case PINT_FALL: return static_cast<uint8_t>((g_pint.fall >> lane) & 0xFFu);
+        case PINT_IST:  return static_cast<uint8_t>((g_pint.ist  >> lane) & 0xFFu);
+        default: return 0;
+    }
+}
+
+void pint_write_byte(uint32_t off, uint8_t val) {
+    if ((off & 3u) != 0u) return;        // nur Byte0-Lane relevant (8 Kanäle)
+    switch (off & ~3u) {
+        case PINT_ISEL:  g_pint.isel = val; break;
+        case PINT_IENR:  g_pint.ienr = val; break;
+        case PINT_SIENR: g_pint.ienr |= val; break;
+        case PINT_CIENR: g_pint.ienr &= static_cast<uint8_t>(~val); break;
+        case PINT_IENF:  g_pint.ienf = val; break;
+        case PINT_SIENF: g_pint.ienf |= val; break;
+        case PINT_CIENF: g_pint.ienf &= static_cast<uint8_t>(~val); break;
+        case PINT_RISE:  g_pint.rise &= static_cast<uint8_t>(~val); break;  // W1C
+        case PINT_FALL:  g_pint.fall &= static_cast<uint8_t>(~val); break;  // W1C
+        case PINT_IST:   g_pint.ist  &= static_cast<uint8_t>(~val); break;  // W1C
+        default: break;
+    }
+}
+
+uint8_t gint_read_byte(uint32_t idx, uint32_t off) {
+    GintModel& g = g_gint[idx];
+    uint32_t lane = (off & 3u) * 8u;
+    switch (off & ~3u) {
+        case GINT_CTRL:      return static_cast<uint8_t>((g.ctrl   >> lane) & 0xFFu);
+        case GINT_PORT_POL0: return static_cast<uint8_t>((g.pol[0] >> lane) & 0xFFu);
+        case GINT_PORT_POL1: return static_cast<uint8_t>((g.pol[1] >> lane) & 0xFFu);
+        case GINT_PORT_ENA0: return static_cast<uint8_t>((g.ena[0] >> lane) & 0xFFu);
+        case GINT_PORT_ENA1: return static_cast<uint8_t>((g.ena[1] >> lane) & 0xFFu);
+        default: return 0;
+    }
+}
+
+void gint_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
+    GintModel& g = g_gint[idx];
+    uint32_t lane = (off & 3u) * 8u;
+    auto patch = [&](uint32_t& v) {
+        v = (v & ~(0xFFu << lane)) | (static_cast<uint32_t>(val) << lane);
+    };
+    switch (off & ~3u) {
+        case GINT_CTRL:
+            // Bit0 = INT, write-1-to-clear; Bits1..2 normal beschreibbar.
+            if (lane == 0) {
+                if (val & 0x1u) g.ctrl &= ~0x1u;
+                g.ctrl = (g.ctrl & ~0x6u) | (val & 0x6u);
+            }
+            break;
+        case GINT_PORT_POL0: patch(g.pol[0]); break;
+        case GINT_PORT_POL1: patch(g.pol[1]); break;
+        case GINT_PORT_ENA0: patch(g.ena[0]); break;
+        case GINT_PORT_ENA1: patch(g.ena[1]); break;
+        default: break;
+    }
+}
+
 bool mmio_read8(uint32_t addr, uint8_t& out) {
     ++g_stats.mmio_reads;
+    sample_pin_interrupts();
 
     if (addr >= GPIO_BASE && addr < GPIO_PORTS_END) {
         uint32_t port_off = addr - GPIO_BASE;
@@ -850,8 +1225,9 @@ bool mmio_read8(uint32_t addr, uint8_t& out) {
         if (port < 4) {
             if (local < GPIO_DATA_END) {
                 // Maskierter DATA-Read: Bits[11:2] der Adresse = Pin-Maske.
+                // Eingänge kommen live von echten RP2350-Pins.
                 uint32_t mask = (local >> 2) & 0xFFFu;
-                uint32_t data = g_gpio[port].data & mask;
+                uint32_t data = gpio_live_port_data(port) & mask;
                 out = static_cast<uint8_t>((data >> ((addr & 3u) * 8u)) & 0xFFu);
                 return true;
             }
@@ -907,6 +1283,13 @@ bool mmio_read8(uint32_t addr, uint8_t& out) {
     if (addr >= PMU_BASE && addr < PMU_END) {
         out = pmu_read_byte(addr); return true;
     }
+    if (addr >= PINT_BASE && addr < PINT_END) {
+        out = pint_read_byte(addr - PINT_BASE); return true;
+    }
+    {
+        uint32_t gi = gint_idx_for(addr);
+        if (gi < 2) { out = gint_read_byte(gi, addr - gint_base_for(gi)); return true; }
+    }
 
     // NVIC-Region wird via vnvic getrappt (eigene MPU-Region) — sollte hier
     // nicht ankommen, ist aber als Fallback definiert.
@@ -914,14 +1297,16 @@ bool mmio_read8(uint32_t addr, uint8_t& out) {
         out = vnvic::read8(addr); return true;
     }
 
-    // Unbekannte Adressen: 0 zurückliefern, damit Polling-Loops nicht
-    // hängen bleiben. Schreiben bleibt strikt.
+    // Unbekannte Adressen: zuletzt geschriebenen Schatten-Wert liefern, sonst
+    // 0 — damit Polling-Loops nicht hängen bleiben.
+    if (shadow_load(addr, out)) return true;
     out = 0;
     return true;
 }
 
 bool mmio_write8(uint32_t addr, uint8_t val) {
     ++g_stats.mmio_writes;
+    sample_pin_interrupts();
 
     if (addr >= GPIO_BASE && addr < GPIO_PORTS_END) {
         uint32_t port_off = addr - GPIO_BASE;
@@ -997,6 +1382,13 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
     if (addr >= PMU_BASE && addr < PMU_END) {
         pmu_write_byte(addr, val); return true;
     }
+    if (addr >= PINT_BASE && addr < PINT_END) {
+        pint_write_byte(addr - PINT_BASE, val); return true;
+    }
+    {
+        uint32_t gi = gint_idx_for(addr);
+        if (gi < 2) { gint_write_byte(gi, addr - gint_base_for(gi), val); return true; }
+    }
 
     if (vnvic::is_nvic_addr(addr)) {
         ++g_stats.nvic_writes;
@@ -1004,7 +1396,10 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
         return true;
     }
 
-    return false;
+    // Nicht modellierte Peripherie: in den generischen Schatten schreiben statt
+    // Watchdog-Reset. Kein Programm stürzt mehr an unbekannten Registern ab.
+    shadow_store(addr, val);
+    return true;
 }
 
 Stats stats() { return g_stats; }

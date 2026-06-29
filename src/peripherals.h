@@ -11,6 +11,11 @@ namespace peripherals {
 void init();
 void reset();
 
+// (Re-)Initialisiert die I²C-Hardware-Bridge anhand der aktuellen config.
+// Wird nach dem Einlesen von CONFIG.INI aufgerufen, damit die Bridge auch
+// ohne Power-Cycle aktiv wird.
+void i2c_bridge_reinit();
+
 // Vom Trap-Handler nach erfolgter Emulation aufgerufen — Stats/PLL-Folgen.
 void on_post_write_hook();
 

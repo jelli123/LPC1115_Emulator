@@ -22,7 +22,14 @@ Result relocate_ram_refs(uint8_t* image, std::size_t size_bytes,
         // wir aus, der wird vom Loader (emulator.cpp) gesondert behandelt.
         if (off == 0) continue;
 
-        if (w >= old_ram_base && w < old_end) {
+        // Bereich [old_ram_base, old_end] INKLUSIVE der oberen Grenze:
+        // Startup-Code (Scatter-Load/CRT) legt regelmaessig "one-past-end"-
+        // Zeiger ab, z. B. _estack/_ebss/_edata == 0x10002000 (Top des 8-KB-
+        // SRAM). Diese liegen exakt auf old_end; wuerden sie nicht reloziert,
+        // faultet bereits die RAM-Initialisierung. Der gemappte Wert
+        // new_ram_base + old_ram_size zeigt konsistent auf das Ende des
+        // Gast-RAM-Puffers (vgl. Initial-SP-Behandlung in emulator.cpp).
+        if (w >= old_ram_base && w <= old_end) {
             uint32_t mapped = new_ram_base + (w - old_ram_base);
             std::memcpy(image + off, &mapped, 4);
             ++r.patched_words;

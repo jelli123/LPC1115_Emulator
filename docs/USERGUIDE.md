@@ -160,10 +160,19 @@ pin.2_0=25              # Status-LED
 uart_bridge_en=1        # Bridge beim Boot starten
 uart_bridge_tx=4        # TX-Pin (RP2350 → extern)
 uart_bridge_rx=5        # RX-Pin (extern → RP2350)
+
+# I²C-Bridge (LPC-I²C-Master → echte RP2350-Hardware)
+i2c_bridge_en=1         # Bridge aktivieren
+i2c_bridge_inst=0       # 0 = i2c0, 1 = i2c1
+i2c_bridge_sda=6        # SDA-Pin (RP2350-GPIO, externer Pull-up nötig)
+i2c_bridge_scl=7        # SCL-Pin (RP2350-GPIO, externer Pull-up nötig)
+i2c_bridge_hz=100000    # Bus-Takt (Standard 100 kHz)
 ```
 
 > Wenn `BOOT.HEX` und `autostart=on` gesetzt sind, läuft der Emulator
 > nach jedem Power-Cycle **vollständig autonom** ohne USB-Konsole.
+> CONFIG.INI-Werte werden beim Einlesen dauerhaft gespeichert; UART-/I²C-
+> Bridge werden sofort (ohne Power-Cycle) angewandt.
 
 ### Variante B: Intel-HEX über CLI
 

@@ -8,9 +8,16 @@
 //
 // Der Code-Generator von Keil/GCC legt SRAM-Adressen als 32-Bit-Konstanten
 // in Literal-Pools ab (fuer `LDR Rx, =sym`). Der Patcher scannt das gesamte
-// Firmware-Image nach 4-byte-aligned Woertern, deren Wert exakt im
-// Bereich [0x10000000, 0x10000000 + LPC_GUEST_RAM_SIZE) liegt, und ersetzt
-// sie durch guest_ram_base + (orig - 0x10000000).
+// Firmware-Image nach 4-byte-aligned Woertern, deren Wert im Bereich
+// [0x10000000, 0x10000000 + LPC_GUEST_RAM_SIZE] liegt (obere Grenze
+// INKLUSIVE, um "one-past-end"-Zeiger wie _estack/_ebss abzudecken), und
+// ersetzt sie durch guest_ram_base + (orig - 0x10000000).
+//
+// Robustheit / Backstop:
+//   - Ein Fault-Handler-Pfad (src/fault.cpp) faengt RAM-Zugriffe ab, die die
+//     Heuristik *verpasst* hat (z. B. zur Laufzeit berechnete Adressen), und
+//     bedient sie korrekt auf dem Gast-RAM. Ein verpasster Treffer ist damit
+//     nicht mehr fatal, sondern nur langsamer.
 //
 // Heuristik-Hinweis (im README dokumentiert):
 //   - False-Positive-Wahrscheinlichkeit ~ 8 KB / 2^32 ~ 1 / 524288 pro Wort.
@@ -33,8 +40,9 @@ struct Result {
     uint32_t scanned_words;
 };
 
-// Patcht das Firmware-Image *in place*. base_addr ist die Ladeadresse
-// (i. d. R. 0x20040000 = LPC_LOAD_BASE).
+// Patcht das Firmware-Image *in place*. old_ram_base/old_ram_size beschreiben
+// den LPC-SRAM-Bereich (0x10000000 / 8 KB), new_ram_base die Laufzeit-Basis
+// des Gast-RAM-Puffers (emulator::guest_ram_base()).
 Result relocate_ram_refs(uint8_t* image, std::size_t size_bytes,
                          uint32_t old_ram_base, uint32_t old_ram_size,
                          uint32_t new_ram_base);

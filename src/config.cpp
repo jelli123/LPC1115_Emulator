@@ -16,6 +16,11 @@ bool     g_autostart   = false;
 bool     g_uart_bridge_en = false;
 int      g_uart_bridge_tx = -1;
 int      g_uart_bridge_rx = -1;
+bool     g_i2c_bridge_en   = false;
+int      g_i2c_bridge_inst = 0;
+int      g_i2c_bridge_sda  = -1;
+int      g_i2c_bridge_scl  = -1;
+uint32_t g_i2c_bridge_hz   = 100'000;
 
 constexpr uint32_t MAX_FREQ_HZ = 150'000'000; // RP2350-Limit, defensiv
 constexpr int      MAX_GPIO    = 47;          // RP2350-Pinanzahl konservativ
@@ -70,6 +75,11 @@ void apply_defaults() {
     g_uart_bridge_en = false;
     g_uart_bridge_tx = -1;
     g_uart_bridge_rx = -1;
+    g_i2c_bridge_en   = false;
+    g_i2c_bridge_inst = 0;
+    g_i2c_bridge_sda  = -1;
+    g_i2c_bridge_scl  = -1;
+    g_i2c_bridge_hz   = 100'000;
 }
 
 void load_pin_map_from_storage() {
@@ -112,6 +122,27 @@ bool load() {
         if (parse_uint32(buf, v) && v <= static_cast<uint32_t>(MAX_GPIO))
             g_uart_bridge_rx = static_cast<int>(v);
     }
+    if (storage::config_get(KEY_I2C_BRIDGE_EN, buf, sizeof buf)) {
+        g_i2c_bridge_en = (buf[0] == '1');
+    }
+    if (storage::config_get(KEY_I2C_BRIDGE_INST, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32(buf, v) && v <= 1) g_i2c_bridge_inst = static_cast<int>(v);
+    }
+    if (storage::config_get(KEY_I2C_BRIDGE_SDA, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32(buf, v) && v <= static_cast<uint32_t>(MAX_GPIO))
+            g_i2c_bridge_sda = static_cast<int>(v);
+    }
+    if (storage::config_get(KEY_I2C_BRIDGE_SCL, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32(buf, v) && v <= static_cast<uint32_t>(MAX_GPIO))
+            g_i2c_bridge_scl = static_cast<int>(v);
+    }
+    if (storage::config_get(KEY_I2C_BRIDGE_HZ, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32(buf, v) && v > 0 && v <= 1'000'000) g_i2c_bridge_hz = v;
+    }
     load_pin_map_from_storage();
     return true;
 }
@@ -132,6 +163,20 @@ bool save() {
         std::snprintf(buf, sizeof buf, "%d", g_uart_bridge_rx);
         if (!storage::config_set(KEY_UART_BRIDGE_RX, buf)) return false;
     }
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_i2c_bridge_en ? 1 : 0));
+    if (!storage::config_set(KEY_I2C_BRIDGE_EN, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%d", g_i2c_bridge_inst);
+    if (!storage::config_set(KEY_I2C_BRIDGE_INST, buf)) return false;
+    if (g_i2c_bridge_sda >= 0) {
+        std::snprintf(buf, sizeof buf, "%d", g_i2c_bridge_sda);
+        if (!storage::config_set(KEY_I2C_BRIDGE_SDA, buf)) return false;
+    }
+    if (g_i2c_bridge_scl >= 0) {
+        std::snprintf(buf, sizeof buf, "%d", g_i2c_bridge_scl);
+        if (!storage::config_set(KEY_I2C_BRIDGE_SCL, buf)) return false;
+    }
+    std::snprintf(buf, sizeof buf, "%lu", static_cast<unsigned long>(g_i2c_bridge_hz));
+    if (!storage::config_set(KEY_I2C_BRIDGE_HZ, buf)) return false;
     char key[24];
     for (std::size_t i = 0; i < LPC_PIN_COUNT; ++i) {
         if (g_pin_map.lpc_to_rp[i] < 0) continue;
@@ -171,5 +216,16 @@ int  uart_bridge_tx_pin()            { return g_uart_bridge_tx; }
 void set_uart_bridge_tx_pin(int gpio){ g_uart_bridge_tx = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
 int  uart_bridge_rx_pin()            { return g_uart_bridge_rx; }
 void set_uart_bridge_rx_pin(int gpio){ g_uart_bridge_rx = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
+
+bool i2c_bridge_enabled()            { return g_i2c_bridge_en; }
+void set_i2c_bridge_enabled(bool v)  { g_i2c_bridge_en = v; }
+int  i2c_bridge_instance()           { return g_i2c_bridge_inst; }
+void set_i2c_bridge_instance(int inst){ g_i2c_bridge_inst = (inst == 1) ? 1 : 0; }
+int  i2c_bridge_sda_pin()            { return g_i2c_bridge_sda; }
+void set_i2c_bridge_sda_pin(int gpio){ g_i2c_bridge_sda = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
+int  i2c_bridge_scl_pin()            { return g_i2c_bridge_scl; }
+void set_i2c_bridge_scl_pin(int gpio){ g_i2c_bridge_scl = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
+uint32_t i2c_bridge_hz()             { return g_i2c_bridge_hz; }
+void set_i2c_bridge_hz(uint32_t hz)  { if (hz > 0 && hz <= 1'000'000) g_i2c_bridge_hz = hz; }
 
 } // namespace config

@@ -106,6 +106,7 @@ target_link_libraries(emulator PRIVATE
     hardware_sync
     hardware_gpio
     hardware_uart
+    hardware_i2c
     hardware_timer
     hardware_watchdog
     hardware_pio

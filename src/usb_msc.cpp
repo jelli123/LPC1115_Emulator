@@ -2,6 +2,8 @@
 #include "config.h"
 #include "storage.h"
 #include "hex_parser.h"
+#include "peripherals.h"
+#include "uart_bridge.h"
 
 #include "tusb.h"
 #include "pico/stdlib.h"
@@ -151,7 +153,12 @@ bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size) {
 // CONFIG.INI parsen: simple key=value, eine Zeile pro Eintrag.
 //   pin.<lpc-port_pin>=<rp-gpio>      (z. B. pin.0_3=14)
 //   autostart=on|off
-//   gdb=on|off
+//   freq_hz=<Hz>
+//   uart_bridge_en=on|off
+//   uart_bridge_tx=<rp-gpio>   uart_bridge_rx=<rp-gpio>
+//   i2c_bridge_en=on|off
+//   i2c_bridge_inst=0|1   i2c_bridge_sda=<rp-gpio>
+//   i2c_bridge_scl=<rp-gpio>   i2c_bridge_hz=<Hz>
 void parse_config(const char* buf, uint32_t len) {
     char line[96];
     uint32_t i = 0;
@@ -187,6 +194,24 @@ void parse_config(const char* buf, uint32_t len) {
                                   std::strcmp(eq, "1")  == 0);
         } else if (std::strcmp(line, "freq_hz") == 0) {
             config::set_target_frequency_hz(static_cast<uint32_t>(std::atol(eq)));
+        } else if (std::strcmp(line, "uart_bridge_en") == 0) {
+            config::set_uart_bridge_enabled(std::strcmp(eq, "on") == 0 ||
+                                            std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "uart_bridge_tx") == 0) {
+            config::set_uart_bridge_tx_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "uart_bridge_rx") == 0) {
+            config::set_uart_bridge_rx_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "i2c_bridge_en") == 0) {
+            config::set_i2c_bridge_enabled(std::strcmp(eq, "on") == 0 ||
+                                           std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "i2c_bridge_inst") == 0) {
+            config::set_i2c_bridge_instance(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "i2c_bridge_sda") == 0) {
+            config::set_i2c_bridge_sda_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "i2c_bridge_scl") == 0) {
+            config::set_i2c_bridge_scl_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "i2c_bridge_hz") == 0) {
+            config::set_i2c_bridge_hz(static_cast<uint32_t>(std::atol(eq)));
         }
     }
 }
@@ -201,6 +226,19 @@ void on_volume_ready() {
         uint32_t n = read_cluster_chain(cl, sz, reinterpret_cast<uint8_t*>(buf),
                                         sizeof buf);
         parse_config(buf, n);
+        // Persistieren, damit die Einstellungen den nächsten Power-Cycle
+        // überleben (config::load() liest sie beim Boot wieder ein).
+        config::save();
+        // Bridges sofort anwenden, damit der direkt folgende Autorun sie
+        // bereits nutzen kann (ohne Power-Cycle).
+        peripherals::i2c_bridge_reinit();
+        if (config::uart_bridge_enabled()) {
+            uart_bridge::set_tx_pin(config::uart_bridge_tx_pin());
+            uart_bridge::set_rx_pin(config::uart_bridge_rx_pin());
+            uart_bridge::start();
+        } else {
+            uart_bridge::stop();
+        }
         std::printf("[MSC] CONFIG.INI: %lu Bytes, %u Zeilen\n",
                     static_cast<unsigned long>(n),
                     static_cast<unsigned>(g_stats.parsed_lines));

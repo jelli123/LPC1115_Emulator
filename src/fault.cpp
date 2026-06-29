@@ -135,6 +135,74 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
         return;
     }
 
+    // LPC-SRAM-Bereich [0x10000000, +RAM_SIZE): Wird ein RAM-Pointer von der
+    // Lade-Heuristik (hex_patcher) nicht reloziert — typisch bei zur Laufzeit
+    // *berechneten* Adressen (base + offset), die als reiner Basiswert nicht
+    // exakt im Scan-Bereich liegen — dann wuerde der Zugriff sonst bei
+    // peripherals::mmio_* abgelehnt und einen Watchdog-Reset ausloesen.
+    // Statt zu faulten lenken wir den Zugriff hier deterministisch auf den
+    // Gast-RAM um. So wird jeder von der Heuristik verpasste RAM-Pointer
+    // *korrekt* bedient (nur etwas langsamer, da getrappt) statt fatal.
+    {
+        const uint32_t asz = (acc.size == AccessSize::B) ? 1u
+                           : (acc.size == AccessSize::H) ? 2u : 4u;
+        // Strikte Host-Bounds-Pruefung (inkl. Straddle am Bereichsende):
+        // verhindert OOB-Zugriffe auf den g_guest_ram-Puffer.
+        if (acc.address >= 0x1000'0000u &&
+            acc.address + asz <= 0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE) {
+            uint32_t off = acc.address - 0x1000'0000u;
+            auto* ram = reinterpret_cast<uint8_t*>(emulator::guest_ram_base());
+            if (acc.is_load) {
+                uint32_t value = 0;
+                switch (acc.size) {
+                    case AccessSize::B: {
+                        uint8_t v = ram[off];
+                        value = acc.is_signed
+                            ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v)))
+                            : v;
+                        break;
+                    }
+                    case AccessSize::H: {
+                        uint16_t h;
+                        std::memcpy(&h, ram + off, 2);
+                        value = acc.is_signed
+                            ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h)))
+                            : h;
+                        break;
+                    }
+                    case AccessSize::W:
+                        std::memcpy(&value, ram + off, 4);
+                        break;
+                }
+                uint32_t* dst = reg_ptr(frame, r4_r11, &guest_sp, acc.rt);
+                if (dst) *dst = value;
+            } else {
+                uint32_t src_val = 0;
+                if (acc.rt < 16) {
+                    uint32_t* p = reg_ptr(frame, r4_r11, &guest_sp, acc.rt);
+                    if (p) src_val = *p;
+                }
+                switch (acc.size) {
+                    case AccessSize::B:
+                        ram[off] = static_cast<uint8_t>(src_val & 0xFFu);
+                        break;
+                    case AccessSize::H: {
+                        uint16_t h = static_cast<uint16_t>(src_val & 0xFFFFu);
+                        std::memcpy(ram + off, &h, 2);
+                        break;
+                    }
+                    case AccessSize::W:
+                        std::memcpy(ram + off, &src_val, 4);
+                        break;
+                }
+            }
+            frame->pc += acc.instr_size;
+            SCB->CFSR = SCB->CFSR;
+            ++faultsys::g_stats.mem_traps;
+            return;
+        }
+    }
+
     if (acc.is_load) {
         uint32_t value = 0;
         switch (acc.size) {

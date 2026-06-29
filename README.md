@@ -38,33 +38,36 @@ native Geschwindigkeit; Interpretation findet nicht statt.
 * **Trap-Decoder:** schmaler Decoder
   in [opcodes.cpp](src/opcodes.cpp) (~150 Zeilen), erkennt LDR/STR-Familie.
 
-## RAM-Adress-Relocation (zwei Wege)
+## RAM-Adress-Relocation
 
 Die LPC1115 hat ihren SRAM bei `0x10000000`. Auf dem RP2350 liegt dort
-das XIP. Wir mappen Gast-RAM auf `0x20060000`. Damit absolute SRAM-Pointer
-stimmen, gibt es zwei Wege:
+das XIP. Der Gast-RAM wird deshalb als aligned Array im RP2350-SRAM
+allokiert; die Laufzeit-Basis liefert `emulator::guest_ram_base()` (keine
+feste Adresse mehr). Damit absolute SRAM-Pointer stimmen, greifen zwei
+sich ergaenzende Mechanismen:
 
-### A) Re-Linken (sauber)
-
-Mit dem mitgelieferten Linker-Skript
-[examples/guest_lpc1115.ld](examples/guest_lpc1115.ld):
-
-* FLASH bei `0x20040000`
-* RAM   bei `0x20060000`
-
-### B) HEX-Patcher (kein Re-Link nötig)
+### A) HEX-Patcher (Load-Time, schnell)
 
 Beim Laden patcht [hex_patcher.cpp](src/hex_patcher.cpp) **alle 4-byte-
 aligned Wörter** im Image, deren Wert im Bereich
-`[0x10000000, 0x10002000)` liegt, auf `0x20060000 + (val − 0x10000000)`.
+`[0x10000000, 0x10002000]` liegt (obere Grenze **inklusive**, deckt
+„one-past-end"-Zeiger wie `_estack`/`_ebss` ab), auf
+`guest_ram_base() + (val − 0x10000000)`.
 
 * Geeignet für GCC/Keil-erzeugte Literal-Pools (`LDR Rx, =sym`).
 * False-Positive-Wahrscheinlichkeit: ~ 8 KB / 2³² ≈ **1/524 288 pro Wort**.
   Bei 64 KB Firmware (16 384 Wörter) erwartet man ~0,03 falsche
-  Treffer. Praktisch vernachlässigbar — bei Auffälligkeiten Variante A
-  nutzen.
+  Treffer. Praktisch vernachlässigbar.
 * Vector-Tabellen-Initial-SP wird separat im Loader behandelt
   ([emulator.cpp](src/emulator.cpp)).
+
+### B) Fault-Backstop (Run-Time, robust)
+
+Verpasst die Heuristik einen RAM-Pointer (z. B. zur Laufzeit *berechnete*
+Adressen), faengt der MemManage-Handler ([fault.cpp](src/fault.cpp)) den
+Zugriff auf `[0x10000000, +8 KB)` ab und bedient ihn direkt auf dem
+Gast-RAM. Ein verpasster Heuristik-Treffer ist damit **nicht fatal**,
+sondern nur etwas langsamer (ein Trap pro Zugriff) — kein Re-Linken nötig.
 
 ## Original-Geschwindigkeit / PLL
 
@@ -110,16 +113,28 @@ Mapping LPC-Peripherie → IRQ-Index ist zentral in
 
 | Peripherie       | Status      | IRQ        | Anmerkung                       |
 |------------------|-------------|------------|---------------------------------|
-| GPIO0            | nutzbar     | -          | Mapping → RP2350-GPIO über `pin`|
+| GPIO0            | nutzbar     | -          | Mapping → RP2350-GPIO über `pin`; Eingänge lesen echte Pin-Pegel |
 | SYSCON / PLL     | nutzbar     | -          | retargeted RP2350-PLL           |
 | SysTick          | nativ       | (SysTick)  | M0/M33 register-kompatibel      |
 | UART0 (16550)    | nutzbar     | UART0 (21) | Backend = RP2350 `uart0`        |
 | CT16B0/CT16B1    | nutzbar     | 16/17      | Match-IRQ via irq_inject        |
 | CT32B0/CT32B1    | nutzbar     | 18/19      | Match-IRQ via irq_inject        |
-| IOCON            | passive     | -          | nur Schatten-RAM                |
-| SSP0/SSP1, I²C   | TODO        | 20/14/15   | Modellgerüst über CT-Pattern    |
-| ADC, WWDT, BOD   | TODO        | 24/25/26   |                                 |
-| GINT0/GINT1, PINT| TODO        | 8/9/0..7   |                                 |
+| IOCON            | passive     | -          | nur Schatten-RAM, kein Pinmux-Effekt |
+| SSP0/SSP1        | nutzbar     | 20/14      | Loopback-Modell (RX=TX), RX-IRQ |
+| I²C0             | nutzbar¹    | 15         | Bridge auf RP2350-HW-I²C (`i2c on`), sonst Stub |
+| ADC              | nutzbar     | 24         | sofortige Wandlung, ADC-IRQ     |
+| WWDT             | nutzbar     | 25         | echtes Timeout, Soft-Reset des Guests |
+| BOD              | TODO        | 26         | nicht modelliert                |
+| PINT (PIN_INT0..7)| nutzbar²   | 0..7       | PINTSEL + Edge/Level, IRQ via irq_inject |
+| GINT0/GINT1      | nutzbar²    | 8/9        | Gruppen-Match (AND/OR), IRQ via irq_inject |
+
+¹ Aktivierung per CLI `i2c on <inst> <sda> <scl> [hz]` (wirkt nach Reset).
+  Ohne Bridge bleibt das alte Stub-Verhalten. Schreib-Adress-ACK wird
+  optimistisch gemeldet; lazy Byte-Reads passen zu Auto-Increment-Slaves.
+² Pin-Interrupts werden **synchron** beim nächsten MMIO-Trap des Guests
+  abgetastet (`sample_pin_interrupts()` aus `mmio_read8/write8`). Ein
+  Programm, das ausschließlich in `WFI` ohne jeden MMIO-Zugriff wartet,
+  kann dadurch nicht aufgeweckt werden — Folge des nativen Core-1-Modells.
 
 ## GDB-Remote-Stub (statt CMSIS-DAP)
 
@@ -254,6 +269,8 @@ FetchContent gezogen. `emulator.uf2` per BOOTSEL aufs Board kopieren.
 | `gdb on/off/status`           | GDB-Stub auf USB-CDC #1                       |
 | `swd start <dio> <clk>`       | SWD-Target auf RP-GPIOs (clk = dio+1)         |
 | `swd stop` / `swd status`     | SWD-Target stoppen / Zustand                  |
+| `i2c on <inst> <sda> <scl> [hz]` | I²C-Bridge auf RP2350-HW (wirkt nach Reset)|
+| `i2c off` / `i2c status`      | I²C-Bridge deaktivieren / Zustand             |
 
 ## Sicherheits-Eigenschaften
 
@@ -269,9 +286,20 @@ FetchContent gezogen. `emulator.uf2` per BOOTSEL aufs Board kopieren.
 
 ## Bekannte Grenzen / TODO
 
-* **Peripherie-Modelle**: GPIO0, SYSCON, UART0, CT16B0/B1, CT32B0/B1
-  drin. SSP/I²C/ADC/WWDT/PINT/GINT folgen dem CT-Pattern (siehe
-  [peripherals.cpp](src/peripherals.cpp)).
+* **Peripherie-Modelle**: GPIO0 (inkl. Eingangspegel), SYSCON, UART0,
+  CT16B0/B1, CT32B0/B1, SSP0/SSP1, I²C0 (HW-Bridge), ADC, WWDT sowie
+  PINT (PIN_INT0..7) und GINT0/GINT1 sind modelliert (siehe
+  [peripherals.cpp](src/peripherals.cpp)). Noch offen: BOD.
+* **Pin-Interrupts (PINT/GINT)** werden nur abgetastet, wenn der Gast
+  einen MMIO-Zugriff auslöst (synchrones Core-1-Modell). Ein reiner
+  `WFI`-Wartepunkt ohne MMIO kann nicht durch Pin-IRQs geweckt werden.
+* **I²C-Bridge**: Schreib-Transaktionen werden gepuffert und beim STOP/
+  Repeated-START geflusht; das Adress-ACK wird währenddessen optimistisch
+  gemeldet. Lese-Transaktionen lesen lazy Byte-für-Byte (passt zu
+  Auto-Increment-Slaves). Nicht hardwarevalidiert in dieser Session.
+* **Unbekannte MMIO-Adressen** sind nicht mehr fatal: Schreibzugriffe
+  landen in einem generischen Schatten-RAM (kein Watchdog-Reset mehr),
+  Rücklesen bleibt konsistent.
 * **SWD-PHY** ist polling-basiert auf der TX-Seite — robust bis ~2 MHz
   SWCLK. Voll-PIO-TX für höhere Geschwindigkeiten ist ein optionales
   Folge-Inkrement.

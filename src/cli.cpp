@@ -72,6 +72,10 @@ void cmd_help() {
         "  uart stop                  UART-Bridge stoppen",
         "  uart status                TX/RX-Pins, Baudrate, aktiv?",
         "",
+        "  i2c on <inst> <sda> <scl> [hz]  I2C-Bridge auf RP2350-HW (Neustart noetig)",
+        "  i2c off                    I2C-Bridge deaktivieren",
+        "  i2c status                 Instanz/Pins/Takt anzeigen",
+        "",
         "  freq <Hz>                  Ziel-CPU-Frequenz",
         "  flash hex                  Intel-Hex-Stream (alias fuer upload)",
         "  flash erase                Firmware-Slot loeschen",
@@ -499,6 +503,40 @@ void handle_command(char* line) {
                         uart_bridge::active() ? "active" : "off",
                         uart_bridge::tx_pin(), uart_bridge::rx_pin(),
                         static_cast<unsigned long>(uart_bridge::baud_rate()));
+            return;
+        }
+    }
+
+    // --- I2C-Bridge (LPC-I2C-Master → RP2350-Hardware-I2C) ---
+    if (std::strcmp(tokens[0], "i2c") == 0 && n >= 2) {
+        if (std::strcmp(tokens[1], "on") == 0) {
+            if (n < 5) { std::puts("err: i2c on <inst 0|1> <sda> <scl> [hz]"); return; }
+            long inst, sda, scl, hz = 100000;
+            if (!parse_int(tokens[2], 0, 1, inst) ||
+                !parse_int(tokens[3], 0, 47, sda) ||
+                !parse_int(tokens[4], 0, 47, scl) ||
+                (n >= 6 && !parse_int(tokens[5], 1000, 1000000, hz))) {
+                std::puts("err: i2c on <inst 0|1> <sda> <scl> [hz]"); return;
+            }
+            config::set_i2c_bridge_instance(static_cast<int>(inst));
+            config::set_i2c_bridge_sda_pin(static_cast<int>(sda));
+            config::set_i2c_bridge_scl_pin(static_cast<int>(scl));
+            config::set_i2c_bridge_hz(static_cast<uint32_t>(hz));
+            config::set_i2c_bridge_enabled(true);
+            std::puts("ok (wird beim naechsten Start/Reset aktiv)");
+            return;
+        }
+        if (std::strcmp(tokens[1], "off") == 0) {
+            config::set_i2c_bridge_enabled(false);
+            std::puts("ok (wird beim naechsten Start/Reset wirksam)");
+            return;
+        }
+        if (std::strcmp(tokens[1], "status") == 0) {
+            std::printf("i2c-bridge=%s inst=i2c%d SDA=GP%d SCL=GP%d hz=%lu\n",
+                        config::i2c_bridge_enabled() ? "on" : "off",
+                        config::i2c_bridge_instance(),
+                        config::i2c_bridge_sda_pin(), config::i2c_bridge_scl_pin(),
+                        static_cast<unsigned long>(config::i2c_bridge_hz()));
             return;
         }
     }
