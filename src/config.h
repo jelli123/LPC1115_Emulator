@@ -21,6 +21,23 @@ inline constexpr const char* KEY_I2C_BRIDGE_INST = "i2c_bridge_inst";  // 0=i2c0
 inline constexpr const char* KEY_I2C_BRIDGE_SDA  = "i2c_bridge_sda";   // GPIO-Nummer
 inline constexpr const char* KEY_I2C_BRIDGE_SCL  = "i2c_bridge_scl";   // GPIO-Nummer
 inline constexpr const char* KEY_I2C_BRIDGE_HZ   = "i2c_bridge_hz";    // Bus-Takt in Hz
+inline constexpr const char* KEY_SPI_BRIDGE_EN   = "spi_bridge_en";    // "0"/"1"
+inline constexpr const char* KEY_SPI_BRIDGE_INST = "spi_bridge_inst";  // 0=spi0, 1=spi1
+inline constexpr const char* KEY_SPI_BRIDGE_LPC  = "spi_bridge_lpc";   // 0=SSP0, 1=SSP1
+inline constexpr const char* KEY_SPI_BRIDGE_SCK  = "spi_bridge_sck";   // GPIO-Nummer
+inline constexpr const char* KEY_SPI_BRIDGE_MOSI = "spi_bridge_mosi";  // GPIO-Nummer
+inline constexpr const char* KEY_SPI_BRIDGE_MISO = "spi_bridge_miso";  // GPIO-Nummer
+inline constexpr const char* KEY_SPI_BRIDGE_HZ   = "spi_bridge_hz";    // Bus-Takt in Hz
+inline constexpr const char* KEY_ADC_BRIDGE_EN   = "adc_bridge_en";    // "0"/"1"
+// Timer-Capture-/Match-Pin-Bridges (für KNX-Bus-Empfang/-Senden via CT16/CT32).
+//   tcap.<t>=<gpio>        Capture-Eingang CAP0 von Timer t (0..3)
+//   tmat.<t>.<m>=<gpio>    Match-Ausgang MATm von Timer t (m=0..3)
+// t: 0=CT16B0, 1=CT16B1, 2=CT32B0, 3=CT32B1.
+inline constexpr const char* KEY_TCAP_PREFIX     = "tcap.";
+inline constexpr const char* KEY_TMAT_PREFIX     = "tmat.";
+inline constexpr const char* KEY_TCAP_PIO        = "tcap_pio";        // "0"/"1" (opt-in)
+inline constexpr const char* KEY_WFI_PIN_WAKEUP  = "wfi_pin_wakeup";   // "0"/"1" (opt-in)
+inline constexpr const char* KEY_PRIMASK_SHADOW  = "primask_shadow";   // "0"/"1" (opt-in)
 
 // Pin-Mapping LPC1115 -> RP2350 GPIO. -1 = nicht zugeordnet.
 constexpr std::size_t LPC_PIN_COUNT = 64;
@@ -60,5 +77,60 @@ int         i2c_bridge_scl_pin();
 void        set_i2c_bridge_scl_pin(int gpio);
 uint32_t    i2c_bridge_hz();
 void        set_i2c_bridge_hz(uint32_t hz);
+
+// SPI-Bridge-Konfiguration (LPC-SSP-Master → RP2350-Hardware-SPI)
+bool        spi_bridge_enabled();
+void        set_spi_bridge_enabled(bool v);
+int         spi_bridge_instance();         // 0=spi0, 1=spi1
+void        set_spi_bridge_instance(int inst);
+int         spi_bridge_lpc();              // 0=SSP0, 1=SSP1 (welcher LPC-SSP)
+void        set_spi_bridge_lpc(int idx);
+int         spi_bridge_sck_pin();
+void        set_spi_bridge_sck_pin(int gpio);
+int         spi_bridge_mosi_pin();
+void        set_spi_bridge_mosi_pin(int gpio);
+int         spi_bridge_miso_pin();
+void        set_spi_bridge_miso_pin(int gpio);
+uint32_t    spi_bridge_hz();
+void        set_spi_bridge_hz(uint32_t hz);
+
+// ADC-Bridge-Konfiguration (LPC-ADC-Kanäle → RP2350-Hardware-ADC).
+// Mapping ist fix durch die RP2350-Hardware vorgegeben: LPC-Kanal 0..3 →
+// RP2350-ADC-Eingang 0..3 (GPIO26..29). Kanäle 4..7 haben keinen RP2350-
+// ADC-Pin und liefern weiterhin den Mittenwert. Nur Enable konfigurierbar.
+bool        adc_bridge_enabled();
+void        set_adc_bridge_enabled(bool v);
+
+// Timer-Capture-/Match-Pin-Bridge (CT16B0/1, CT32B0/1 → echte RP2350-GPIOs).
+// Wird primär für den Selfbus-KNX-Buszugriff benötigt: Capture-Eingang =
+// Bus-Empfang (Flanken-Timestamps), Match-Ausgänge = Bus-Senden.
+//   t = Timer-Index 0..3 (0=CT16B0, 1=CT16B1, 2=CT32B0, 3=CT32B1)
+//   m = Match-Kanal 0..3
+// Rückgabe < 0 = kein Pin gebunden.
+int         ct_capture_pin(int t);
+void        set_ct_capture_pin(int t, int gpio);
+int         ct_match_pin(int t, int m);
+void        set_ct_match_pin(int t, int m, int gpio);
+
+// Opt-in: Timer-Capture per PIO statt Software-Polling. Eine PIO-State-
+// Machine erfasst Flanken-Timestamps am Capture-Pin flankengenau und ohne
+// Core-Last; die CPU rechnet die Zaehlerdifferenzen in TC-Ticks um. Default
+// aus (Software-Capture als Fallback).
+bool        tcap_pio();
+void        set_tcap_pio(bool v);
+
+// WFI-Pin-Wakeup (opt-in, Default aus): patcht WFI der Gast-Firmware auf
+// einen SVC-Trap, sodass eine reine WFI-Warteschleife durch echte
+// RP2350-Pin-Flanken (und zeitbasierte Modelle) geweckt werden kann.
+bool        wfi_pin_wakeup();
+void        set_wfi_pin_wakeup(bool v);
+
+// PRIMASK-Schatten (opt-in, Default aus): patcht CPSID i / CPSIE i der
+// Gast-Firmware auf SVC-Traps und fuehrt einen Schatten-PRIMASK nach. Da der
+// Gast unprivilegiert laeuft, ignoriert die Hardware diese Instruktionen sonst
+// (Kritische Sektionen via __disable_irq() blieben wirkungslos). Solange der
+// Schatten gesetzt ist, haelt die IRQ-Injektion neue IRQs pending zurueck.
+bool        primask_shadow();
+void        set_primask_shadow(bool v);
 
 } // namespace config

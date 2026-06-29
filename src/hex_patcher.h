@@ -47,4 +47,30 @@ Result relocate_ram_refs(uint8_t* image, std::size_t size_bytes,
                          uint32_t old_ram_base, uint32_t old_ram_size,
                          uint32_t new_ram_base);
 
+// Ersetzt alle WFI-Instruktionen (Thumb 0xBF30) durch SVC #0 (0xDF00), damit
+// eine reine WFI-Warteschleife der Gast-Firmware den Host-SVC-Trap auslöst
+// (siehe src/emulator.cpp, isr_svc_wfi). Nur opt-in (config::wfi_pin_wakeup).
+//
+// Heuristik / Risiko:
+//   - Gescannt werden 2-byte-aligned Halbwörter ab Offset `skip_bytes`
+//     (üblicherweise hinter der Vektor-Tabelle), um Vektoren nicht zu treffen.
+//   - Ein 16-Bit-Datenwort 0xBF30 im Code-Image würde fälschlich gepatcht.
+//     Daher ist das Feature default AUS und nur für getestete Firmware
+//     gedacht. Rückgabe = Anzahl ersetzter Instruktionen.
+//   - WFI mit aktivierten Interrupts (PRIMASK=0) läuft über den SVC-Handler;
+//     WFI mit gesperrten Interrupts (PRIMASK=1) eskaliert den SVC zu
+//     HardFault und wird dort gesondert behandelt (src/fault.cpp).
+uint32_t patch_wfi_to_svc(uint8_t* image, std::size_t size_bytes,
+                          std::size_t skip_bytes);
+
+// Ersetzt CPSID i (Thumb 0xB672) durch SVC #1 (0xDF01) und CPSIE i (0xB662)
+// durch SVC #2 (0xDF02), damit der Host die Gast-Kritischen-Sektionen
+// (__disable_irq()/__enable_irq()) als Schatten-PRIMASK nachfuehren kann
+// (siehe src/emulator.cpp svc_dispatch_c, src/vnvic.cpp). Nur opt-in
+// (config::primask_shadow). Gleiche Heuristik/Risiko wie patch_wfi_to_svc:
+// gescannt werden 2-byte-aligned Halbwoerter ab `skip_bytes`; ein passendes
+// 16-Bit-Datenwort im Image wuerde faelschlich gepatcht. Rueckgabe = Anzahl.
+uint32_t patch_cps_to_svc(uint8_t* image, std::size_t size_bytes,
+                          std::size_t skip_bytes);
+
 } // namespace hex_patcher

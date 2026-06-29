@@ -10,6 +10,7 @@ namespace {
 std::atomic<uint32_t> g_iser{0};
 std::atomic<uint32_t> g_ispr{0};
 std::atomic<uint32_t> g_iabr{0};
+std::atomic<bool>     g_primask{false};
 uint8_t               g_ipr[32]{};
 
 uint32_t read32(uint32_t aligned) {
@@ -107,6 +108,9 @@ void clear_pending(uint8_t lpc_irq) {
     g_ispr.fetch_and(~(1u << lpc_irq));
 }
 
+void set_primask(bool masked) { g_primask.store(masked); }
+bool primask()                { return g_primask.load(); }
+
 Snapshot snapshot() {
     Snapshot s{};
     s.iser = g_iser.load();
@@ -121,6 +125,7 @@ Snapshot snapshot() {
 
 void reset() {
     g_iser.store(0); g_ispr.store(0); g_iabr.store(0);
+    g_primask.store(false);
     std::memset(g_ipr, 0, sizeof g_ipr);
     g_wc = {0,{0,0,0,0},0};
 }

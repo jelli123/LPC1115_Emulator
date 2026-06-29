@@ -154,6 +154,7 @@ IRQ-Tabelle: [src/lpc_irqs.h](../src/lpc_irqs.h) (UM10398 Tab. 51).
 | SSP0/SSP1       | ✅     | Loopback-Modell (RX=TX)                       |
 | I²C0            | ✅     | Stub (NAK auf Adress-Send) — ohne externen Slave |
 | PMU/PCON        | ✅     | siehe [§13 Energiemanagement](#13-energiemanagement) |
+| BOD (`BODCTRL`) | ✅     | Register modelliert; `BODRSTENA` → echte RP2350-POWMAN-BOD aktiv |
 | RTC             | ❌     | LPC1115 hat keinen RTC-Block (entfällt)       |
 
 PLL-Modell: `F_OUT = F_CLKIN × (M+1)`, gültig 156-320 MHz CCO.
@@ -281,7 +282,7 @@ LPC1115 → RP2350-Mapping, soweit das RP2350 vergleichbare Modi anbietet:
 | Power-Down              | `PMU.PCON.PM=2` + WFI             | `clocks_hw->sleep_en{0,1}=0` + Deep-Sleep         |
 | Deep-Power-Down         | `PMU.PCON.PM=3` + WFI             | nicht 1:1 möglich (RP2350 Dormant würde USB+CLI killen) — ignoriert |
 | Wake-Up Quellen         | NVIC, BOD, WAKEUP-Pins            | jeder Cortex-M33-NVIC-IRQ + alle GPIO-Wake-Pins   |
-| BOD (Brown-Out-Detect)  | LPC SYSCON BOD-Block              | nicht modelliert (RP2350 hat eigenen Mechanismus) |
+| BOD (Brown-Out-Detect)  | LPC SYSCON `BODCTRL`              | Register modelliert; bei `BODRSTENA` echte RP2350-POWMAN-BOD aktiv |
 
 Konkret:
 
@@ -298,6 +299,48 @@ Konkret:
   Modus wie Power-Down behandelt.
 * SYSCON-PDRUNCFG wird als RAM-Schatten geführt; einzelne Power-
   Domain-Bits werden im RP2350 nicht abgebildet.
+* **BOD (`BODCTRL` @ `0x40048048`):** Das LPC-Register wird modelliert
+  ([src/peripherals.cpp](../src/peripherals.cpp) `g_bodctrl`,
+  `bod_apply()`), damit die Firmware konsistent zurücklesen kann. Setzt
+  der Gast `BODRSTENA`, stellen wir sicher, dass die **echte**
+  RP2350-POWMAN-BOD aktiv ist (`powman_set_bits(&powman_hw->bod,
+  POWMAN_BOD_EN_BITS)`), sodass reale Unterspannung einen Hardware-Reset
+  auslöst.
+  **Hardware-Grenze:** Die LPC-BOD überwacht die 3,3-V-VDD-Versorgung,
+  die RP2350-POWMAN-BOD dagegen die *Core-Rail* (~1,1 V, VSEL
+  0,473–1,204 V). Eine wörtliche Übersetzung der 3,3-V-Schwellen ist
+  physikalisch sinnlos; `VSEL` bleibt daher auf RP2350-Default (sichere
+  Core-Schwelle) — ein Anheben würde im Feldgerät spurious Resets
+  riskieren. Die LPC-Schwellenbits werden gespeichert, aber nicht auf
+  eine Core-Spannung gemappt.
+
+### Pin-IRQ-Wakeup aus reiner WFI-Schleife (opt-in)
+
+Da der Gast nativ ohne Host-Loop läuft, ist der MMIO-Trap normalerweise
+der einzige synchrone Injektionspunkt für emulierte IRQs — eine reine
+`__WFI()`-Warteschleife ohne MMIO-Zugriff lässt sich so nicht wecken.
+
+Mit `wfi_pin_wakeup=on` (CONFIG.INI, Default **aus**) werden beim Laden
+alle `WFI` (Thumb `0xBF30`) auf `SVC #0` (`0xDF00`) gepatcht
+([src/hex_patcher.cpp](../src/hex_patcher.cpp) `patch_wfi_to_svc`) und der
+SVC-Vektor (Slot 11) auf `isr_svc_wfi`
+([src/emulator.cpp](../src/emulator.cpp)) umgebogen. Der Handler pollt
+`peripherals::sample_pin_interrupts()` (echte PINT/GINT-Flanken) und
+`peripherals::poll_timed_sources()` (CT16/CT32/WWDT) und kehrt mit
+gesetztem PendSV zurück, sobald ein vom Gast aktivierter IRQ pending wird.
+
+**Einschränkungen:**
+* Aktives Pollen (`busy_wait_us(50)`), funktional korrekt, aber **nicht
+  stromsparend**.
+* `WFI` mit aktivierten Interrupts (`PRIMASK=0`) läuft über den SVC-Handler.
+  Das Idiom `__disable_irq(); __WFI();` (`PRIMASK=1`) eskaliert den SVC zu
+  HardFault und wird dort gesondert behandelt
+  ([src/fault.cpp](../src/fault.cpp) `hardfault_c`): gleiches Polling, PendSV
+  wird gesetzt und feuert, sobald der Gast die Interrupts wieder freigibt.
+* Das Patchen ersetzt das 16-Bit-Muster `0xBF30`; ein gleich aussehendes
+  Datenwort würde fälschlich getroffen → Feature nur für getestete
+  Firmware, daher Default aus.
+* Auf Hardware nicht validiert.
 
 **Ergebnis**: Der Energieverbrauch des Emulators folgt grob dem
 Verhalten des Guests — wenn der Guest schläft, schläft auch das

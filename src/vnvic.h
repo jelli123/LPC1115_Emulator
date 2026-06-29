@@ -30,6 +30,14 @@ bool     irq_pending();
 uint8_t  next_pending_irq();
 void     clear_pending(uint8_t lpc_irq);
 
+// PRIMASK-Schatten (opt-in via config::primask_shadow). Der Gast laeuft
+// unprivilegiert, daher ignoriert die M33-Hardware CPSID/CPSIE. Werden diese
+// per Patch auf SVC-Traps umgelenkt, fuehrt der Host hier einen Schatten-
+// PRIMASK nach. Ist er gesetzt, unterdrueckt die IRQ-Injektion das Ausliefern
+// (der IRQ bleibt im vNVIC pending und feuert beim Verlassen der Sektion).
+void     set_primask(bool masked);
+bool     primask();
+
 struct Snapshot {
     uint32_t iser;     // 1 Bit / IRQ, gesetzt = enabled
     uint32_t ispr;     // pending

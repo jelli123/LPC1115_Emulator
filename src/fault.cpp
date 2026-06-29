@@ -5,6 +5,8 @@
 #include "iap.h"
 #include "emulator.h"
 #include "storage.h"
+#include "config.h"
+#include "vnvic.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -320,9 +322,50 @@ extern "C" __attribute__((naked)) void isr_memmanage() {
     );
 }
 
-extern "C" void isr_hardfault() {
+// HardFault. Sonderfall WFI-Pin-Wakeup (opt-in): Führt der Gast `WFI` mit
+// gesperrten Interrupts aus (`PRIMASK=1`, das gängige
+// "__disable_irq(); __WFI();"-Idiom), so kann der aus dem Patch entstandene
+// `SVC #0` die SVCall-Exception nicht aktivieren (Priorität maskiert) und
+// eskaliert zu HardFault (HFSR.FORCED=1). Wir erkennen das an der
+// gefehlerten Instruktion (`0xDF00`) und behandeln es wie WFI: pollen echte
+// Pin-Flanken/Timer, setzen bei fälligem IRQ PendSV (bleibt unter PRIMASK
+// pending und feuert, sobald der Gast die Interrupts wieder freigibt) und
+// kehren hinter das WFI zurück. PRIMASK des Gastes bleibt unangetastet.
+extern "C" void hardfault_c(uint32_t* exc_frame) {
+    if (config::wfi_pin_wakeup() && (SCB->HFSR & SCB_HFSR_FORCED_Msk)) {
+        uint32_t pc = exc_frame[6];
+        const uint16_t* ip = reinterpret_cast<const uint16_t*>(pc & ~1u);
+        if (*ip == 0xDF00) {                 // SVC #0 (gepatchtes WFI)
+            for (;;) {
+                peripherals::sample_pin_interrupts();
+                peripherals::poll_timed_sources();
+                if (vnvic::irq_pending()) {
+                    SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+                    break;
+                }
+                busy_wait_us(50);
+            }
+            exc_frame[6] = (pc & ~1u) + 2u;  // hinter das WFI/SVC zurück
+            SCB->HFSR = SCB->HFSR;           // FORCED w1c
+            ++faultsys::g_stats.mem_traps;
+            return;
+        }
+    }
     watchdog_enable(50, true);
     while (true) { tight_loop_contents(); }
+}
+
+extern "C" __attribute__((naked)) void isr_hardfault() {
+    __asm volatile (
+        "tst   lr, #4              \n"
+        "ite   eq                  \n"
+        "mrseq r0, msp             \n"
+        "mrsne r0, psp             \n"
+        "push  {r4-r11, lr}        \n"
+        "bl    hardfault_c         \n"
+        "pop   {r4-r11, lr}        \n"
+        "bx    lr                  \n"
+    );
 }
 
 // Bei aktivem GDB-Stub fängt UsageFault BKPT-Instruktionen (Software-

@@ -77,6 +77,11 @@ add_executable(emulator
 
 target_include_directories(emulator PRIVATE src)
 
+# PIO-Programm fuer flankengenaues Capture-Timestamping (KNX-Empfang).
+# pioasm erzeugt den Header knx_edge_ts.pio.h ins Build-Verzeichnis.
+pico_generate_pio_header(emulator ${CMAKE_CURRENT_LIST_DIR}/src/knx_edge_ts.pio)
+
+
 # tusb_config.h aus src/ verwenden statt SDK-Default.
 target_compile_definitions(emulator PRIVATE
     PICO_STDIO_USB_USE_USB_CDC=1
@@ -107,10 +112,13 @@ target_link_libraries(emulator PRIVATE
     hardware_gpio
     hardware_uart
     hardware_i2c
+    hardware_spi
+    hardware_adc
     hardware_timer
     hardware_watchdog
     hardware_pio
     hardware_clocks
+    hardware_powman
     tinyusb_device
     tinyusb_board
 )

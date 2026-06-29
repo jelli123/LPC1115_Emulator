@@ -4,6 +4,7 @@
 #include "irq_inject.h"
 #include "lpc_irqs.h"
 #include "emulator.h"
+#include "pio_glue.h"
 
 #include <cstring>
 #include <cstdio>
@@ -12,9 +13,14 @@
 #include "hardware/clocks.h"
 #include "hardware/uart.h"
 #include "hardware/i2c.h"
+#include "hardware/spi.h"
+#include "hardware/adc.h"
 #include "hardware/timer.h"
+#include "hardware/powman.h"
+#include "hardware/structs/powman.h"
 #include "hardware/structs/clocks.h"
 #include "hardware/structs/scb.h"
+#include "hardware/regs/powman.h"
 #include "pico/stdlib.h"
 
 // Pico-SDK 2.x definiert in addressmap.h Makros wie WDT_BASE, ADC_BASE,
@@ -48,6 +54,9 @@ constexpr uint32_t WDTOSCCTRL         = SYSCON_BASE + 0x024;
 constexpr uint32_t IRCCTRL            = SYSCON_BASE + 0x028;
 constexpr uint32_t SYSPLLCLKSEL       = SYSCON_BASE + 0x040;
 constexpr uint32_t SYSPLLCLKUEN       = SYSCON_BASE + 0x044;
+// BODCTRL (UM10398 Kap. 3.5.34): BODRSTLEV[1:0], BODINTVAL[3:2], BODRSTENA[4].
+constexpr uint32_t BODCTRL            = SYSCON_BASE + 0x048;
+constexpr uint32_t BODCTRL_BODRSTENA  = 1u << 4;
 constexpr uint32_t MAINCLKSEL         = SYSCON_BASE + 0x070;
 constexpr uint32_t MAINCLKUEN         = SYSCON_BASE + 0x074;
 constexpr uint32_t SYSAHBCLKDIV       = SYSCON_BASE + 0x078;
@@ -159,6 +168,28 @@ constexpr uint8_t lpc_pin_idx(uint8_t port, uint8_t pin) {
 
 void apply_gpio_to_hw(uint8_t lpc_pin, bool out, bool level);
 
+// Prüft, ob ein RP2350-GPIO exklusiv von einer Hardware-Bridge belegt ist
+// (ADC, SPI, Timer-Capture/Match). Solche Pins darf das GPIO-Modell nicht
+// als digitalen Aus-/Eingang übersteuern, sonst kollidiert es mit der Bridge.
+bool bridge_owns_gpio(int g) {
+    if (g < 0) return false;
+    // ADC: feste RP2350A-ADC-Pins GP26..29.
+    if (config::adc_bridge_enabled() && g >= 26 && g <= 29) return true;
+    // SPI: SCK/MOSI/MISO.
+    if (config::spi_bridge_enabled()) {
+        if (g == config::spi_bridge_sck_pin() ||
+            g == config::spi_bridge_mosi_pin() ||
+            g == config::spi_bridge_miso_pin()) return true;
+    }
+    // Timer-Capture-/Match-Pins.
+    for (int t = 0; t < 4; ++t) {
+        if (g == config::ct_capture_pin(t)) return true;
+        for (int m = 0; m < 4; ++m)
+            if (g == config::ct_match_pin(t, m)) return true;
+    }
+    return false;
+}
+
 void gpio_apply_port(uint8_t port, uint32_t /*old_data*/, uint32_t new_data, uint32_t dir) {
     for (uint8_t pin = 0; pin < 12; ++pin) {
         bool out = (dir >> pin) & 1u;
@@ -174,6 +205,24 @@ uint32_t        g_syspllclksel = 0;       // 0 = IRC, 1 = SYSOSC
 uint32_t        g_mainclksel   = 0;       // 0 = IRC, 2 = SYSPLLOUT
 uint32_t        g_sysahbclkdiv = 1;
 uint32_t        g_pdruncfg     = 0xFFFF;
+uint32_t        g_bodctrl      = 0;        // LPC BODCTRL-Schatten
+
+// Bildet das LPC-Brownout-Detect auf die *echte* RP2350-POWMAN-BOD ab.
+//
+// WICHTIGE HARDWARE-EINSCHRÄNKUNG: Die LPC1115-BOD überwacht die 3,3-V-
+// VDD-Versorgung (Schwellen ~1,7..2,9 V). Die RP2350-POWMAN-BOD überwacht
+// dagegen die *Core-Rail* (~1,1 V, VSEL 0,473..1,204 V). Eine wörtliche
+// Übersetzung der 3,3-V-Schwellen wäre physikalisch sinnlos und ein Anheben
+// der Core-Schwelle würde im Feldgerät spurious Resets riskieren. Daher:
+//   - VSEL bleibt auf RP2350-Default (sichere Core-Brownout-Schwelle).
+//   - Setzt der Gast BODRSTENA, stellen wir nur sicher, dass die RP2350-BOD
+//     überhaupt aktiv ist (EN). Damit löst echte Unterspannung am Gerät einen
+//     Hardware-Reset aus — wie es die LPC-Firmware erwartet.
+void bod_apply() {
+    if (g_bodctrl & BODCTRL_BODRSTENA) {
+        powman_set_bits(&powman_hw->bod, POWMAN_BOD_EN_BITS);
+    }
+}
 uint8_t         g_iocon[256]{};
 uint8_t         g_pintsel[8]{};            // Kanal n → LPC-Pin-Index (PINTSEL0..7)
 uint32_t        g_current_hz   = 12'000'000; // Default IRC
@@ -186,6 +235,7 @@ void apply_gpio_to_hw(uint8_t lpc_pin, bool out, bool level) {
     if (lpc_pin >= config::LPC_PIN_COUNT) return;
     int g = pm.lpc_to_rp[lpc_pin];
     if (g < 0) return;
+    if (bridge_owns_gpio(g)) return;   // ADC/SPI/Timer-Capture/Match besitzen den Pin
     gpio_init(static_cast<uint>(g));
     gpio_set_dir(static_cast<uint>(g), out);
     if (out) gpio_put(static_cast<uint>(g), level);
@@ -238,6 +288,7 @@ void syscon_write32(uint32_t addr, uint32_t value) {
         case MAINCLKSEL:    g_mainclksel   = value & 0x3u;  g_pll_reconfig_pending = true; break;
         case SYSAHBCLKDIV:  g_sysahbclkdiv = value & 0xFFu; g_pll_reconfig_pending = true; break;
         case PDRUNCFG:      g_pdruncfg     = value;                                           break;
+        case BODCTRL:       g_bodctrl      = value & 0x1Fu; bod_apply();                       break;
         case SYSPLLCLKUEN:
         case MAINCLKUEN:
             if (value & 1u) g_pll_reconfig_pending = true;
@@ -260,6 +311,7 @@ uint32_t syscon_read32(uint32_t addr) {
         case MAINCLKUEN:   return 1;
         case SYSAHBCLKDIV: return g_sysahbclkdiv;
         case PDRUNCFG:     return g_pdruncfg;
+        case BODCTRL:      return g_bodctrl;
         default:
             if (addr >= PINTSEL0 && addr < PINTSEL_END)
                 return g_pintsel[(addr - PINTSEL0) >> 2];
@@ -390,6 +442,10 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
 
 // =========================================================================
 // CT16Bx / CT32Bx — Match-Timer mit Soft-Tick aus time_us_64().
+// Zusätzlich: Capture (CR0) und External-Match-Ausgänge (EMR), an echte
+// RP2350-GPIOs gebrückt. Wird für den Selfbus-KNX-Buszugriff benötigt:
+//   Capture-Eingang  = Bus-Empfang (Flanken-Timestamps → CR0 + Capture-IRQ)
+//   Match-Ausgänge   = Bus-Senden (EMR steuert MATm-Pin: clear/set/toggle)
 // =========================================================================
 struct CtModel {
     bool     enabled;
@@ -399,11 +455,40 @@ struct CtModel {
     uint32_t mr[4];
     uint32_t mcr;
     uint32_t ir;
+    uint32_t ccr;          // Capture Control (CAP0RE/FE/I in Bits 0..2)
+    uint32_t cr0;          // Capture-Wert 0 (read-only für Gast)
+    uint32_t emr;          // External Match Register (EM0..3 + EMC0..3)
     bool     is32;
     uint8_t  irq_num;
     uint64_t last_us;
+    int8_t   cap_pin;      // RP2350-GPIO für CAP0-Eingang, -1 = keiner
+    bool     cap_last;     // letzter gesampelter Pegel (Flankenerkennung)
+    int8_t   mat_pin[4];   // RP2350-GPIO für MAT0..3-Ausgänge, -1 = keiner
+    // PIO-Capture (opt-in, flankengenau): Handle der State-Machine, Zählrate
+    // und Zustand zur Differenz-/Richtungsrekonstruktion.
+    int      pio_handle;   // < 0 = Software-Capture (Fallback)
+    float    pio_rate;     // PIO-Zählrate [Counts/s]
+    uint32_t pio_prev;     // letzter Zählerstand
+    bool     pio_have_prev;
+    bool     pio_dir_rising; // nächste erwartete Flanke steigend? (Idle high → erst fallend)
 };
 CtModel g_ct[4];
+
+// EMR-External-Match: EM0..3 = Bits 0..3, EMC0..3 = je 2 Bit ab Bit 4.
+// EMC: 0=nichts, 1=Pin löschen(0), 2=Pin setzen(1), 3=Pin toggeln.
+void ct_apply_external_match(CtModel& c, int m) {
+    uint32_t emc = (c.emr >> (4u + 2u * static_cast<uint32_t>(m))) & 0x3u;
+    if (emc == 0) return;
+    uint32_t bit = 1u << m;
+    bool level;
+    switch (emc) {
+        case 1:  c.emr &= ~bit; level = false; break;   // clear
+        case 2:  c.emr |=  bit; level = true;  break;   // set
+        default: c.emr ^=  bit; level = (c.emr & bit) != 0; break; // toggle
+    }
+    if (c.mat_pin[m] >= 0)
+        gpio_put(static_cast<uint>(c.mat_pin[m]), level);
+}
 
 uint32_t ct_idx_for(uint32_t addr) {
     if (addr >= CT16B0_BASE && addr < CT16B0_BASE + CT_BLOCK_SIZE) return 0;
@@ -432,6 +517,7 @@ void ct_advance(CtModel& c) {
             if (c.tc == c.mr[m]) {
                 uint32_t mcr = (c.mcr >> (m * 3)) & 0x7u;
                 if (mcr & 0x1) { c.ir |= (1u << m); irq_inject::pend(c.irq_num); }
+                ct_apply_external_match(c, m);   // EMR: MATm-Pin treiben
                 if (mcr & 0x2) c.tc = 0;
                 if (mcr & 0x4) c.enabled = false;
             }
@@ -439,9 +525,78 @@ void ct_advance(CtModel& c) {
     }
 }
 
+// Flankenerkennung am Capture-Eingang: liest den echten RP2350-Pin, erkennt
+// die per CCR scharfgeschalteten Flanken, schreibt den aktuellen TC nach CR0,
+// setzt IR-Bit 4 und pendet den Timer-IRQ (falls CAP0I gesetzt). Wird mit der
+// gleichen Kadenz wie sample_pin_interrupts() aufgerufen (jeder MMIO-Trap und
+// die WFI-Warteschleife). Zeitliche Auflösung der Flanken = Sampling-Kadenz.
+void ct_sample_capture_sw(CtModel& c) {
+    bool rise_arm = (c.ccr & 0x1u) != 0;
+    bool fall_arm = (c.ccr & 0x2u) != 0;
+    bool level = gpio_get(static_cast<uint>(c.cap_pin));
+    if (level == c.cap_last) return;
+    bool rising  = level && !c.cap_last;
+    bool falling = !level && c.cap_last;
+    c.cap_last = level;
+    if ((rising && rise_arm) || (falling && fall_arm)) {
+        ct_advance(c);                 // TC auf "jetzt" bringen
+        c.cr0 = c.tc;
+        c.ir |= (1u << 4);             // CR0-Capture-Interrupt-Flag
+        if (c.ccr & 0x4u) irq_inject::pend(c.irq_num);  // CAP0I
+    }
+}
+
+// PIO-Capture (opt-in): drainiert die FIFO der Timestamp-State-Machine. Jeder
+// Eintrag = eine flankengenaue (Hardware-)Zeitmarke. Die Flankenrichtung wird
+// per strikter Alternation bestimmt (Bus-Idle = high → erste Flanke fallend).
+// Die Zählerdifferenz wird in TC-Ticks umgerechnet und auf CR0 akkumuliert,
+// sodass die vom Gast ausgewerteten CR0-Differenzen exakt stimmen — unabhängig
+// davon, wann die CPU die FIFO ausliest (kein Jitter, keine verlorenen Flanken).
+void ct_sample_capture_pio(CtModel& c) {
+    bool rise_arm = (c.ccr & 0x1u) != 0;
+    bool fall_arm = (c.ccr & 0x2u) != 0;
+    uint32_t raw;
+    while (pio_glue::ts_read(c.pio_handle, raw)) {
+        bool rising = c.pio_dir_rising;
+        c.pio_dir_rising = !c.pio_dir_rising;     // Flanken alternieren strikt
+
+        if (!c.pio_have_prev) {
+            c.pio_prev = raw;
+            c.pio_have_prev = true;
+            ct_advance(c);                        // CR0-Anker = aktueller TC
+            c.cr0 = c.tc;
+        } else {
+            // Abwärtszähler: verstrichene Counts = prev - raw (mod 2^32).
+            uint32_t delta = c.pio_prev - raw;
+            c.pio_prev = raw;
+            double f_tc = static_cast<double>(g_current_hz)
+                          / static_cast<double>(c.pre + 1u);
+            double tc_delta = (c.pio_rate > 0.0f)
+                ? static_cast<double>(delta) * f_tc / static_cast<double>(c.pio_rate)
+                : 0.0;
+            uint32_t mask = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
+            c.cr0 = static_cast<uint32_t>(
+                        (static_cast<uint64_t>(c.cr0) +
+                         static_cast<uint64_t>(tc_delta)) & mask);
+        }
+
+        if ((rising && rise_arm) || (!rising && fall_arm)) {
+            c.ir |= (1u << 4);
+            if (c.ccr & 0x4u) irq_inject::pend(c.irq_num);  // CAP0I
+        }
+    }
+}
+
+void ct_sample_capture(CtModel& c) {
+    if (c.cap_pin < 0) return;
+    if (c.pio_handle >= 0) ct_sample_capture_pio(c);
+    else                   ct_sample_capture_sw(c);
+}
+
 uint8_t ct_read_byte(uint32_t idx, uint32_t off) {
     CtModel& c = g_ct[idx];
     ct_advance(c);
+    ct_sample_capture(c);
     auto byte_of = [&](uint32_t v) {
         return static_cast<uint8_t>((v >> ((off & 3u) * 8)) & 0xFFu);
     };
@@ -456,6 +611,9 @@ uint8_t ct_read_byte(uint32_t idx, uint32_t off) {
         case 0x1C: return byte_of(c.mr[1]);
         case 0x20: return byte_of(c.mr[2]);
         case 0x24: return byte_of(c.mr[3]);
+        case 0x28: return byte_of(c.ccr);
+        case 0x2C: return byte_of(c.cr0);
+        case 0x3C: return byte_of(c.emr);
         default:   return 0;
     }
 }
@@ -486,6 +644,19 @@ void ct_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
         case 0x1C: patch(c.mr[1]); break;
         case 0x20: patch(c.mr[2]); break;
         case 0x24: patch(c.mr[3]); break;
+        case 0x28: patch(c.ccr);   break;
+        case 0x2C: /* CR0 read-only */ break;
+        case 0x3C: {
+            // EMR-Schreibzugriff: EMC-Steuerbits übernehmen; manuelle EM0..3-
+            // Setzen treibt die MATm-Pins direkt (z. B. Initialpegel beim Senden).
+            uint32_t old = c.emr;
+            patch(c.emr);
+            for (int m = 0; m < 4; ++m) {
+                if (c.mat_pin[m] >= 0 && (((old ^ c.emr) >> m) & 1u))
+                    gpio_put(static_cast<uint>(c.mat_pin[m]), ((c.emr >> m) & 1u) != 0);
+            }
+            break;
+        }
         default: break;
     }
 }
@@ -578,8 +749,11 @@ void wdt_write_byte(uint32_t addr, uint8_t val) {
 }
 
 // =========================================================================
-// ADC — minimaler Modell. Wandlung gilt sofort als fertig, Ergebnis = 0.
-// Reicht für Selfbus-Apps, die ADC nicht zwingend benötigen.
+// ADC — Bridge auf den echten RP2350-ADC (opt-in via config::adc_bridge_en).
+// Mapping ist durch die RP2350-Hardware fix vorgegeben: LPC-Kanal 0..3 →
+// RP2350-ADC-Eingang 0..3 (GPIO26..29). Kanäle 4..7 haben keinen RP2350-ADC-
+// Pin und liefern weiterhin den Mittenwert. Ist die Bridge aus, ist das
+// Ergebnis deterministisch (halber Skalenwert), damit Apps booten.
 // =========================================================================
 struct AdcModel {
     uint32_t cr;
@@ -590,6 +764,78 @@ struct AdcModel {
 };
 AdcModel g_adc{};
 
+bool     g_adc_ready        = false;   // Bridge initialisiert?
+uint32_t g_adc_gpio_inited  = 0;       // Bitmaske: GPIO je Kanal schon init'd
+
+void adc_bridge_init() {
+    g_adc_ready       = false;
+    g_adc_gpio_inited = 0;
+    if (!config::adc_bridge_enabled()) return;
+    adc_init();
+    g_adc_ready = true;
+}
+
+// Liefert einen 10-Bit-Sample (0..0x3FF) für LPC-ADC-Kanal `ch`.
+uint16_t adc_sample_channel(int ch) {
+    if (g_adc_ready && ch >= 0 && ch <= 3) {
+        if (!(g_adc_gpio_inited & (1u << ch))) {
+            adc_gpio_init(static_cast<uint>(26 + ch));   // ADC0..3 = GPIO26..29
+            g_adc_gpio_inited |= (1u << ch);
+        }
+        adc_select_input(static_cast<uint>(ch));
+        return static_cast<uint16_t>(adc_read() >> 2);   // 12-Bit → 10-Bit
+    }
+    return 0x200;                                          // Mittenwert-Fallback
+}
+
+// =========================================================================
+// Timer-Capture-/Match-Pin-Bridge (CT16/CT32 → echte RP2350-GPIOs).
+// Bindet die in CONFIG.INI konfigurierten Capture-Eingänge (KNX-Empfang) und
+// Match-Ausgänge (KNX-Senden) an reale Pins. Capture-Pins werden als Eingang
+// mit Pull-up (KNX-Bus-Idle = high) initialisiert, Match-Pins als Ausgang.
+// =========================================================================
+void ct_bridge_init() {
+    bool use_pio = config::tcap_pio();
+    for (int t = 0; t < 4; ++t) {
+        // Evtl. zuvor belegte PIO-State-Machine wieder freigeben (Reinit).
+        if (g_ct[t].pio_handle >= 0) {
+            pio_glue::ts_teardown(g_ct[t].pio_handle);
+            g_ct[t].pio_handle = -1;
+        }
+        g_ct[t].pio_have_prev  = false;
+        g_ct[t].pio_dir_rising = false;
+
+        int cap = config::ct_capture_pin(t);
+        g_ct[t].cap_pin = static_cast<int8_t>(cap);
+        if (cap >= 0) {
+            gpio_init(static_cast<uint>(cap));
+            gpio_set_dir(static_cast<uint>(cap), false);    // Eingang
+            gpio_pull_up(static_cast<uint>(cap));           // KNX-Bus-Idle = high
+            g_ct[t].cap_last = gpio_get(static_cast<uint>(cap));
+            if (use_pio) {
+                float rate = 0.0f;
+                int h = pio_glue::ts_setup(static_cast<uint8_t>(cap), rate);
+                if (h >= 0) {
+                    g_ct[t].pio_handle = h;
+                    g_ct[t].pio_rate   = rate;
+                } else {
+                    std::printf("[CT] PIO-Capture fuer Timer %d nicht moeglich, "
+                                "Fallback auf Software\n", t);
+                }
+            }
+        }
+        for (int m = 0; m < 4; ++m) {
+            int mp = config::ct_match_pin(t, m);
+            g_ct[t].mat_pin[m] = static_cast<int8_t>(mp);
+            if (mp >= 0) {
+                gpio_init(static_cast<uint>(mp));
+                gpio_set_dir(static_cast<uint>(mp), true);  // Ausgang
+                gpio_put(static_cast<uint>(mp), false);
+            }
+        }
+    }
+}
+
 void adc_simulate() {
     // Wenn START != 0 oder BURST gesetzt → Conversion sofort fertig.
     bool start = ((g_adc.cr >> 24) & 0x7u) != 0;
@@ -598,9 +844,8 @@ void adc_simulate() {
     uint32_t sel = g_adc.cr & 0xFFu;
     for (int ch = 0; ch < 8; ++ch) {
         if (sel & (1u << ch)) {
-            // 10-bit "Sample" = halber Skalenwert; deterministisch.
-            uint16_t sample = 0x200;
-            g_adc.dr[ch] = (1u << 31) | (1u << 30) |     // DONE, OVERRUN=0 (also 1u<<30 ist OVERRUN; here clear)
+            uint16_t sample = adc_sample_channel(ch);     // 10-Bit
+            g_adc.dr[ch] = (1u << 31) |                   // DONE
                            (static_cast<uint32_t>(sample) << 6);
             g_adc.dr[ch] &= ~(1u << 30);                  // OVERRUN clearen
             g_adc.gdr = (1u << 31) | (static_cast<uint32_t>(sample) << 6) |
@@ -641,15 +886,64 @@ void adc_write_byte(uint32_t addr, uint8_t val) {
 }
 
 // =========================================================================
-// SSP0/SSP1 — minimale Modelle. RX = TX (Loopback) wenn keine HW gebunden,
-// das reicht für Selfbus-Apps, die SSP zur SPI-Datenausgabe benutzen, weil
-// der Empfangs-Pfad der App egal ist.
+// SSP0/SSP1 — Bridge auf RP2350-Hardware-SPI (spi0/spi1), konfigurierbar.
+//
+// Der per config::spi_bridge_lpc gewählte LPC-SSP wird voll-duplex auf die
+// echte RP2350-SPI abgebildet: Jeder Schreibzugriff auf das Datenregister
+// (DR) löst eine SPI-Transaktion aus; das gleichzeitig empfangene Byte/Wort
+// landet im RX-Schatten und wird beim DR-Lesen zurückgeliefert. CR0 steuert
+// Datenbreite (DSS) sowie SPI-Modus (CPOL/CPHA). Der nicht gebrückte SSP
+// (und der Fall „Bridge inaktiv") fällt auf Loopback (RX=TX) zurück, damit
+// Apps ohne angeschlossene SPI-Hardware weiter booten.
+//
+// Bekannte Grenze: Der SCK-Takt wird über spi_bridge_hz konfiguriert, nicht
+// aus den LPC-CPSR/SCR-Registern abgeleitet. Chip-Selects sind nicht Teil der
+// SSP-Bridge; sie laufen wie gehabt über das GPIO-Modell (echte Pins).
 // =========================================================================
 struct SspModel {
-    uint32_t cr0, cr1, cpsr, imsc, ris, dr_rx;
+    uint32_t cr0, cr1, cpsr, imsc, ris, dr_rx, tx;
     uint8_t  irq_num;
 };
 SspModel g_ssp[2]{};
+
+spi_inst_t* g_spi_hw    = nullptr;   // nullptr → Bridge inaktiv (Loopback)
+bool        g_spi_ready = false;
+int         g_spi_lpc   = 0;         // welcher LPC-SSP gebrückt ist
+
+void ssp_apply_format(uint32_t idx);
+
+void spi_bridge_init() {
+    g_spi_hw    = nullptr;
+    g_spi_ready = false;
+    g_spi_lpc   = config::spi_bridge_lpc();
+    if (!config::spi_bridge_enabled()) return;
+    int sck  = config::spi_bridge_sck_pin();
+    int mosi = config::spi_bridge_mosi_pin();
+    int miso = config::spi_bridge_miso_pin();
+    if (sck < 0 || mosi < 0 || miso < 0) return;
+    g_spi_hw = config::spi_bridge_instance() ? spi1 : spi0;
+    spi_init(g_spi_hw, config::spi_bridge_hz());
+    gpio_set_function(static_cast<uint>(sck),  GPIO_FUNC_SPI);
+    gpio_set_function(static_cast<uint>(mosi), GPIO_FUNC_SPI);
+    gpio_set_function(static_cast<uint>(miso), GPIO_FUNC_SPI);
+    g_spi_ready = true;
+    ssp_apply_format(static_cast<uint32_t>(g_spi_lpc));
+}
+
+// Übernimmt Datenbreite (DSS) und SPI-Modus (CPOL/CPHA) aus CR0 in die HW.
+void ssp_apply_format(uint32_t idx) {
+    if (!g_spi_ready || static_cast<int>(idx) != g_spi_lpc) return;
+    uint bits = (g_ssp[idx].cr0 & 0xFu) + 1u;
+    if (bits < 4u)  bits = 4u;
+    if (bits > 16u) bits = 16u;
+    spi_cpol_t cpol = (g_ssp[idx].cr0 & (1u << 6)) ? SPI_CPOL_1 : SPI_CPOL_0;
+    spi_cpha_t cpha = (g_ssp[idx].cr0 & (1u << 7)) ? SPI_CPHA_1 : SPI_CPHA_0;
+    spi_set_format(g_spi_hw, bits, cpol, cpha, SPI_MSB_FIRST);
+}
+
+bool ssp_is_bridged(uint32_t idx) {
+    return g_spi_ready && static_cast<int>(idx) == g_spi_lpc;
+}
 
 uint32_t ssp_idx_for(uint32_t addr) {
     if (addr >= SSP0_BASE && addr < SSP0_BASE + SSP_BLOCK) return 0;
@@ -669,7 +963,12 @@ uint8_t ssp_read_byte(uint32_t idx, uint32_t off) {
             s.ris &= ~0x4u;     // RX nicht mehr voll
             return static_cast<uint8_t>((v >> lane) & 0xFFu);
         }
-        case SSP_SR:   return static_cast<uint8_t>((0x03u) & 0xFFu);  // TFE+TNF
+        case SSP_SR: {
+            // TFE(0)+TNF(1) immer gesetzt (synchroner Transfer); RNE(2), wenn
+            // ein RX-Wort bereitsteht. BSY(4) nie (Transfer schon fertig).
+            uint8_t sr = 0x03u | ((s.ris & 0x4u) ? 0x04u : 0x00u);
+            return static_cast<uint8_t>((sr >> lane) & 0xFFu);
+        }
         case SSP_CPSR: return static_cast<uint8_t>((s.cpsr >> lane) & 0xFFu);
         case SSP_IMSC: return static_cast<uint8_t>((s.imsc >> lane) & 0xFFu);
         case SSP_RIS:  return static_cast<uint8_t>((s.ris  >> lane) & 0xFFu);
@@ -685,12 +984,31 @@ void ssp_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
         v = (v & ~(0xFFu << lane)) | (static_cast<uint32_t>(val) << lane);
     };
     switch (off & ~3u) {
-        case SSP_CR0:  patch(s.cr0);  break;
+        case SSP_CR0:  patch(s.cr0);  ssp_apply_format(idx); break;
         case SSP_CR1:  patch(s.cr1);  break;
         case SSP_DR:   {
-            // Loopback: was gesendet wird, kommt zurück.
-            patch(s.dr_rx);
-            s.ris |= 0x4u;     // RX-FIFO not empty
+            patch(s.tx);
+            // Frame-Größe aus DSS; das letzte Byte des Frames löst den
+            // Transfer aus (8-Bit → Lane 0, >8-Bit → Lane 1).
+            uint32_t bits = (s.cr0 & 0xFu) + 1u;
+            bool complete = (bits <= 8u) ? ((off & 3u) == 0u)
+                                         : ((off & 3u) == 1u);
+            if (!complete) break;
+            if (ssp_is_bridged(idx)) {
+                if (bits <= 8u) {
+                    uint8_t tx = static_cast<uint8_t>(s.tx & 0xFFu), rx = 0;
+                    spi_write_read_blocking(g_spi_hw, &tx, &rx, 1);
+                    s.dr_rx = rx;
+                } else {
+                    uint16_t tx = static_cast<uint16_t>(s.tx & 0xFFFFu), rx = 0;
+                    spi_write16_read16_blocking(g_spi_hw, &tx, &rx, 1);
+                    s.dr_rx = rx;
+                }
+            } else {
+                s.dr_rx = s.tx;        // Loopback-Fallback
+            }
+            s.tx = 0;
+            s.ris |= 0x4u;             // RX-FIFO not empty
             if (s.imsc & 0x4u) irq_inject::pend(s.irq_num);
             break;
         }
@@ -943,9 +1261,15 @@ namespace peripherals {
 void init() {
     reset();
     i2c_bridge_init();
+    spi_bridge_init();
+    adc_bridge_init();
+    ct_bridge_init();
 }
 
 void i2c_bridge_reinit() { i2c_bridge_init(); }
+void spi_bridge_reinit() { spi_bridge_init(); }
+void adc_bridge_reinit() { adc_bridge_init(); }
+void ct_bridge_reinit()  { ct_bridge_init(); }
 
 void reset() {
     std::memset(g_gpio, 0, sizeof g_gpio);
@@ -956,6 +1280,7 @@ void reset() {
     g_mainclksel   = 0;
     g_sysahbclkdiv = 1;
     g_pdruncfg     = 0xFFFF;
+    g_bodctrl      = 0;
     g_current_hz   = 12'000'000;
     g_syscon_collector = {0, {0,0,0,0}, 0};
     g_pll_reconfig_pending = false;
@@ -966,6 +1291,13 @@ void reset() {
     g_ct[1].is32 = false; g_ct[1].irq_num = lpc_irq::CT16B1;
     g_ct[2].is32 = true;  g_ct[2].irq_num = lpc_irq::CT32B0;
     g_ct[3].is32 = true;  g_ct[3].irq_num = lpc_irq::CT32B1;
+    for (auto& c : g_ct) {
+        c.cap_pin = -1;
+        for (auto& mp : c.mat_pin) mp = -1;
+        c.pio_handle    = -1;
+        c.pio_have_prev = false;
+        c.pio_dir_rising = false;   // Idle high → erste Flanke fallend
+    }
 
     g_wdt = {};
     g_wdt.tc = 0xFF;
@@ -1043,6 +1375,7 @@ uint32_t gpio_live_port_data(uint32_t port) {
         if (lpc >= config::LPC_PIN_COUNT) continue;
         int g = pm.lpc_to_rp[lpc];
         if (g < 0) continue;
+        if (bridge_owns_gpio(g)) continue;          // ADC/SPI/Capture/Match-Pin
         bool lvl = gpio_get(static_cast<uint>(g));
         data = (data & ~(1u << pin)) | (static_cast<uint32_t>(lvl) << pin);
     }
@@ -1091,6 +1424,9 @@ uint32_t gint_base_for(uint32_t i) { return i ? GINT1_BASE : GINT0_BASE; }
 void sample_pin_interrupts() {
     uint32_t live[4];
     for (uint32_t p = 0; p < 4; ++p) live[p] = gpio_live_port_data(p);
+
+    // --- Timer-Capture (KNX-Bus-Empfang): Flanken am CAP0-Pin timestampen. ---
+    for (auto& c : g_ct) ct_sample_capture(c);
 
     // --- PINT ---
     uint16_t cur = 0;
@@ -1145,6 +1481,22 @@ void sample_pin_interrupts() {
         }
         g.prev_match = match;
     }
+}
+
+// Treibt die zeitbasierten Modelle (CT16/CT32, WWDT) weiter und pendet
+// fällige IRQs. ct_advance/wdt_advance/g_ct/g_wdt liegen im anonymen
+// Namespace oben, sind in dieser TU aber sichtbar.
+void poll_timed_sources() {
+    for (auto& c : g_ct) { ct_advance(c); ct_sample_capture(c); }
+    wdt_advance();
+}
+
+bool capture_armed() {
+    // Nur Software-Capture braucht enges Polling. PIO-Capture puffert Flanken
+    // in der FIFO und braucht kein tight-loop → erlaubt die 50-µs-Pause.
+    for (auto& c : g_ct)
+        if (c.cap_pin >= 0 && (c.ccr & 0x3u) && c.pio_handle < 0) return true;
+    return false;
 }
 
 uint8_t pint_read_byte(uint32_t off) {

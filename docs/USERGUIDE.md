@@ -167,7 +167,25 @@ i2c_bridge_inst=0       # 0 = i2c0, 1 = i2c1
 i2c_bridge_sda=6        # SDA-Pin (RP2350-GPIO, externer Pull-up nötig)
 i2c_bridge_scl=7        # SCL-Pin (RP2350-GPIO, externer Pull-up nötig)
 i2c_bridge_hz=100000    # Bus-Takt (Standard 100 kHz)
+
+# WFI-Pin-Wakeup (opt-in, Default aus) — siehe Hinweis unten
+wfi_pin_wakeup=off      # on = WFI der Firmware auf Pin-IRQ-Wakeup patchen
 ```
+
+> **WFI-Pin-Wakeup (experimentell, opt-in):** Der LPC-Gast läuft nativ ohne
+> Host-Loop; eine reine `__WFI()`-Warteschleife der Firmware wird sonst nur
+> durch einen MMIO-Zugriff wieder „geweckt". Mit `wfi_pin_wakeup=on` werden
+> beim Laden alle `WFI`-Instruktionen auf einen SVC-Trap gepatcht. Der Host
+> pollt dann echte RP2350-Pin-Flanken (PINT/GINT) sowie die Timer-/WWDT-
+> Modelle und injiziert fällige LPC-IRQs.
+> Einschränkungen: (1) Es wird aktiv gepollt — funktional korrekt, aber
+> **nicht stromsparend**. (2) `WFI` mit aktivierten Interrupts läuft über
+> einen SVC-Handler; das Idiom `__disable_irq(); __WFI();` eskaliert intern
+> zu einem HardFault und wird dort äquivalent behandelt.
+> (3) Der Patch ersetzt das 16-Bit-Muster `0xBF30`; ein gleich aussehendes
+> Datenwort würde fälschlich getroffen — daher Default **aus** und nur für
+> getestete Firmware. Auf Hardware nicht validiert.
+
 
 > Wenn `BOOT.HEX` und `autostart=on` gesetzt sind, läuft der Emulator
 > nach jedem Power-Cycle **vollständig autonom** ohne USB-Konsole.

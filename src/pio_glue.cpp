@@ -7,6 +7,8 @@
 #include "hardware/gpio.h"
 #include "pico/stdlib.h"
 
+#include "knx_edge_ts.pio.h"   // von pioasm erzeugt (pico_generate_pio_header)
+
 // ---------------------------------------------------------------------------
 // PIO-Programm: Edge-Capture mit 32-Bit-Cycle-Counter.
 //
@@ -131,6 +133,91 @@ bool capture_read(uint16_t handle, uint32_t& out) {
     c.last = 0xFFFF'FFFFu - raw;
     out = c.last;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Flankengenaues Timestamping (knx_edge_ts-Programm).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct Ts {
+    bool    used;
+    PIO     pio;
+    uint    sm;
+    uint8_t gpio;
+};
+Ts   g_ts[MAX_HANDLES]{};
+
+PIO  g_ts_pio = pio0;
+bool g_ts_loaded = false;
+int  g_ts_offset = -1;
+
+bool ts_ensure_program() {
+    if (g_ts_loaded) return true;
+    g_ts_pio = pio0;
+    if (!pio_can_add_program(g_ts_pio, &knx_edge_ts_program)) {
+        g_ts_pio = pio1;
+        if (!pio_can_add_program(g_ts_pio, &knx_edge_ts_program)) return false;
+    }
+    g_ts_offset = pio_add_program(g_ts_pio, &knx_edge_ts_program);
+    g_ts_loaded = true;
+    return true;
+}
+
+} // namespace
+
+int ts_setup(uint8_t rp_gpio, float& out_rate_hz) {
+    if (!ts_ensure_program()) {
+        std::printf("[PIO] kein Platz fuer knx_edge_ts-Programm\n");
+        return -1;
+    }
+    int slot = -1;
+    for (int i = 0; i < static_cast<int>(MAX_HANDLES); ++i)
+        if (!g_ts[i].used) { slot = i; break; }
+    if (slot < 0) return -1;
+
+    int sm = pio_claim_unused_sm(g_ts_pio, false);
+    if (sm < 0) return -1;
+
+    // Zaehlrate ~1 MHz anpeilen: clkdiv = clk_sys / (2 * Zielrate).
+    // (2 Takte je Zaehlschritt, siehe .pio). clkdiv ist 16.8-Fixpunkt.
+    float sysclk = static_cast<float>(clock_get_hz(clk_sys));
+    float clkdiv = sysclk / (2.0f * 1'000'000.0f);
+    if (clkdiv < 1.0f) clkdiv = 1.0f;
+    out_rate_hz = sysclk / (2.0f * clkdiv);
+
+    pio_sm_config c = knx_edge_ts_program_get_default_config(g_ts_offset);
+    sm_config_set_jmp_pin(&c, rp_gpio);
+    sm_config_set_in_pins(&c, rp_gpio);
+    sm_config_set_in_shift(&c, /*shift_right=*/false, /*autopush=*/false, 32);
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    pio_gpio_init(g_ts_pio, rp_gpio);
+    pio_sm_set_consecutive_pindirs(g_ts_pio, static_cast<uint>(sm),
+                                   rp_gpio, 1, /*is_out=*/false);
+    pio_sm_init(g_ts_pio, static_cast<uint>(sm), g_ts_offset, &c);
+    pio_sm_set_enabled(g_ts_pio, static_cast<uint>(sm), true);
+
+    g_ts[slot] = { true, g_ts_pio, static_cast<uint>(sm), rp_gpio };
+    return slot;
+}
+
+bool ts_read(int handle, uint32_t& counter) {
+    if (handle < 0 || handle >= static_cast<int>(MAX_HANDLES)) return false;
+    auto& t = g_ts[handle];
+    if (!t.used) return false;
+    if (pio_sm_is_rx_fifo_empty(t.pio, t.sm)) return false;
+    counter = pio_sm_get(t.pio, t.sm);
+    return true;
+}
+
+void ts_teardown(int handle) {
+    if (handle < 0 || handle >= static_cast<int>(MAX_HANDLES)) return;
+    auto& t = g_ts[handle];
+    if (!t.used) return;
+    pio_sm_set_enabled(t.pio, t.sm, false);
+    pio_sm_unclaim(t.pio, t.sm);
+    t = {};
 }
 
 } // namespace pio_glue

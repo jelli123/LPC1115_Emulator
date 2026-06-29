@@ -5,6 +5,7 @@
 #include "storage.h"
 #include "config.h"
 #include "hex_patcher.h"
+#include "vnvic.h"
 
 #include <atomic>
 #include <cstdio>
@@ -37,6 +38,74 @@ extern "C" void isr_busfault();
 extern "C" void isr_memmanage();
 extern "C" void isr_hardfault();
 extern "C" void isr_usagefault();
+extern "C" void isr_pendsv();   // IRQ-Injektor (src/irq_inject.cpp)
+
+// --- WFI-Pin-Wakeup + PRIMASK-Schatten (beide opt-in) ----------------------
+//
+// Beide Features lenken Gast-Instruktionen auf SVC-Traps um, die hier ueber
+// die SVC-Immediate unterschieden werden (SVCall = Vektor-Slot 11):
+//   SVC #0  = gepatchtes WFI  (config::wfi_pin_wakeup) -> Warteschleife
+//   SVC #1  = CPSID i         (config::primask_shadow) -> Schatten-PRIMASK=1
+//   SVC #2  = CPSIE i         (config::primask_shadow) -> Schatten-PRIMASK=0
+//
+// WFI-Warteschleife: Statt schlafen zu legen, pollt der Host die echten
+// RP2350-Eingaenge (Pin-Flanken) und die zeitbasierten Modelle (CT/WWDT).
+// Sobald ein vom Gast aktivierter IRQ pending wird, kehrt der Handler zurueck
+// und setzt PendSV — die bestehende IRQ-Injektion liefert den LPC-Handler aus.
+//
+// PRIMASK-Schatten: Der Gast laeuft unprivilegiert, daher ignoriert die M33-
+// Hardware CPSID/CPSIE. Wir fuehren den Maskierungszustand im vNVIC nach;
+// solange gesetzt, haelt pendsv_inject_c() neue IRQs pending zurueck. Beim
+// Loeschen (CPSIE) wird ein evtl. wartender IRQ sofort per PendSV nachgereicht.
+//
+// HINWEIS: Die WFI-Schleife pollt aktiv (busy-wait), nicht stromsparend.
+// WFI muss mit aktivierten Interrupts (PRIMASK=0) ausgefuehrt werden; sonst
+// eskaliert der SVC zum HardFault (Sonderbehandlung in src/fault.cpp).
+extern "C" void svc_dispatch_c(uint32_t* frame) {
+    // Gestapelter Exception-Frame: frame[6] = Return-PC (hinter dem SVC).
+    // Die SVC-Instruktion liegt 2 Byte davor; ihr Low-Byte ist die Immediate.
+    uint32_t pc  = frame[6] & ~1u;
+    uint8_t  imm = *reinterpret_cast<const uint8_t*>(pc - 2u);
+    switch (imm) {
+        case 1:                                  // CPSID i -> Sektion betreten
+            vnvic::set_primask(true);
+            return;
+        case 2:                                  // CPSIE i -> Sektion verlassen
+            vnvic::set_primask(false);
+            if (vnvic::irq_pending())
+                SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+            return;
+        case 0:                                  // gepatchtes WFI
+        default:
+            for (;;) {
+                if (g_request_stop.load(std::memory_order_acquire)) return;
+                peripherals::sample_pin_interrupts();
+                peripherals::poll_timed_sources();
+                if (vnvic::irq_pending()) {
+                    SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+                    return;
+                }
+                // Bei aktivem Timer-Capture (KNX-Empfang) eng pollen, damit
+                // Busflanken (~104 µs/Bit) zeitlich aufgelöst werden; sonst
+                // 50 µs Pause zur RP2350-Entlastung.
+                if (!peripherals::capture_armed())
+                    busy_wait_us(50);
+            }
+    }
+}
+
+__attribute__((naked))
+void isr_svc() {
+    __asm volatile (
+        "tst   lr, #4              \n"   // EXC_RETURN bit2: 0=MSP, 1=PSP
+        "ite   eq                  \n"
+        "mrseq r0, msp             \n"
+        "mrsne r0, psp             \n"
+        "push  {r4, lr}            \n"   // 8-Byte-Alignment + EXC_RETURN
+        "bl    svc_dispatch_c      \n"
+        "pop   {r4, pc}            \n"   // EXC_RETURN -> zurueck zum Gast
+    );
+}
 
 // Naked Trampolin: setzt MPU, wechselt auf PSP/unprivileged Thread Mode,
 // und springt mit BX in den Reset-Handler. Kehrt nie zurück (Gast läuft
@@ -115,6 +184,38 @@ void core1_main() {
             dst[4]  = reinterpret_cast<uint32_t>(&isr_memmanage);
             dst[5]  = reinterpret_cast<uint32_t>(&isr_busfault);
             dst[6]  = reinterpret_cast<uint32_t>(&isr_usagefault);
+
+            // PendSV (Slot 14) gehört dem Host: Über PendSV werden emulierte
+            // LPC-IRQs in den Gast injiziert (irq_inject.cpp). Die Firmware
+            // selbst nutzt PendSV typischerweise nicht (LPC-Startups legen dort
+            // nur einen `B .`-Default-Stub ab) — würde der Stub stehenbleiben,
+            // liefe der Gast beim ersten injizierten IRQ in eine Endlosschleife.
+            // SysTick (Slot 15) bleibt beim Gast, da es eine echte M33-
+            // Peripherie ist und der Gast seinen eigenen Tick-Handler braucht.
+            dst[14] = reinterpret_cast<uint32_t>(&isr_pendsv);
+
+            // Opt-in-Patches, die Gast-Instruktionen auf SVC-Traps umlenken
+            // (gemeinsamer Dispatcher isr_svc, Vektor-Slot 11):
+            //   WFI-Pin-Wakeup : WFI      -> SVC #0
+            //   PRIMASK-Schatten: CPSID i -> SVC #1, CPSIE i -> SVC #2
+            bool need_svc = false;
+            if (config::wfi_pin_wakeup()) {
+                uint32_t n = hex_patcher::patch_wfi_to_svc(
+                    reinterpret_cast<uint8_t*>(dst), sz, VEC_COUNT * 4);
+                need_svc = true;
+                std::printf("[EMU] WFI-Pin-Wakeup aktiv: %u WFI gepatcht\n",
+                            static_cast<unsigned>(n));
+            }
+            if (config::primask_shadow()) {
+                uint32_t n = hex_patcher::patch_cps_to_svc(
+                    reinterpret_cast<uint8_t*>(dst), sz, VEC_COUNT * 4);
+                need_svc = true;
+                std::printf("[EMU] PRIMASK-Schatten aktiv: %u CPSID/CPSIE gepatcht\n",
+                            static_cast<unsigned>(n));
+            }
+            if (need_svc) {
+                dst[11] = reinterpret_cast<uint32_t>(&isr_svc);
+            }
         }
 
         // RAM-Adressen aus Literal-Pools relocaten (LPC RAM 0x10000000+8KB

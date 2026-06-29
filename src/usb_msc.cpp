@@ -159,6 +159,16 @@ bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size) {
 //   i2c_bridge_en=on|off
 //   i2c_bridge_inst=0|1   i2c_bridge_sda=<rp-gpio>
 //   i2c_bridge_scl=<rp-gpio>   i2c_bridge_hz=<Hz>
+//   spi_bridge_en=on|off
+//   spi_bridge_inst=0|1   spi_bridge_lpc=0|1
+//   spi_bridge_sck=<rp-gpio>   spi_bridge_mosi=<rp-gpio>
+//   spi_bridge_miso=<rp-gpio>  spi_bridge_hz=<Hz>
+//   adc_bridge_en=on|off
+//   tcap.<t>=<rp-gpio>        Timer-Capture-Eingang (KNX-RX), t=0..3
+//   tmat.<t>.<m>=<rp-gpio>    Timer-Match-Ausgang (KNX-TX), t=0..3, m=0..3
+//   tcap_pio=on|off          Capture flankengenau per PIO (opt-in)
+//   wfi_pin_wakeup=on|off   (opt-in)
+//   primask_shadow=on|off   (opt-in)
 void parse_config(const char* buf, uint32_t len) {
     char line[96];
     uint32_t i = 0;
@@ -189,6 +199,20 @@ void parse_config(const char* buf, uint32_t len) {
                 std::sscanf(eq, "%d", &rp) == 1) {
                 config::set_pin_map(static_cast<uint8_t>(port * 12 + pin), rp);
             }
+        } else if (std::strncmp(line, "tcap.", 5) == 0) {
+            // tcap.<t>=<rp-gpio>
+            int t, rp;
+            if (std::sscanf(line + 5, "%d", &t) == 1 &&
+                std::sscanf(eq, "%d", &rp) == 1) {
+                config::set_ct_capture_pin(t, rp);
+            }
+        } else if (std::strncmp(line, "tmat.", 5) == 0) {
+            // tmat.<t>.<m>=<rp-gpio>
+            int t, m, rp;
+            if (std::sscanf(line + 5, "%d.%d", &t, &m) == 2 &&
+                std::sscanf(eq, "%d", &rp) == 1) {
+                config::set_ct_match_pin(t, m, rp);
+            }
         } else if (std::strcmp(line, "autostart") == 0) {
             config::set_autostart(std::strcmp(eq, "on") == 0 ||
                                   std::strcmp(eq, "1")  == 0);
@@ -212,6 +236,33 @@ void parse_config(const char* buf, uint32_t len) {
             config::set_i2c_bridge_scl_pin(static_cast<int>(std::atol(eq)));
         } else if (std::strcmp(line, "i2c_bridge_hz") == 0) {
             config::set_i2c_bridge_hz(static_cast<uint32_t>(std::atol(eq)));
+        } else if (std::strcmp(line, "spi_bridge_en") == 0) {
+            config::set_spi_bridge_enabled(std::strcmp(eq, "on") == 0 ||
+                                           std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "spi_bridge_inst") == 0) {
+            config::set_spi_bridge_instance(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "spi_bridge_lpc") == 0) {
+            config::set_spi_bridge_lpc(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "spi_bridge_sck") == 0) {
+            config::set_spi_bridge_sck_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "spi_bridge_mosi") == 0) {
+            config::set_spi_bridge_mosi_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "spi_bridge_miso") == 0) {
+            config::set_spi_bridge_miso_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "spi_bridge_hz") == 0) {
+            config::set_spi_bridge_hz(static_cast<uint32_t>(std::atol(eq)));
+        } else if (std::strcmp(line, "adc_bridge_en") == 0) {
+            config::set_adc_bridge_enabled(std::strcmp(eq, "on") == 0 ||
+                                           std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "tcap_pio") == 0) {
+            config::set_tcap_pio(std::strcmp(eq, "on") == 0 ||
+                                 std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "wfi_pin_wakeup") == 0) {
+            config::set_wfi_pin_wakeup(std::strcmp(eq, "on") == 0 ||
+                                       std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "primask_shadow") == 0) {
+            config::set_primask_shadow(std::strcmp(eq, "on") == 0 ||
+                                       std::strcmp(eq, "1")  == 0);
         }
     }
 }
@@ -232,6 +283,9 @@ void on_volume_ready() {
         // Bridges sofort anwenden, damit der direkt folgende Autorun sie
         // bereits nutzen kann (ohne Power-Cycle).
         peripherals::i2c_bridge_reinit();
+        peripherals::spi_bridge_reinit();
+        peripherals::adc_bridge_reinit();
+        peripherals::ct_bridge_reinit();
         if (config::uart_bridge_enabled()) {
             uart_bridge::set_tx_pin(config::uart_bridge_tx_pin());
             uart_bridge::set_rx_pin(config::uart_bridge_rx_pin());

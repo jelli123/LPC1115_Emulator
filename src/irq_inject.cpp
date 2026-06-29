@@ -101,6 +101,11 @@ extern "C" void pendsv_inject_c() {
     // Halt-Anforderungen haben Vorrang (Debugger-Pfad).
     target_halt::on_pendsv_check();
 
+    // PRIMASK-Schatten (opt-in): Befindet sich der Gast in einer kritischen
+    // Sektion (__disable_irq()), wird der IRQ nicht ausgeliefert, bleibt aber
+    // im vNVIC pending und feuert beim Verlassen (CPSIE -> erneutes PendSV).
+    if (vnvic::primask()) return;
+
     // Solange Pending+Enabled vorliegt, einen Frame synthetisieren.
     // Wir injizieren maximal einen IRQ pro PendSV-Lauf, um Tail-Chaining
     // dem Hardware-Mechanismus zu überlassen.
