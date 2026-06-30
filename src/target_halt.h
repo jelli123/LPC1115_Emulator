@@ -20,6 +20,13 @@ namespace target_halt {
 
 void init();
 
+// Wird bei einem (erzwungenen) Guest-/Core-Reset aufgerufen. Loescht die
+// Run-Control-Flags (Halt/Resume/Step/Halted), damit ein frisch relaunchter
+// Gast nicht beim ersten Trap an einem stehengebliebenen Halt-Request haengt.
+// Breakpoints/Snapshot bleiben unberuehrt (werden mit dem neuen Image ohnehin
+// obsolet). Von jedem Core aus sicher (nur atomare Flags).
+void on_guest_reset();
+
 // Wird vom PendSV-Handler aufgerufen.
 void on_pendsv_check();
 

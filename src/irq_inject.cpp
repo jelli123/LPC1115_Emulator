@@ -10,6 +10,7 @@
 
 #include "RP2350.h"
 #include "hardware/sync.h"
+#include "pico/multicore.h"   // get_core_num()
 
 // ---------------------------------------------------------------------------
 // IRQ-Injektion via PendSV
@@ -98,6 +99,16 @@ void poll() {
 }
 
 extern "C" void pendsv_inject_c() {
+    // PendSV gehoert ausschliesslich dem Gast-Core (Core1). Der emulatoreigene
+    // isr_pendsv ueberschreibt das schwache SDK-PendSV-Symbol und ist daher
+    // AUCH in Core0s Vektortabelle installiert. Wuerde PendSV jemals auf Core0
+    // gepended (z.B. target_halt::request_halt() aus der CLI, die SCB->ICSR=
+    // PENDSVSET auf Core0 schreibt), liefe Core0 sonst in den Halt-Pfad und
+    // bliebe in der Resume-Spinschleife haengen (CLI-Freeze) bzw. wuerde einen
+    // Exception-Frame auf Core0s (falschem) PSP synthetisieren. Auf Core0 daher
+    // sofort und folgenlos zurueckkehren — Injektion/Halt sind nur auf Core1 gueltig.
+    if (get_core_num() != 1u) return;
+
     // Halt-Anforderungen haben Vorrang (Debugger-Pfad).
     target_halt::on_pendsv_check();
 

@@ -6,6 +6,7 @@
 #include "config.h"
 #include "hex_patcher.h"
 #include "vnvic.h"
+#include "target_halt.h"   // on_guest_reset() bei Core-Reset
 
 #include <atomic>
 #include <cstdio>
@@ -485,6 +486,7 @@ void stop() {
     multicore_reset_core1();
     g_state.store(State::Idle);
     mpu_setup::disable();
+    target_halt::on_guest_reset();   // stehengebliebene Halt-Flags loeschen
     boot_core1();
 }
 
@@ -494,6 +496,7 @@ void request_guest_reset() {
     multicore_reset_core1();
     g_state.store(State::Idle);
     mpu_setup::disable();
+    target_halt::on_guest_reset();   // stehengebliebene Halt-Flags loeschen
     boot_core1();
     g_state.store(State::Running, std::memory_order_release);
     __asm volatile ("sev");

@@ -72,6 +72,16 @@ void init() {
     for (auto& b : g_bp) b = {};
 }
 
+void on_guest_reset() {
+    // Run-Control-Flags zuruecksetzen — ein evtl. stehengebliebener Halt-Request
+    // (z.B. nach erzwungenem Core-Reset, wenn der Gast nie kooperativ haltete)
+    // wuerde sonst den naechsten Gast beim ersten PendSV/Trap sofort anhalten.
+    g_halt_request.store(false);
+    g_resume_request.store(false);
+    g_step_request.store(false);
+    g_halted.store(false);
+}
+
 void on_pendsv_check() {
     if (!g_halt_request.load(std::memory_order_acquire)) return;
 
