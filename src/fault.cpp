@@ -52,6 +52,69 @@ bool guest_read32_safe(uint32_t addr, uint32_t& out) {
     return true;
 }
 
+// Dekodiert die wichtigsten CFSR/HFSR-Bits (ARMv8-M) in Klartext.
+void print_fault_cause() {
+    const uint32_t c = SCB->CFSR;
+    const uint32_t h = SCB->HFSR;
+    // MemManage (MMFSR, Bits 0-7)
+    if (c & (1u<<0))  std::printf("[FAULT]  MMFSR.IACCVIOL  (Code-Fetch verboten)\n");
+    if (c & (1u<<1))  std::printf("[FAULT]  MMFSR.DACCVIOL  (Daten-Zugriff verboten)\n");
+    if (c & (1u<<3))  std::printf("[FAULT]  MMFSR.MUNSTKERR (Unstacking-Fehler)\n");
+    if (c & (1u<<4))  std::printf("[FAULT]  MMFSR.MSTKERR   (Stacking-Fehler)\n");
+    if (c & (1u<<5))  std::printf("[FAULT]  MMFSR.MLSPERR   (Lazy-FP-Stacking)\n");
+    // BusFault (BFSR, Bits 8-15)
+    if (c & (1u<<8))  std::printf("[FAULT]  BFSR.IBUSERR    (Instruktions-Bus)\n");
+    if (c & (1u<<9))  std::printf("[FAULT]  BFSR.PRECISERR  (praeziser Daten-Bus)\n");
+    if (c & (1u<<10)) std::printf("[FAULT]  BFSR.IMPRECISERR(impraeziser Daten-Bus)\n");
+    if (c & (1u<<11)) std::printf("[FAULT]  BFSR.UNSTKERR\n");
+    if (c & (1u<<12)) std::printf("[FAULT]  BFSR.STKERR\n");
+    // UsageFault (UFSR, Bits 16-25)
+    if (c & (1u<<16)) std::printf("[FAULT]  UFSR.UNDEFINSTR (illegale Instruktion)\n");
+    if (c & (1u<<17)) std::printf("[FAULT]  UFSR.INVSTATE   (ungueltiger Thumb/EPSR-State)\n");
+    if (c & (1u<<18)) std::printf("[FAULT]  UFSR.INVPC      (ungueltiger EXC_RETURN/PC)\n");
+    if (c & (1u<<19)) std::printf("[FAULT]  UFSR.NOCP       (Coprozessor/FPU nicht da)\n");
+    if (c & (1u<<20)) std::printf("[FAULT]  UFSR.STKOF      (Stack-Overflow)\n");
+    if (c & (1u<<24)) std::printf("[FAULT]  UFSR.UNALIGNED  (unaligned Zugriff)\n");
+    if (c & (1u<<25)) std::printf("[FAULT]  UFSR.DIVBYZERO  (Division durch 0)\n");
+    if (h & (1u<<30)) std::printf("[FAULT]  HFSR.FORCED     (eskalierter Fault)\n");
+    if (h & (1u<<1))  std::printf("[FAULT]  HFSR.VECTTBL    (Vektortabellen-Lesefehler)\n");
+}
+
+// Gemeinsame Diagnose-Ausgabe fuer die fatalen Exception-Handler. f = Standard-
+// exception-stacked Frame (r0,r1,r2,r3,r12,lr,pc,xpsr). r4_r11 optional (vom
+// Asm-Wrapper gepushter Block) — nullptr, wenn nicht verfuegbar.
+void print_exc_diag(const char* tag, const uint32_t* f, const uint32_t* r4_r11) {
+    const uint32_t lb = emulator::load_base();
+    auto lpc = [&](uint32_t a) -> long {            // Host->LPC-Offset, sonst -1
+        return (a >= lb && a < lb + emulator::LPC_LOAD_MAX_SIZE)
+                   ? static_cast<long>(a - lb) : -1L;
+    };
+    std::printf("[FAULT] %s @PC=0x%08lx (LPC 0x%lx) CFSR=0x%08lx HFSR=0x%08lx\n",
+                tag, (unsigned long)f[6], lpc(f[6] & ~1u),
+                (unsigned long)SCB->CFSR, (unsigned long)SCB->HFSR);
+    print_fault_cause();
+    std::printf("[FAULT]  r0=%08lx r1=%08lx r2=%08lx r3=%08lx r12=%08lx\n",
+                (unsigned long)f[0], (unsigned long)f[1], (unsigned long)f[2],
+                (unsigned long)f[3], (unsigned long)f[4]);
+    std::printf("[FAULT]  LR=%08lx (LPC 0x%lx)  xPSR=%08lx  SP=%08lx\n",
+                (unsigned long)f[5], lpc(f[5] & ~1u), (unsigned long)f[7],
+                (unsigned long)(reinterpret_cast<uint32_t>(f) + 0x20u));
+    if (r4_r11)
+        std::printf("[FAULT]  r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
+                    (unsigned long)r4_r11[0], (unsigned long)r4_r11[1],
+                    (unsigned long)r4_r11[2], (unsigned long)r4_r11[3]);
+    // Gefehlerte Instruktion(en) am PC, wenn die Adresse gemappt ist.
+    uint32_t iw = 0;
+    if (guest_read32_safe(f[6] & ~1u, iw))
+        std::printf("[FAULT]  instr@PC = 0x%04lx 0x%04lx\n",
+                    (unsigned long)(iw & 0xFFFFu), (unsigned long)(iw >> 16));
+    // Fault-Adressen, falls gueltig (MMARVALID=Bit7, BFARVALID=Bit15 in CFSR).
+    if (SCB->CFSR & (1u<<7))
+        std::printf("[FAULT]  MMFAR=0x%08lx\n", (unsigned long)SCB->MMFAR);
+    if (SCB->CFSR & (1u<<15))
+        std::printf("[FAULT]  BFAR=0x%08lx\n", (unsigned long)SCB->BFAR);
+}
+
 // Nicht-emulierbarer Gast-Fault: Gast ANHALTEN statt das ganze Silizium per
 // Watchdog zu rebooten. Frueher loeste jeder fatale Fault watchdog_enable(50)
 // + Spin aus -> voller RP2350-Reboot, der die soeben ausgegebene [FAULT]-
@@ -487,7 +550,7 @@ extern "C" __attribute__((naked)) void isr_memmanage() {
 // Pin-Flanken/Timer, setzen bei fälligem IRQ PendSV (bleibt unter PRIMASK
 // pending und feuert, sobald der Gast die Interrupts wieder freigibt) und
 // kehren hinter das WFI zurück. PRIMASK des Gastes bleibt unangetastet.
-extern "C" void hardfault_c(uint32_t* exc_frame) {
+extern "C" void hardfault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
     if (config::wfi_pin_wakeup() && (SCB->HFSR & SCB_HFSR_FORCED_Msk)) {
         uint32_t pc = exc_frame[6];
         const uint16_t* ip = reinterpret_cast<const uint16_t*>(pc & ~1u);
@@ -507,6 +570,7 @@ extern "C" void hardfault_c(uint32_t* exc_frame) {
             return;
         }
     }
+    print_exc_diag("HardFault", exc_frame, r4_r11);
     enter_fatal_halt();
 }
 
@@ -517,7 +581,10 @@ extern "C" __attribute__((naked)) void isr_hardfault() {
         "mrseq r0, msp             \n"
         "mrsne r0, psp             \n"
         "push  {r4-r11, lr}        \n"
+        "sub   sp, #4              \n"   // 8-Byte-Alignment
+        "add   r1, sp, #4          \n"   // r1 = &{r4..r11, lr_excret}
         "bl    hardfault_c         \n"
+        "add   sp, #4              \n"
         "pop   {r4-r11, lr}        \n"
         "bx    lr                  \n"
     );
@@ -536,7 +603,7 @@ extern "C" void usagefault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
             }
         }
     }
-    SCB->CFSR = SCB->CFSR;
+    print_exc_diag("UsageFault", exc_frame, r4_r11);
     enter_fatal_halt();
 }
 
