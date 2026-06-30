@@ -258,24 +258,32 @@ uint32_t recompute_target_hz() {
     return f_main / div;
 }
 
-// Setzt RP2350 auf eine möglichst nahe Frequenz an die LPC-Soll-Frequenz.
+// Übernimmt die vom Gast programmierte LPC-Soll-Frequenz als Zeitbasis der
+// emulierten Peripherie (Timer-Tick-Skalierung in ct_advance, UART-Baud in
+// uart0_ensure_hw, CLI-Anzeige). Der ECHTE RP2350-Systemtakt wird BEWUSST NICHT
+// verändert.
+//
+// Grund: set_sys_clock_khz() von Core1 aus aufzurufen, während Core0 USB-CDC/
+// CLI/Heartbeat bedient, legt Core0 lahm — die clk_sys-Transition (kurzer
+// Wechsel auf clk_ref, pll_sys-Stop/Restart) plus Multicore-Hazard bringt
+// USB-/Flash-Timing durcheinander, die CLI friert ein. Für die Korrektheit der
+// Emulation ist der reale Takt ohnehin irrelevant: ct_advance skaliert REALE
+// Wall-Clock-Zeit (time_us_64) mit g_current_hz, die UART-Baud wird aus
+// g_current_hz berechnet und real über clk_peri gesetzt. Zusätzlich braucht der
+// Trap-and-Emulate-Pfad die volle RP2350-Frequenz als Reserve, um die Gast-
+// Peripherie in Echtzeit zu bedienen — ein Herunterregeln auf die LPC-Frequenz
+// würde den Emulator selbst ausbremsen.
+// Einzige Einbuße: native Busy-Loops des Gasts und die gast-eigene SysTick
+// laufen mit der realen (stabilen) RP2350-Frequenz statt der LPC-Soll-Frequenz.
 void retarget_rp2350_clock(uint32_t target_hz) {
     if (target_hz < 12'000'000u || target_hz > 150'000'000u) return;
     if (target_hz == g_current_hz)                            return;
 
-    // RP2350 set_sys_clock_khz akzeptiert "geeignete" Frequenzen; bei nicht
-    // einstellbaren Werten gibt false zurück. Wir runden auf 1 MHz.
-    uint32_t khz = (target_hz + 500u) / 1000u;
-    if (set_sys_clock_khz(khz, false)) {
-        g_current_hz = target_hz;
-        ++g_stats.pll_reconfigs;
-        std::printf("[CLK] retarget RP2350 -> %lu kHz\n",
-                    static_cast<unsigned long>(khz));
-    } else {
-        std::printf("[CLK] set_sys_clock_khz(%lu) abgelehnt; bleibe bei %lu Hz\n",
-                    static_cast<unsigned long>(khz),
-                    static_cast<unsigned long>(g_current_hz));
-    }
+    g_current_hz = target_hz;
+    ++g_stats.pll_reconfigs;
+    std::printf("[CLK] LPC-Soll-Takt %lu kHz uebernommen "
+                "(emulierte Zeitbasis; RP2350-Takt unveraendert)\n",
+                static_cast<unsigned long>((target_hz + 500u) / 1000u));
 }
 
 // SYSCON 32-Bit-Schreibzugriff (kommt in 4 Byte-Schritten an). Wir halten
