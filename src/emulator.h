@@ -48,8 +48,17 @@ bool take_handover_sp_fixup(uint32_t& raw, uint32_t& reloc);
 void boot_core1();
 void load_and_start();
 void stop();
-// Asynchrones „Soft-Reset" nur des Guests (z. B. WDT-Ablauf).
+// Asynchrones „Soft-Reset" nur des Guests (z. B. WDT-Ablauf, NVIC_SystemReset).
+// Sicher von Core1 aufrufbar: stellt dann nur eine Anforderung an Core0 und
+// parkt den Core, bis Core0 den eigentlichen Reset ausfuehrt.
 void request_guest_reset();
+// Von Core0 im Hauptloop konsumiert: true + Reset, wenn der Gast einen Reset
+// angefordert hat (request_guest_reset von Core1). Fuehrt den Reset NICHT
+// selbst aus — der Aufrufer ruft danach request_guest_reset() auf Core0.
+bool guest_reset_pending();
+// Vom Fault-Handler (Core1) bei nicht-emulierbarem Gast-Fault aufgerufen:
+// Gast in State::Faulted halten statt das Silizium per Watchdog zu rebooten.
+void notify_guest_faulted();
 // --- Flash-Schreibschutz (nur Core0) --------------------------------------
 // Ein Flash-Erase/Program blockiert XIP. Laeuft der Gast nativ auf Core1, wuerde
 // dessen naechster Trap (unsere Fault-Handler liegen im XIP-Flash) waehrend der

@@ -24,6 +24,12 @@ std::atomic<emulator::State> g_state{emulator::State::Idle};
 std::atomic<bool>            g_request_stop{false};
 std::atomic<uint32_t>        g_pc{0};
 
+// Vom Gast (Core1) angeforderter Soft-Reset (NVIC_SystemReset/WDT). Wird vom
+// Core0-Loop konsumiert, der den eigentlichen Core1-Reset ausfuehrt — ein
+// multicore_reset_core1() VON Core1 aus wuerde sich selbst abschiessen und nie
+// relaunchen.
+std::atomic<bool>            g_guest_reset_req{false};
+
 // Basis der aktiven Guest-Vektortabelle (0 = noch nicht gesetzt -> load_base).
 // Wird beim Guest-Start auf load_base gesetzt und bei einem Bootloader-
 // Handover auf die Applikations-Vektortabelle umgestellt.
@@ -468,6 +474,30 @@ void boot_core1() {
     multicore_launch_core1(core1_main);
 }
 
+// Core1 hart resetten und core1_main neu starten. NUR von Core0 aufrufen.
+// target == Running: Gast danach sofort wieder anlaufen lassen (Soft-Reset).
+// target == Idle:    Gast bleibt gestoppt (CLI 'stop'/Flash-Pause).
+//
+// Core0 ist seit main() Multicore-Lockout-Victim, d.h. sein SIO-FIFO-IRQ ist
+// aktiv. multicore_reset_core1() und boot_core1() (multicore_launch_core1)
+// kommunizieren ueber genau diesen FIFO; wuerde Core0s Lockout-Handler
+// dazwischenfunken, draint er die Handshake-Bytes weg -> Hang. Daher den
+// FIFO-IRQ um Reset+Relaunch herum stilllegen.
+void core1_reset_and_relaunch(State target) {
+    const bool fifo_irq = irq_is_enabled(SIO_IRQ_FIFO);
+    if (fifo_irq) irq_set_enabled(SIO_IRQ_FIFO, false);
+    multicore_reset_core1();
+    g_state.store(State::Idle);          // core1_main soll zunaechst warten
+    mpu_setup::disable();
+    target_halt::on_guest_reset();       // stehengebliebene Halt-Flags loeschen
+    boot_core1();
+    if (fifo_irq) irq_set_enabled(SIO_IRQ_FIFO, true);
+    if (target == State::Running) {
+        g_state.store(State::Running, std::memory_order_release);
+        __asm volatile ("sev");
+    }
+}
+
 void load_and_start() {
     if (g_state.load() == State::Running) {
         std::printf("[EMU] bereits gestartet\n");
@@ -484,32 +514,38 @@ void load_and_start() {
 void stop() {
     // Ein laufender, in unprivileged Mode bxender Gast lässt sich nicht
     // ohne Weiteres anhalten. Wir schießen Core 1 ab und reinitialisieren.
-    //
-    // WICHTIG: Core0 ist seit main() Multicore-Lockout-Victim, d.h. sein
-    // SIO-FIFO-IRQ ist aktiv. multicore_reset_core1() und boot_core1()
-    // (multicore_launch_core1) kommunizieren ueber genau diesen FIFO; wuerde
-    // der Lockout-Handler dazwischenfunken, draint er die Handshake-Bytes weg
-    // -> Hang. Daher den FIFO-IRQ um Reset+Relaunch herum stilllegen.
-    const bool fifo_irq = irq_is_enabled(SIO_IRQ_FIFO);
-    if (fifo_irq) irq_set_enabled(SIO_IRQ_FIFO, false);
-    multicore_reset_core1();
-    g_state.store(State::Idle);
-    mpu_setup::disable();
-    target_halt::on_guest_reset();   // stehengebliebene Halt-Flags loeschen
-    boot_core1();
-    if (fifo_irq) irq_set_enabled(SIO_IRQ_FIFO, true);
+    core1_reset_and_relaunch(State::Idle);
 }
 
 void request_guest_reset() {
-    // Vom WDT-Modell aufgerufen: nur Guest neustarten, RP2350 läuft weiter.
-    // multicore_reset_core1 ist von beiden Cores aus sicher.
-    multicore_reset_core1();
-    g_state.store(State::Idle);
-    mpu_setup::disable();
-    target_halt::on_guest_reset();   // stehengebliebene Halt-Flags loeschen
-    boot_core1();
-    g_state.store(State::Running, std::memory_order_release);
-    __asm volatile ("sev");
+    // Vom Gast angeforderter Soft-Reset (WDT-Ablauf ODER NVIC_SystemReset, das
+    // der Fault-Handler abfaengt). NUR der Gast wird neu gestartet, der RP2350
+    // laeuft weiter.
+    //
+    // KRITISCH: Diese Funktion wird typischerweise AUF Core1 aufgerufen
+    // (WDT-Advance im WFI-Loop / Fault-Handler). multicore_reset_core1() von
+    // Core1 aus wuerde Core1 sofort abschalten — die Relaunch-Schritte danach
+    // liefen nie, der Gast bliebe tot. Daher von Core1 nur eine Anforderung an
+    // Core0 stellen und parken; Core0 fuehrt den Reset im Loop aus.
+    if (get_core_num() != 0u) {
+        g_guest_reset_req.store(true, std::memory_order_release);
+        __DSB();
+        (void) save_and_disable_interrupts();   // kein Fehl-Vektoring mehr
+        for (;;) __asm volatile ("wfe");         // Core0 resettet diesen Core
+    }
+    core1_reset_and_relaunch(State::Running);
+}
+
+// Von Core0 im Loop konsumiert: fuehrt einen vom Gast angeforderten Reset aus.
+bool guest_reset_pending() {
+    return g_guest_reset_req.exchange(false, std::memory_order_acq_rel);
+}
+
+// Vom Fault-Handler (Core1) aufgerufen, wenn ein Gast-Fault nicht emulierbar
+// ist: Gast anhalten statt das ganze Silizium per Watchdog zu rebooten. Core0
+// (CLI/USB) laeuft weiter, die [FAULT]-Diagnose bleibt sichtbar.
+void notify_guest_faulted() {
+    g_state.store(State::Faulted, std::memory_order_release);
 }
 
 bool pause_for_flash() {
@@ -517,7 +553,12 @@ bool pause_for_flash() {
     // Handler und sperrt Core0 selbst per Lockout aus (FlashGuard) -> hier
     // No-op, damit Core1 sich nicht selbst zu resetten versucht.
     if (get_core_num() != 0u) return false;
-    if (g_state.load(std::memory_order_acquire) != State::Running) return false;
+    const State st = g_state.load(std::memory_order_acquire);
+    // Running ODER Faulted: in beiden Faellen haengt Core1 am Gast (laufend
+    // bzw. im Fault-Handler gehalten) und kann den Lockout-Handshake nicht
+    // bedienen -> vor dem Flash-Zugriff sicher per Core-Reset in die
+    // SDK-Spin-Schleife zuruecksetzen.
+    if (st != State::Running && st != State::Faulted) return false;
     // stop() resettet Core1 und relaunched core1_main -> Gast haelt, Core1
     // steht in der Spin-Schleife (SDK-VTOR). Flash-Writes sind nun sicher.
     stop();

@@ -24,8 +24,10 @@
 //   0: Code-Image     firmware_base  .. +64 KB  (RWX, Normal)
 //   1: Gast-RAM       guest_ram_base .. +8 KB   (RWX, Normal)
 //   2: enter_guest    trampoline     .. +32 B   (RX,  Normal)
-//   3: PPB Teil A     0xE0000000-0xE000E0FF      (RW, Device, XN)
-//   4: PPB Teil B     0xE000E500-0xE00FFFFF      (RW, Device, XN)
+//   3: PPB Teil A     0xE0000000-0xE000E0FF      (RW,  Device, XN)
+//   4: PPB Teil B1    0xE000E500-0xE000ECFF      (RW,  Device, XN)
+//   5: SCB-Ctrl-Block 0xE000ED00-0xE000ED1F      (RO,  Device, XN) -> AIRCR-Trap
+//   6: PPB Teil B2    0xE000ED20-0xE00FFFFF      (RW,  Device, XN)
 //
 // WICHTIG: Frueher gab Region 0 das GESAMTE 520-KB-SRAM unprivileged RWX frei.
 // Ein wilder Gast-Pointer, Heap- oder Stack-Ueberlauf konnte damit TinyUSB-
@@ -106,10 +108,26 @@ void enable_for_guest(uint32_t firmware_base, uint32_t guest_ram_base,
     // NVIC-Region 0xE000_E100 - 0xE000_E4FF wird *nicht* whitelistet.
     // Jeder Gast-Zugriff darauf trapt → vnvic::read8/write8.
 
-    // PPB Teil B: 0xE000_E500 - 0xE00F_FFFF (Rest des PPB inkl. SCB-Tail,
-    // CPUID, ICTR, ACTLR, CFSR usw.).
+    // PPB Teil B1: 0xE000_E500 - 0xE000_ECFF (SCB-Tail, CPUID, ICTR, ACTLR,
+    // SysTick-Kalibrierung usw.). RW any, Device, XN.
     set_region(r++,
         make_rbar(0xE000'E500u, SH_NS, AP_RW_ANY, /*xn=*/true),
+        make_rlar(0xE000'ECFFu, ATTR_DEVICE, true));
+
+    // SCB-Kontroll-Block 0xE000_ED00 - 0xE000_ED1F: READ-ONLY fuer den Gast.
+    // Enthaelt CPUID/ICSR/VTOR/AIRCR/SCR/CCR/SHPR1/SHPR2. Schreibzugriffe
+    // trappen (MemManage) -> fault.cpp emuliert sie. KRITISCH: AIRCR (0xED0C)
+    // mit SYSRESETREQ (NVIC_SystemReset) wuerde nativ das ECHTE RP2350-Silizium
+    // rebooten; durch das Trapping faengt der Fault-Handler es ab und startet
+    // nur den Gast neu. Reads (CPUID/ICSR-Status/...) bleiben nativ erlaubt.
+    set_region(r++,
+        make_rbar(0xE000'ED00u, SH_NS, AP_RO_ANY, /*xn=*/true),
+        make_rlar(0xE000'ED1Fu, ATTR_DEVICE, true));
+
+    // PPB Teil B2: 0xE000_ED20 - 0xE00F_FFFF (SHPR3, SHCSR, CFSR, HFSR, MMFAR,
+    // BFAR, MPU-Register, DWT, ROM-Table ...). RW any, Device, XN.
+    set_region(r++,
+        make_rbar(0xE000'ED20u, SH_NS, AP_RW_ANY, /*xn=*/true),
         make_rlar(LPC_PRIVPERI_END - 1, ATTR_DEVICE, true));
 
     // Restliche Regionen disabled lassen.

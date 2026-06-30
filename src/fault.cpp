@@ -52,6 +52,20 @@ bool guest_read32_safe(uint32_t addr, uint32_t& out) {
     return true;
 }
 
+// Nicht-emulierbarer Gast-Fault: Gast ANHALTEN statt das ganze Silizium per
+// Watchdog zu rebooten. Frueher loeste jeder fatale Fault watchdog_enable(50)
+// + Spin aus -> voller RP2350-Reboot, der die soeben ausgegebene [FAULT]-
+// Diagnose UND die USB-CDC-Sitzung vernichtete ("RP2350 resettet"). Jetzt:
+// State=Faulted setzen (LED flackert, 'stats' zeigt Faulted), Core0/CLI laeuft
+// weiter, die Diagnose bleibt lesbar. Recovery ueber CLI ('reset'/'run') oder
+// erneutes Flashen. Laeuft auf Core1 und kehrt nie zurueck (Core1 parkt).
+[[noreturn]] void enter_fatal_halt() {
+    emulator::notify_guest_faulted();
+    std::printf("[FAULT] Gast angehalten (State=Faulted) — 'reset' oder neue "
+                "Firmware zum Fortfahren.\n");
+    for (;;) __asm volatile ("wfe");
+}
+
 } // namespace
 
 // --- Trap-Handler (in C, von Asm-Wrapper aus aufgerufen) ------------------
@@ -164,13 +178,60 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
             }
         }
         SCB->CFSR = SCB->CFSR;          // Sticky-Bits clearen
-        // Endlosschleife mit Watchdog-Reset.
-        watchdog_enable(50, true);
-        for (;;) tight_loop_contents();
+        // Gast anhalten (kein Silizium-Reboot mehr) — Diagnose bleibt sichtbar.
+        enter_fatal_halt();
     }
 
     // Emulieren
     bool ok = true;
+
+    // SCB-Kontroll-Block (0xE000ED00-0xE000ED1F): liegt in einer Read-Only-MPU-
+    // Region, damit Gast-SCHREIBzugriffe hier trappen (Reads passieren dank RO
+    // nativ). Wichtigster Fall: AIRCR.SYSRESETREQ via NVIC_SystemReset() (z. B.
+    // sblib BcuBase::softSystemReset). Auf dem M33 wuerde das nativ das ECHTE
+    // RP2350-Silizium rebooten (USB/CLI weg) — wir fangen es ab und starten nur
+    // den Gast neu. ICSR/SCR/CCR/SHPR werden auf den realen SCB durchgereicht
+    // (der Gast laeuft ja nativ auf dem M33); VTOR wird ignoriert (Host
+    // verwaltet die Vektorbasis ueber den Handover).
+    if (acc.address >= 0xE000'ED00u && acc.address <= 0xE000'ED1Fu) {
+        const uint32_t reg = acc.address & ~3u;
+        if (acc.is_load) {
+            uint32_t v = *reinterpret_cast<volatile uint32_t*>(reg);
+            uint32_t* dst = reg_ptr(frame, r4_r11, &guest_sp, acc.rt);
+            if (dst) *dst = v;
+            frame->pc += acc.instr_size;
+            SCB->CFSR = SCB->CFSR;
+            ++faultsys::g_stats.mem_traps;
+            return;
+        }
+        uint32_t src_val = 0;
+        if (acc.rt < 16) {
+            uint32_t* p = reg_ptr(frame, r4_r11, &guest_sp, acc.rt);
+            if (p) src_val = *p;
+        }
+        if (reg == 0xE000'ED0Cu) {                    // AIRCR
+            // VECTKEY (0x05FA) korrekt UND SYSRESETREQ (Bit 2) -> nur Gast-Reset.
+            if (((src_val >> 16) == 0x05FAu) && (src_val & (1u << 2))) {
+                ++faultsys::g_stats.mem_traps;
+                emulator::request_guest_reset();     // Core1 parkt bis Core0-Reset
+                return;                              // (falls je Core0: regulaer)
+            }
+            // sonstige AIRCR-Schreibzugriffe (VECTCLRACTIVE etc.) ignorieren
+        } else if (reg != 0xE000'ED08u) {            // != VTOR -> auf realen SCB
+            volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(reg);
+            if (acc.size == AccessSize::W) {
+                *p = src_val;
+            } else {                                  // partieller Zugriff: RMW
+                uint32_t shift = (acc.address & 3u) * 8u;
+                uint32_t mask  = (acc.size == AccessSize::B) ? 0xFFu : 0xFFFFu;
+                *p = (*p & ~(mask << shift)) | ((src_val & mask) << shift);
+            }
+        }   // VTOR (0xE000ED08): ignorieren
+        frame->pc += acc.instr_size;
+        SCB->CFSR = SCB->CFSR;
+        ++faultsys::g_stats.mem_traps;
+        return;
+    }
 
     // LPC-Flash-Bereich (gesamte 64 KB): Daten aus dem geladenen Firmware-
     // Image liefern. Der Guest liest z. B. .data-Initialisierungswerte ueber
@@ -353,8 +414,7 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
                     static_cast<unsigned long>(frame->pc),
                     static_cast<unsigned long>(acc.address));
         SCB->CFSR = SCB->CFSR;
-        watchdog_enable(50, true);
-        for (;;) tight_loop_contents();
+        enter_fatal_halt();
     }
 
     ++faultsys::g_stats.mem_traps;
@@ -447,8 +507,7 @@ extern "C" void hardfault_c(uint32_t* exc_frame) {
             return;
         }
     }
-    watchdog_enable(50, true);
-    while (true) { tight_loop_contents(); }
+    enter_fatal_halt();
 }
 
 extern "C" __attribute__((naked)) void isr_hardfault() {
@@ -478,8 +537,7 @@ extern "C" void usagefault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
         }
     }
     SCB->CFSR = SCB->CFSR;
-    watchdog_enable(50, true);
-    while (true) { tight_loop_contents(); }
+    enter_fatal_halt();
 }
 
 extern "C" __attribute__((naked)) void isr_usagefault() {

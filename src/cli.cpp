@@ -287,6 +287,10 @@ void handle_command(char* line) {
                 emulator::stop();
                 std::puts("halted (forced core reset)");
             }
+        } else if (emulator::state() == emulator::State::Faulted) {
+            // Gast steht nach nicht-emulierbarem Fault -> Core hart resetten.
+            emulator::stop();
+            std::puts("Gast war Faulted -> gestoppt ('run' zum Neustart)");
         } else {
             std::puts("nicht gestartet");
         }
@@ -692,6 +696,11 @@ void run() {
         swd_target::poll();
         usb_msc::poll();
         uart_bridge::poll();
+        if (emulator::guest_reset_pending()) {
+            // Vom Gast angeforderter Soft-Reset (NVIC_SystemReset/WDT). Core1
+            // hat geparkt; Core0 fuehrt den eigentlichen Core-Reset aus.
+            emulator::request_guest_reset();
+        }
         if (usb_msc::consume_pending_boot_request()) {
             std::printf("\n[BOOT] BOOT.HEX ueber USB-MSC erkannt -> Start\n");
             emulator::load_and_start();
