@@ -251,20 +251,31 @@ void config_dump(void (*emit)(const char*)) {
 // Page-Buffer: sammelt Schreibvorgänge bis eine volle 256-Byte-Page vorliegt,
 // bevor sie in den Flash programmiert wird. Nötig, weil Intel-HEX-Records
 // typischerweise 16/32-Byte-Blöcke mit beliebigem Alignment liefern.
-alignas(4) static uint8_t fw_page_buf[FLASH_PAGE_SIZE];
-static std::size_t fw_page_base = SIZE_MAX; // Startoffset der gepufferten Page
+// Sektor-Buffer fuer additives Read-Modify-Write. Beim Wechsel auf einen
+// Sektor wird dessen aktueller Flash-Inhalt eingelesen, die neuen HEX-Bytes
+// daruebergelegt und der Sektor beim Flush geloescht + neu programmiert. So
+// bleiben nicht angefasste Sektoren (z. B. ein zuvor geladener Bootloader)
+// beim Laden einer zweiten Datei (Applikation) erhalten.
+alignas(4) static uint8_t fw_sector_buf[SECTOR_SIZE];
+static std::size_t fw_sector_base  = SIZE_MAX; // Startoffset des gepufferten Sektors
+static bool        fw_sector_dirty = false;
 
-static bool fw_flush_page() {
-    if (fw_page_base == SIZE_MAX) return true;
-    FlashGuard guard;
-    flash_range_program(firmware_region_offset + fw_page_base,
-                        fw_page_buf, FLASH_PAGE_SIZE);
-    fw_page_base = SIZE_MAX;
+static bool fw_flush_sector() {
+    if (fw_sector_base == SIZE_MAX) return true;
+    if (fw_sector_dirty) {
+        FlashGuard guard;
+        flash_range_erase(firmware_region_offset + fw_sector_base, SECTOR_SIZE);
+        flash_range_program(firmware_region_offset + fw_sector_base,
+                            fw_sector_buf, SECTOR_SIZE);
+    }
+    fw_sector_base  = SIZE_MAX;
+    fw_sector_dirty = false;
     return true;
 }
 
 bool firmware_erase() {
-    fw_page_base = SIZE_MAX;
+    fw_sector_base  = SIZE_MAX;
+    fw_sector_dirty = false;
     FlashGuard guard;
     flash_range_erase(firmware_region_offset, firmware_region_size);
     firmware_length   = 0;
@@ -277,16 +288,22 @@ bool firmware_write(std::size_t offset, const void* data, std::size_t len) {
 
     const uint8_t* src = static_cast<const uint8_t*>(data);
     while (len > 0) {
-        std::size_t page_start = (offset / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
-        if (fw_page_base != page_start) {
-            if (!fw_flush_page()) return false;
-            fw_page_base = page_start;
-            std::memset(fw_page_buf, 0xFF, FLASH_PAGE_SIZE);
+        std::size_t sector_start = (offset / SECTOR_SIZE) * SECTOR_SIZE;
+        if (fw_sector_base != sector_start) {
+            if (!fw_flush_sector()) return false;
+            fw_sector_base = sector_start;
+            // Read-Modify-Write: bestehenden Sektorinhalt laden, damit nicht
+            // geschriebene Bytes (anderer Code) erhalten bleiben.
+            std::memcpy(fw_sector_buf,
+                        xip_ptr(firmware_region_offset + sector_start),
+                        SECTOR_SIZE);
+            fw_sector_dirty = false;
         }
-        std::size_t page_off = offset - page_start;
-        std::size_t chunk = FLASH_PAGE_SIZE - page_off;
+        std::size_t sec_off = offset - sector_start;
+        std::size_t chunk   = SECTOR_SIZE - sec_off;
         if (chunk > len) chunk = len;
-        std::memcpy(fw_page_buf + page_off, src, chunk);
+        std::memcpy(fw_sector_buf + sec_off, src, chunk);
+        fw_sector_dirty = true;
         src    += chunk;
         offset += chunk;
         len    -= chunk;
@@ -295,7 +312,11 @@ bool firmware_write(std::size_t offset, const void* data, std::size_t len) {
 }
 
 bool firmware_finalize(std::size_t total_len) {
-    fw_flush_page(); // Restliche Daten in Flash schreiben
+    fw_flush_sector(); // Restlichen Sektor in Flash schreiben
+    // Laengen-Merge: bereits vorhandene Firmware (z. B. Bootloader) kann
+    // groesser sein als die soeben additiv geschriebene Datei.
+    std::size_t existing = firmware_size();
+    if (existing > total_len) total_len = existing;
     if (total_len == 0 || total_len > FIRMWARE_SLOT_BYTES - sizeof(FirmwareHeader)) {
         return false;
     }

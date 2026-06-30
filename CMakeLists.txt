@@ -51,9 +51,9 @@ pico_sdk_init()
 add_executable(emulator
     src/main.cpp
     src/cli.cpp
+    src/xmodem.cpp
     src/config.cpp
-    src/hex_parser.cpp
-    src/hex_patcher.cpp
+    src/hex_parser.cpp    src/hex_patcher.cpp
     src/storage.cpp
     src/mmu.cpp
     src/fault.cpp

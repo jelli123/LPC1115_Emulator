@@ -4,7 +4,6 @@
 #include "gdb_stub.h"
 #include "iap.h"
 #include "emulator.h"
-#include "storage.h"
 #include "config.h"
 #include "vnvic.h"
 
@@ -60,8 +59,13 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
     uint32_t cfsr = SCB->CFSR;
     if (cfsr & 0x01u) {  // MMFSR.IACCVIOL
         uint32_t fpc = frame->pc;
-        // LPC Flash [0, firmware_size) → load_base + offset
-        if (fpc < storage::firmware_size()) {
+        // LPC-Flash [0, 64 KB) -> load_base + offset. Der gesamte LPC-Flash ist
+        // ausfuehrbar und liegt vollstaendig (0xFF-gepaddet) im g_firmware_image;
+        // IAP-/OTA-Schreibvorgaenge landen ebenfalls dort. Daher jede Flash-
+        // Adresse bedienen, nicht nur die urspruenglich geladene Code-Laenge —
+        // sonst faultet Code einer ueber den Bus nachgeladenen (ggf. groesseren)
+        // Applikation jenseits von firmware_size() in einen Watchdog-Reset.
+        if (fpc < emulator::LPC_LOAD_MAX_SIZE) {
             frame->pc = emulator::load_base() + fpc;
             SCB->CFSR = cfsr;
             ++faultsys::g_stats.mem_traps;
@@ -286,6 +290,21 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
     ++faultsys::g_stats.mem_traps;
     // Post-Hook (z. B. PLL-Re-Konfiguration nach abgeschlossenem 32-bit-Wort).
     if (!acc.is_load) peripherals::on_post_write_hook();
+
+    // Bootloader->App-Handover: SP-Korrektur anwenden, falls der soeben
+    // emulierte SYSMEMREMAP-Store den Uebergang ausgeloest hat. Der Bootloader
+    // fuehrt als naechste Instruktion `mov SP, StackTop` aus; wir ersetzen den
+    // rohen LPC-RAM-StackTop im gestackten r4..r11-Block durch die relocierte
+    // Gast-RAM-Adresse, damit der SP auf gueltiges RP2350-SRAM zeigt.
+    {
+        uint32_t sp_raw = 0, sp_reloc = 0;
+        if (emulator::take_handover_sp_fixup(sp_raw, sp_reloc)) {
+            for (int i = 0; i < 8; ++i) {
+                if (r4_r11[i] == sp_raw) r4_r11[i] = sp_reloc;
+            }
+        }
+    }
+
     // PC vorrücken
     frame->pc += acc.instr_size;
     // Sticky-Bits clearen (CFSR write-1-to-clear)

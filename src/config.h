@@ -39,6 +39,10 @@ inline constexpr const char* KEY_TCAP_PIO        = "tcap_pio";        // "0"/"1"
 inline constexpr const char* KEY_TMATCH_PIO      = "tmatch_pio";      // "0"/"1" (opt-in, Match/PWM)
 inline constexpr const char* KEY_WFI_PIN_WAKEUP  = "wfi_pin_wakeup";   // "0"/"1" (opt-in)
 inline constexpr const char* KEY_PRIMASK_SHADOW  = "primask_shadow";   // "0"/"1" (opt-in)
+// Bootloader->Applikation: Erkennungs-/Descriptor-Adressen (hex oder dezimal).
+inline constexpr const char* KEY_APP_START       = "app_start";        // Flash-Adresse der Applikation (Default 0x3000)
+inline constexpr const char* KEY_DESC_ADDR       = "desc_addr";        // Adresse des Boot-Descriptors (Default app_start-0x100)
+inline constexpr const char* KEY_AUTODESC        = "autodesc";         // "0"/"1": Descriptor automatisch erzeugen (Default 1)
 
 // Pin-Mapping LPC1115 -> RP2350 GPIO. -1 = nicht zugeordnet.
 constexpr std::size_t LPC_PIN_COUNT = 64;
@@ -139,5 +143,18 @@ void        set_wfi_pin_wakeup(bool v);
 // Schatten gesetzt ist, haelt die IRQ-Injektion neue IRQs pending zurueck.
 bool        primask_shadow();
 void        set_primask_shadow(bool v);
+
+// Bootloader->Applikation-Uebergang: Flash-Adresse, an der die Applikation
+// (eigene Vektortabelle) erwartet wird, sowie die Adresse, an der der Selfbus-
+// Boot-Descriptor liegt/erzeugt wird. Beide frei konfigurierbar, damit
+// verschiedene Bootloader-Groessen/-Layouts unterstuetzt werden.
+uint32_t    app_start_addr();
+void        set_app_start_addr(uint32_t addr);
+uint32_t    descriptor_addr();          // 0 = automatisch app_start - 0x100
+void        set_descriptor_addr(uint32_t addr);
+// Auto-Descriptor (Default an): erzeugt beim Laden einen gueltigen Boot-
+// Descriptor, falls eine Applikation an app_start liegt und noch keiner da ist.
+bool        autodesc();
+void        set_autodesc(bool v);
 
 } // namespace config

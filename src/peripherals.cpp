@@ -47,6 +47,7 @@ namespace {
 
 // SYSCON
 constexpr uint32_t SYSCON_BASE        = 0x4004'8000;
+constexpr uint32_t SYSMEMREMAP        = SYSCON_BASE + 0x000;
 constexpr uint32_t SYSPLLCTRL         = SYSCON_BASE + 0x008;
 constexpr uint32_t SYSPLLSTAT         = SYSCON_BASE + 0x00C;
 constexpr uint32_t SYSOSCCTRL         = SYSCON_BASE + 0x020;
@@ -283,6 +284,18 @@ void retarget_rp2350_clock(uint32_t target_hz) {
 // dem letzten Byte ausgeführt, damit wir nicht 4× neu takten.
 void syscon_write32(uint32_t addr, uint32_t value) {
     switch (addr) {
+        case SYSMEMREMAP:
+            // LPC SYSMEMREMAP: 0=BootROM, 1=User-RAM, 2=User-Flash. Ein
+            // Schreiben in einen User-Mode markiert den Vektor-Remap. Der
+            // Selfbus-Bootloader setzt 0x01 unmittelbar vor dem Sprung in die
+            // Applikation (Vektortabelle wurde zuvor nach RAM kopiert). Auf dem
+            // Cortex-M33 gibt es kein SYSMEMREMAP — wir bilden den Remap auf
+            // VTOR ab und stellen IRQ-/Fault-Vektoren auf die Applikation um.
+            // (Cortex-M0+-Reset-Default ist BootROM; nur User-Mode triggert.)
+            if ((value & 0x3u) != 0u) {
+                emulator::activate_bootloader_handover();
+            }
+            break;
         case SYSPLLCTRL:    g_syspllctrl   = value & 0x7Fu; g_pll_reconfig_pending = true; break;
         case SYSPLLCLKSEL:  g_syspllclksel = value & 0x3u;  g_pll_reconfig_pending = true; break;
         case MAINCLKSEL:    g_mainclksel   = value & 0x3u;  g_pll_reconfig_pending = true; break;

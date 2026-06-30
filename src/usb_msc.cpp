@@ -38,6 +38,10 @@ std::atomic<bool> g_volume_processed{false};
 std::atomic<bool> g_eject_pending{false};
 Stats             g_stats{};
 
+// Wird beim Parsen von CONFIG.INI (flash_erase=on) gesetzt und in
+// on_volume_ready ausgewertet, bevor eine evtl. BOOT.HEX angewendet wird.
+bool              g_erase_request = false;
+
 // Dirty-Timeout: wenn der Host N ms nicht mehr schreibt, gilt das Volume
 // als fertig (für Linux-Systeme, die kein Eject senden).
 constexpr uint32_t WRITE_IDLE_TIMEOUT_MS = 2000;
@@ -267,6 +271,22 @@ void parse_config(const char* buf, uint32_t len) {
         } else if (std::strcmp(line, "primask_shadow") == 0) {
             config::set_primask_shadow(std::strcmp(eq, "on") == 0 ||
                                        std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "app_start") == 0) {
+            config::set_app_start_addr(
+                static_cast<uint32_t>(std::strtoul(eq, nullptr, 0)));
+        } else if (std::strcmp(line, "desc_addr") == 0) {
+            config::set_descriptor_addr(
+                static_cast<uint32_t>(std::strtoul(eq, nullptr, 0)));
+        } else if (std::strcmp(line, "autodesc") == 0) {
+            config::set_autodesc(std::strcmp(eq, "on") == 0 ||
+                                 std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "flash_erase") == 0 ||
+                   std::strcmp(line, "erase") == 0) {
+            // Loescht den gesamten Firmware-Slot, bevor eine evtl. ebenfalls
+            // abgelegte BOOT.HEX angewendet wird. Ohne diesen Schluessel wird
+            // BOOT.HEX additiv (mergend) in den Slot geschrieben.
+            g_erase_request = (std::strcmp(eq, "on") == 0 ||
+                               std::strcmp(eq, "1")  == 0);
         }
     }
 }
@@ -274,6 +294,7 @@ void parse_config(const char* buf, uint32_t len) {
 // Trigger nach Eject vom Hauptloop aufgerufen.
 void on_volume_ready() {
     uint16_t cl; uint32_t sz;
+    g_erase_request = false;
 
     // CONFIG.INI zuerst (damit Pinmap vor dem Boot wirkt).
     if (find_dir_entry("CONFIG.INI", cl, sz) && sz > 0 && sz < 4096) {
@@ -302,12 +323,18 @@ void on_volume_ready() {
                     static_cast<unsigned>(g_stats.parsed_lines));
     }
 
-    // BOOT.HEX → in firmware-Slot persistieren.
+    // Optionales vollstaendiges Loeschen des Firmware-Slots (flash_erase=on).
+    if (g_erase_request) {
+        storage::firmware_erase();
+        std::printf("[MSC] flash_erase=on -> Firmware-Slot geloescht\n");
+    }
+
+    // BOOT.HEX -> in firmware-Slot persistieren (additiv/mergend; zum
+    // vollstaendigen Ersetzen flash_erase=on in CONFIG.INI verwenden).
     if (find_dir_entry("BOOT.HEX", cl, sz) && sz > 0) {
         static uint8_t hex_buf[64 * 1024 + 1024];
         uint32_t n = read_cluster_chain(cl, sz, hex_buf, sizeof hex_buf);
         // Stream-Parser mit Writer auf storage::firmware_write.
-        storage::firmware_erase();
         struct Ctx {
             uint32_t total;
             bool     overflow;

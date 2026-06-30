@@ -31,6 +31,9 @@ uint32_t g_spi_bridge_hz   = 1'000'000;
 bool     g_adc_bridge_en   = false;
 bool     g_wfi_pin_wakeup  = false;
 bool     g_primask_shadow  = false;
+uint32_t g_app_start       = 0x3000;
+uint32_t g_desc_addr       = 0;       // 0 = automatisch app_start - 0x100
+bool     g_autodesc        = true;
 
 // Timer-Capture-/Match-Pin-Bindung (4 Timer, je 1 Capture + 4 Match).
 // -1 = nicht gebunden.
@@ -51,6 +54,19 @@ bool parse_uint32(const char* s, uint32_t& out) {
     char* end = nullptr;
     errno = 0;
     unsigned long v = std::strtoul(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') return false;
+    if (v > 0xFFFF'FFFFul) return false;
+    out = static_cast<uint32_t>(v);
+    return true;
+}
+
+// Wie parse_uint32, akzeptiert aber zusaetzlich Hex mit "0x"/"0X"-Praefix
+// (Basis-Autodetektion). Fuer Adress-Konfiguration (app_start, desc_addr).
+bool parse_uint32_auto(const char* s, uint32_t& out) {
+    if (!s || !*s) return false;
+    char* end = nullptr;
+    errno = 0;
+    unsigned long v = std::strtoul(s, &end, 0);
     if (errno != 0 || end == s || *end != '\0') return false;
     if (v > 0xFFFF'FFFFul) return false;
     out = static_cast<uint32_t>(v);
@@ -110,6 +126,9 @@ void apply_defaults() {
     g_adc_bridge_en   = false;
     g_wfi_pin_wakeup  = false;
     g_primask_shadow  = false;
+    g_app_start       = 0x3000;
+    g_desc_addr       = 0;
+    g_autodesc        = true;
     for (int t = 0; t < 4; ++t) {
         g_ct_cap[t] = -1;
         for (int m = 0; m < 4; ++m) g_ct_mat[t][m] = -1;
@@ -217,6 +236,17 @@ bool load() {
     if (storage::config_get(KEY_PRIMASK_SHADOW, buf, sizeof buf)) {
         g_primask_shadow = (buf[0] == '1');
     }
+    if (storage::config_get(KEY_APP_START, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32_auto(buf, v) && v < 0x10000u) g_app_start = v;
+    }
+    if (storage::config_get(KEY_DESC_ADDR, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32_auto(buf, v) && v < 0x10000u) g_desc_addr = v;
+    }
+    if (storage::config_get(KEY_AUTODESC, buf, sizeof buf)) {
+        g_autodesc = (buf[0] == '1');
+    }
     {
         char key[24];
         for (int t = 0; t < 4; ++t) {
@@ -302,6 +332,12 @@ bool save() {
     if (!storage::config_set(KEY_WFI_PIN_WAKEUP, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_primask_shadow ? 1 : 0));
     if (!storage::config_set(KEY_PRIMASK_SHADOW, buf)) return false;
+    std::snprintf(buf, sizeof buf, "0x%lx", static_cast<unsigned long>(g_app_start));
+    if (!storage::config_set(KEY_APP_START, buf)) return false;
+    std::snprintf(buf, sizeof buf, "0x%lx", static_cast<unsigned long>(g_desc_addr));
+    if (!storage::config_set(KEY_DESC_ADDR, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_autodesc ? 1 : 0));
+    if (!storage::config_set(KEY_AUTODESC, buf)) return false;
     {
         char key[24];
         for (int t = 0; t < 4; ++t) {
@@ -416,5 +452,16 @@ void set_wfi_pin_wakeup(bool v)      { g_wfi_pin_wakeup = v; }
 
 bool primask_shadow()                { return g_primask_shadow; }
 void set_primask_shadow(bool v)      { g_primask_shadow = v; }
+
+uint32_t app_start_addr()            { return g_app_start; }
+void set_app_start_addr(uint32_t a)  { if (a < 0x10000u) g_app_start = a; }
+uint32_t descriptor_addr() {
+    if (g_desc_addr != 0) return g_desc_addr;
+    // Automatik: eine Flash-Page (256 B) vor der Applikation.
+    return (g_app_start >= 0x100u) ? (g_app_start - 0x100u) : 0u;
+}
+void set_descriptor_addr(uint32_t a) { if (a < 0x10000u) g_desc_addr = a; }
+bool autodesc()                      { return g_autodesc; }
+void set_autodesc(bool v)            { g_autodesc = v; }
 
 } // namespace config

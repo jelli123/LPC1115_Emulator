@@ -12,6 +12,7 @@
 #include "usb_msc.h"
 #include "uart_bridge.h"
 #include "led.h"
+#include "xmodem.h"
 
 extern "C" void usb_stdio_task(void);
 #include <cstdio>
@@ -34,6 +35,74 @@ bool hex_writer(uint32_t offset, const uint8_t* data, std::size_t len) {
     return storage::firmware_write(offset, data, len);
 }
 
+// Wendet ausgewaehlte Schluessel sofort auf die laufende Konfiguration an,
+// damit ein direkt folgendes 'run' sie ohne Power-Cycle beruecksichtigt
+// (andere Keys greifen erst nach erneutem config::load() beim Boot).
+void apply_live_config_key(const char* key, const char* val) {
+    if (std::strcmp(key, config::KEY_APP_START) == 0)
+        config::set_app_start_addr(
+            static_cast<uint32_t>(std::strtoul(val, nullptr, 0)));
+    else if (std::strcmp(key, config::KEY_DESC_ADDR) == 0)
+        config::set_descriptor_addr(
+            static_cast<uint32_t>(std::strtoul(val, nullptr, 0)));
+    else if (std::strcmp(key, config::KEY_AUTODESC) == 0)
+        config::set_autodesc(val[0] == '1' || std::strcmp(val, "on") == 0);
+}
+
+// --- XMODEM-Empfang in den HEX-Parser ---
+struct XmodemHexCtx {
+    hex::Parser* parser;
+    bool         error;
+    bool         done;   // EOF-Record erreicht; weiteres Padding ignorieren
+};
+
+bool xmodem_hex_sink(const uint8_t* data, std::size_t len, void* ctxv) {
+    auto* c = static_cast<XmodemHexCtx*>(ctxv);
+    for (std::size_t i = 0; i < len; ++i) {
+        if (c->done) return true; // Padding (0x1A) nach EOF verwerfen
+        hex::Result r = c->parser->feed(static_cast<char>(data[i]));
+        using R = hex::Result;
+        if (r == R::BadFormat || r == R::BadChecksum ||
+            r == R::OutOfRange || r == R::Overflow) {
+            c->error = true;
+            return false;
+        }
+        if (r == R::EndOfFile) c->done = true;
+    }
+    return true;
+}
+
+void cmd_xmodem() {
+    std::puts("xmodem: Empfang (CRC/1K, additiv) bereit - Datei jetzt senden...");
+    fflush(stdout);
+    static hex::Parser parser(hex_writer, 0x0000'0000, 64u * 1024u);
+    parser = hex::Parser(hex_writer, 0x0000'0000, 64u * 1024u);
+    XmodemHexCtx ctx{&parser, false, false};
+    uint32_t raw = 0;
+    auto res = xmodem::receive(xmodem_hex_sink, &ctx, usb_stdio_task, raw);
+
+    if (ctx.error) {
+        std::puts("\n[xmodem] HEX-Fehler -> abgebrochen");
+        return;
+    }
+    if (res == xmodem::Result::SyncFailed) {
+        std::puts("\n[xmodem] kein Sender erkannt (timeout)");
+        return;
+    }
+    if (res == xmodem::Result::Canceled) {
+        std::puts("\n[xmodem] abgebrochen");
+        return;
+    }
+    uint32_t bw = parser.bytes_written();
+    if (bw > 0 && storage::firmware_finalize(bw)) {
+        std::printf("\n[xmodem] %lu hex-bytes (%lu roh empfangen), CRC ok\n",
+                    static_cast<unsigned long>(bw),
+                    static_cast<unsigned long>(raw));
+    } else {
+        std::puts("\n[xmodem] keine gueltigen Daten");
+    }
+}
+
 void cmd_help() {
     static const char* lines[] = {
         "Befehle:",
@@ -43,6 +112,7 @@ void cmd_help() {
         "  reset                      Emulator-Core neu starten",
         "",
         "  upload                     Intel-Hex-Stream starten (alias: flash hex)",
+        "  xmodem                     Intel-Hex per XMODEM-CRC/1K empfangen",
         "  info                       Reset-Vektor, Stack, Groesse, CRC",
         "  erase                      Firmware-Slot loeschen (alias: flash erase)",
         "  run                        Guest starten",
@@ -167,12 +237,18 @@ void handle_command(char* line) {
     if (std::strcmp(tokens[0], "upload") == 0 ||
         (std::strcmp(tokens[0], "flash") == 0 && n >= 2 &&
          std::strcmp(tokens[1], "hex") == 0)) {
-        storage::firmware_erase();
+        // Kein Auto-Erase: HEX wird additiv in den vorhandenen Slot gemischt,
+        // damit z. B. ein zuvor geladener Bootloader erhalten bleibt. Zum
+        // vollstaendigen Loeschen 'erase' verwenden.
         static hex::Parser parser(hex_writer, 0x0000'0000, 64u * 1024u);
         parser = hex::Parser(hex_writer, 0x0000'0000, 64u * 1024u);
         g_hex_parser = &parser;
         g_in_hex_upload = true;
-        std::puts("hex: stream Intel-Hex Zeilen, Ende mit leerer Zeile");
+        std::puts("hex: stream Intel-Hex Zeilen (additiv), Ende mit leerer Zeile");
+        return;
+    }
+    if (std::strcmp(tokens[0], "xmodem") == 0) {
+        cmd_xmodem();
         return;
     }
     if (std::strcmp(tokens[0], "info") == 0)  { cmd_info(); return; }
@@ -257,8 +333,9 @@ void handle_command(char* line) {
             return;
         }
         if (std::strcmp(tokens[1], "set") == 0 && n >= 4) {
-            std::puts(storage::config_set(tokens[2], tokens[3])
-                      ? "ok" : "err");
+            bool ok = storage::config_set(tokens[2], tokens[3]);
+            if (ok) apply_live_config_key(tokens[2], tokens[3]);
+            std::puts(ok ? "ok" : "err");
             return;
         }
         if (std::strcmp(tokens[1], "save") == 0) {
@@ -276,8 +353,9 @@ void handle_command(char* line) {
             return;
         }
         if (std::strcmp(tokens[1], "set") == 0 && n >= 4) {
-            std::puts(storage::config_set(tokens[2], tokens[3])
-                      ? "ok" : "err");
+            bool ok = storage::config_set(tokens[2], tokens[3]);
+            if (ok) apply_live_config_key(tokens[2], tokens[3]);
+            std::puts(ok ? "ok" : "err");
             return;
         }
         if (std::strcmp(tokens[1], "save") == 0) {

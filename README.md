@@ -248,8 +248,45 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ```
 
-Wenn `PICO_SDK_PATH` nicht gesetzt ist, wird das SDK 2.1.0 per
-FetchContent gezogen. `emulator.uf2` per BOOTSEL aufs Board kopieren.
+Wenn `PICO_SDK_PATH` nicht gesetzt ist, wird das SDK per FetchContent
+gezogen. In dieser Arbeitskopie wird das von der Pico-VS-Code-Erweiterung
+verwaltete **SDK 2.2.0** benutzt; das Build-Artefakt ist `build/emulator.uf2`
+und wird per BOOTSEL aufs Board kopiert.
+
+## Zweistufiger Boot: Bootloader + Applikation (auto-Descriptor)
+
+Selfbus-Geräte bestehen aus zwei Teilen: einem **Bootloader** ab
+`0x0000` und der **Applikation** ab einer höheren Flash-Adresse (Selfbus-
+Default `0x3000`). Der Bootloader prüft vor dem Sprung einen
+**App-Descriptor** (Start-/End-Adresse + CRC32) in einem Flash-Block kurz
+vor der App (Default `app_start − 0x100`).
+
+Der Emulator unterstützt diesen Ablauf direkt:
+
+* **Mergendes Laden:** `upload`/`xmodem`/`BOOT.HEX` schreiben **additiv** in
+  den 64-KiB-Slot (Sektor-Read-Modify-Write). Eine zweite Datei (z. B. die
+  App) überschreibt den zuvor geladenen Bootloader **nicht**. Vollständiges
+  Löschen nur explizit über `erase` (CLI) bzw. `flash_erase=on` (CONFIG.INI).
+* **Auto-Descriptor:** Erkennt der Loader beim Start eine gültige
+  Applikation ab `app_start` (plausibler Initial-SP im LPC-RAM + Thumb-
+  Reset-Vektor im Flash), synthetisiert er bei `autodesc=on` einen
+  korrekten Selfbus-Descriptor bei `desc_addr` und protokolliert das auf der
+  CLI (`[EMU] Boot-Descriptor erzeugt …`). Die CRC ist bit-identisch zur
+  Selfbus-Bootloader-Routine; die App-Bytes bleiben dabei unangetastet
+  (pristine), damit Descriptor- und Laufzeit-CRC übereinstimmen.
+* **Konfigurierbar** (CLI `cfg set …` oder CONFIG.INI):
+
+  | Key         | Default            | Bedeutung                                  |
+  |-------------|--------------------|--------------------------------------------|
+  | `app_start` | `0x3000`           | Flash-Adresse der Applikation              |
+  | `desc_addr` | `0` (= auto)       | Descriptor-Adresse; `0` ⇒ `app_start−0x100`|
+  | `autodesc`  | `on`               | Descriptor automatisch erzeugen            |
+
+  `app_start` muss der `applicationFirstAddress()` des verwendeten
+  Bootloaders entsprechen.
+
+Alternativ zum kombinierten Laden kann die App auch per **OTA über den
+KNX-Bus** in den emulierten Bootloader geschrieben werden (IAP-Pfad).
 
 ## CLI
 
@@ -261,8 +298,9 @@ FetchContent gezogen. `emulator.uf2` per BOOTSEL aufs Board kopieren.
 | `pin set <lpc> <rp\|-1>`      | Pin-Mapping setzen                            |
 | `pin show`                    | aktuelles Pin-Mapping                         |
 | `freq <Hz>`                   | nur Konfig (RP2350-Takt folgt der Gast-PLL)   |
-| `flash erase`                 | Firmware-Slot löschen                         |
-| `flash hex`                   | Intel-Hex-Upload                              |
+| `upload` / `flash hex`        | Intel-Hex-Upload (**additiv/mergend**)        |
+| `xmodem`                      | Intel-Hex per XMODEM-CRC/1K empfangen         |
+| `erase` / `flash erase`       | Firmware-Slot komplett löschen                |
 | `flash finalize <bytes>`      | CRC-Marker setzen                             |
 | `run`                         | Gast starten (Core 1)                         |
 | `stop` / `reset`              | Core 1 abschießen + neu booten                |

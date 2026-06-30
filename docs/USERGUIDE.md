@@ -31,7 +31,7 @@ Eine Pico-2- oder Pico-2-W-Platine genügt.
    cmake --build build -j
    ```
 
-   Ergebnis: `build/lpc1115_emulator.uf2`.
+   Ergebnis: `build/emulator.uf2`.
 
 2. RP2350 in BOOTSEL halten, einstecken, UF2 kopieren.
 3. Drei serielle Ports erscheinen:
@@ -84,9 +84,10 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 
 | Befehl              | Wirkung                                              |
 |---------------------|------------------------------------------------------|
-| `upload`            | wartet auf Intel-HEX-Stream auf CDC#0                |
+| `upload`            | wartet auf Intel-HEX-Stream auf CDC#0 (**additiv**)  |
+| `xmodem`            | Intel-HEX per XMODEM-CRC/1K empfangen (robust)       |
 | `info`              | zeigt Reset-Vector, Stack, Größe, CRC                |
-| `erase`             | Firmware-Slot leeren                                 |
+| `erase`             | Firmware-Slot komplett leeren                        |
 | `run`               | Guest starten                                        |
 | `halt`              | Guest anhalten (kooperatives Halt via PendSV)        |
 | `step`              | ein Befehl ausführen, dann halten                    |
@@ -129,6 +130,13 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 
 ## 4. Firmware aufspielen
 
+> **Wichtig – additives Laden:** Alle drei Upload-Wege schreiben seit
+> Phase 3 **mergend** in den 64-KiB-Slot. Eine zweite Datei überschreibt
+> die zuvor geladene **nicht** komplett, sondern nur die tatsächlich
+> belegten Sektoren. Das ist genau das, was man für „Bootloader laden,
+> danach Applikation laden" braucht. Zum **vollständigen Ersetzen** vorher
+> `erase` (CLI) ausführen bzw. `flash_erase=on` in die CONFIG.INI schreiben.
+
 ### Variante A: USB-Wechseldatenträger (empfohlen, kein CLI nötig)
 
 Der Emulator stellt sich auch als **USB-Mass-Storage-Volume** dar
@@ -168,6 +176,12 @@ i2c_bridge_sda=6        # SDA-Pin (RP2350-GPIO, externer Pull-up nötig)
 i2c_bridge_scl=7        # SCL-Pin (RP2350-GPIO, externer Pull-up nötig)
 i2c_bridge_hz=100000    # Bus-Takt (Standard 100 kHz)
 
+# Zweistufiger Boot: Bootloader + Applikation (siehe Abschnitt 4d)
+app_start=0x3000        # Flash-Adresse der Applikation
+desc_addr=0x2F00        # Boot-Descriptor (0 oder weglassen = app_start-0x100)
+autodesc=on             # Descriptor beim Laden automatisch erzeugen
+flash_erase=off         # on = Firmware-Slot vor BOOT.HEX komplett löschen
+
 # WFI-Pin-Wakeup (opt-in, Default aus) — siehe Hinweis unten
 wfi_pin_wakeup=off      # on = WFI der Firmware auf Pin-IRQ-Wakeup patchen
 ```
@@ -206,6 +220,28 @@ emu> run
 
 In *PuTTY*/*Tera Term*: „Send file" → Datei `.hex` wählen, Protocol: **plain**.
 
+### Variante B2: XMODEM-CRC/1K über CLI (robust gegen Zeichenverlust)
+
+Der reine HEX-Stream (Variante B) kann bei schnellem „Einfügen" ohne
+Flusskontrolle einzelne Zeichen verlieren. `xmodem` überträgt blockweise
+mit CRC-Prüfung und ACK/NAK und ist dadurch zuverlässig:
+
+```
+emu> xmodem
+xmodem: Empfang (CRC/1K, additiv) bereit - Datei jetzt senden...
+... <jetzt .hex per XMODEM senden> ...
+[xmodem] 16234 hex-bytes (16896 roh empfangen), CRC ok
+```
+
+Sender-Seite:
+
+* **Tera Term:** *Datei → Transfer → XMODEM → Send…*, Option **1K** wählen,
+  die `.hex`-Datei auswählen.
+* **Linux/macOS:** `sx -k -X firmware.hex < /dev/ttyACM0 > /dev/ttyACM0`
+  (aus `lrzsz`; `-k` = 1K-Blöcke).
+
+Auch der XMODEM-Upload ist **additiv** — für Vollersatz vorher `erase`.
+
 ### Variante C: GDB-Load über CDC#1
 
 ```
@@ -217,6 +253,43 @@ arm-none-eabi-gdb fw.elf
 
 Die geladene Firmware landet sowohl im RAM-View des Emulators als auch im
 Wear-Leveling-Slot des QSPI-Flash (überlebt Power-Cycle wenn `autostart on`).
+
+### Variante D: Bootloader + Applikation (zweistufig, mit Auto-Descriptor)
+
+Selfbus-Geräte bestehen aus **Bootloader** (ab `0x0000`) und **Applikation**
+(ab `app_start`, Default `0x3000`). Der Emulator kann beides nacheinander in
+denselben Slot laden und den vom Bootloader benötigten **App-Descriptor**
+selbst erzeugen:
+
+```
+emu> erase                         # einmalig: Slot komplett leeren
+emu> cfg set app_start 0x3000      # Applikations-Startadresse (= BL applicationFirstAddress)
+emu> cfg set desc_addr 0           # 0 = automatisch app_start-0x100
+emu> cfg set autodesc on
+emu> cfg save
+emu> upload                        # 1) Bootloader-HEX senden
+...
+emu> upload                        # 2) Applikations-HEX (@0x3000) senden – additiv!
+...
+emu> run
+[EMU] Boot-Descriptor erzeugt @0x2F00 start=0x3000 end=0x... crc=0x... ver=0x3000
+[guest] running...
+```
+
+Wichtig:
+
+* `app_start` muss exakt der `applicationFirstAddress()` des verwendeten
+  Bootloaders entsprechen (beim Selfbus-Bootloader `0x3000`).
+* Der Descriptor wird nur erzeugt, wenn bei `app_start` eine plausible
+  Vektortabelle erkannt wird (`autodesc=on`). Schon vorhandene gültige
+  Descriptoren bleiben unangetastet.
+* Die fertigen Beispiel-HEX-Dateien liegen unter `examples/`
+  (`bootloader_…hex` + `in16-bim112_flashstart_0x3000_…hex`).
+* Dasselbe geht über das USB-Volume: erst `CONFIG.INI` mit `app_start`/
+  `autodesc`/`flash_erase=on` + Bootloader als `BOOT.HEX` ablegen, auswerfen,
+  dann ein zweites Mal die App als `BOOT.HEX` ohne `flash_erase` ablegen.
+* Alternativ: nur den Bootloader laden und die App per **OTA über den
+  KNX-Bus** in den emulierten Bootloader programmieren (Abschnitt 7).
 
 ---
 
@@ -459,13 +532,18 @@ emu> uart stop
 | OpenOCD findet kein Target                | Pull-Ups (10 kΩ) auf SWDIO, GND verbinden!         |
 | sblib-EEPROM-Write „failed"               | Firmware-Slot voll – `erase` und neu laden         |
 | KNX-RX leer                               | Pinmap und sblib-Konstanten gegenchecken           |
+| Zweite App ersetzt Bootloader nicht / alte Reste | Laden ist **additiv** – vor Vollersatz `erase`     |
+| Bootloader springt nicht in App           | `app_start` ≠ `applicationFirstAddress`, oder `autodesc=off` – Log `[EMU] Boot-Descriptor …` prüfen |
+| `xmodem` „kein Sender erkannt"            | Sender nutzt kein CRC/1K, oder falscher COM-Port    |
 
 ---
 
 ## 10. Quick-Reference
 
 ```
-upload          # HEX laden
+upload          # HEX laden (additiv)
+xmodem          # HEX per XMODEM-CRC/1K laden (robust)
+erase           # Firmware-Slot komplett löschen
 run / halt      # Guest steuern
 gdb on          # GDB-Stub auf CDC#1
 swd start 14 15 # SWD-Target auf GP14(DIO)/GP15(CLK)

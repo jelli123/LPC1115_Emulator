@@ -252,7 +252,8 @@ src/
   gdb_stub.cpp                    # RSP-Server auf CDC#1
   pio_glue.cpp                    # Edge-Capture-PIO
   hex_parser.cpp  hex_patcher.cpp # Intel-HEX + Relokation
-  storage.cpp                     # Flash-WL
+  xmodem.cpp                      # XMODEM-CRC/1K-Empfänger (CLI-Upload)
+  storage.cpp                     # Flash-WL + 64-KiB-Firmware-Slot (RMW)
   config.cpp                      # KV-Konfig
   usb_descriptors.cpp tusb_config.h
 docs/
@@ -418,6 +419,123 @@ Persistenz: das FAT12-Volume liegt aktuell als 256-KiB-RAM-Spiegel
 in SRAM; der Inhalt geht beim Power-Cycle verloren, **außer** für
 die geparsten Targets (Firmware-Slot, Konfig-KV) — die sind
 persistent und reichen für Auto-Boot.
+
+Weitere CONFIG.INI-Schlüssel (Auszug, Phase 3): `app_start`, `desc_addr`,
+`autodesc` (siehe §18) sowie `flash_erase=on`/`erase=on`, das den
+Firmware-Slot **vor** dem Anwenden einer ggf. mitgelieferten `BOOT.HEX`
+komplett löscht. Ohne diesen Schlüssel wird `BOOT.HEX` additiv gemergt.
+
+---
+
+## 17. Firmware-Slot: additives Laden (Sektor-RMW)
+
+[src/storage.cpp](../src/storage.cpp) verwaltet den 64-KiB-Firmware-Slot.
+Uploads (`upload`, `xmodem`, `BOOT.HEX`) schreiben über
+`storage::firmware_write(offset, data, len)` **additiv** — es wird **nicht**
+mehr implizit vorgelöscht.
+
+Mechanik (Read-Modify-Write je 4-KiB-Sektor):
+
+* Ein `fw_sector_buf[4096]` puffert den aktuell beschriebenen Sektor.
+* Beim Sektorwechsel wird der bestehende Inhalt zuerst aus dem XIP-Flash
+  (`xip_ptr(region + sector_start)`) in den Puffer geladen, dann werden die
+  neuen Bytes darüber gelegt (Overlay).
+* `fw_flush_sector()` führt — nur wenn der Puffer „dirty" ist — innerhalb
+  einer `FlashGuard` ein `flash_range_erase` + `flash_range_program` aus.
+* Nicht beschriebene Sektoren (z. B. ein zuvor geladener Bootloader)
+  bleiben dadurch unverändert erhalten.
+* `firmware_finalize(total_len)` flusht den letzten Sektor, setzt
+  `total_len = max(vorhandene_Größe, total_len)` (Längen-Merge), berechnet
+  die CRC32 über `[region, total_len)` und schreibt anschließend den
+  Firmware-Marker.
+
+`firmware_erase()` (CLI `erase`/`flash erase`, CONFIG.INI `flash_erase=on`)
+löscht den gesamten Slot explizit und setzt den Sektor-Cache zurück.
+
+Derselbe RMW-Pfad macht auch die **IAP-Persistenz** (Cmd 51, sblib-EEPROM,
+OTA) robuster: Programmierung erfolgt jetzt als echtes Erase+Program statt
+Program-only.
+
+---
+
+## 18. Zweistufiger Boot: Bootloader → Applikation + Auto-Descriptor
+
+Selfbus-Geräte koppeln einen **Bootloader** (ab `0x0000`) mit einer
+**Applikation** (ab `app_start`, Default `0x3000`). Der Bootloader springt
+nur, wenn ein **App-Descriptor** bei `desc_addr` (Default `app_start−0x100`)
+gültig ist. Der Descriptor entspricht der Selfbus-`AppDescriptionBlock`:
+
+```c
+struct AppDescriptor {            // 16 Byte
+    uint32_t startAddress;        // = app_start (LPC-Flash-Adresse)
+    uint32_t endAddress;          // letztes belegtes App-Byte
+    uint32_t crc;                 // CRC32 über [start..end]
+    uint32_t appVersionAddress;   // "!AVP!@:"-Magic oder app_start
+};
+```
+
+### Erkennung (Load-Time)
+
+[src/emulator.cpp](../src/emulator.cpp) `core1_main` prüft via
+`has_valid_app_vectors()`, ob bei `app_start` eine plausible Vektortabelle
+liegt: Wort[0] (Initial-SP) im LPC-RAM-Bereich `[0x10000000, +RAM)` und
+Wort[1] (Reset-Vektor) mit gesetztem Thumb-Bit im Flash `≥ app_start`. Ist
+das der Fall, läuft der Modus „zweistufig".
+
+### Pristine-App-Grenze (CRC-Korrektheit)
+
+Im zweistufigen Modus werden die Load-Time-Patches (`relocate_ram_refs`,
+WFI-/CPS-Patches) **nur auf den Bootloader-Bereich `[0, app_start)`**
+angewandt (`reloc_len = app_start`). Die App-Bytes bleiben damit **exakt
+so wie geladen** — sonst wiche die Laufzeit-CRC von der Descriptor-CRC ab
+und der Bootloader bliebe im Updater-Modus. Die App läuft trotzdem korrekt,
+weil Flash-Zugriffe ohnehin getrappt und auf das relozierte Image
+umgeleitet werden (gleicher Pfad wie beim OTA-Update).
+
+### Descriptor-Synthese
+
+Bei `autodesc=on` ruft der Loader `ensure_boot_descriptor()`:
+
+* End-Adresse = letztes Byte ≠ `0xFF` im App-Bereich.
+* `crc32_selfbus()` (Polynom `0xEDB88320`, Seed `0xFFFFFFFF`, finales `~`) —
+  **bit-identisch** zur Bootloader-Routine — über `[app_start..end]`.
+* Schreibt den Descriptor mit **LPC-Adressen** (z. B. `0x3000`), weil der
+  Bootloader sie zur Laufzeit dereferenziert und der Flash-Trap sie aufs
+  Image umleitet.
+* **Schutz:** geschrieben wird nur, wenn der Descriptor-Bereich entweder
+  blank (`0xFF`) ist **oder** bereits descriptor-artig aussieht
+  (`startAddress == app_start`). Ein bereits gültiger Descriptor (CRC passt)
+  bleibt unangetastet; Fremddaten werden geschont und nur geloggt.
+
+Log-Ausgabe: `[EMU] Boot-Descriptor erzeugt @0x… start=… end=… crc=… ver=…`.
+
+### Handover
+
+Der Sprung BL→App läuft über den bestehenden SYSMEMREMAP-Hook
+(`activate_bootloader_handover()`, siehe Boot-Diagramm): App-Vektoren werden
+**erst nach** der Bootloader-CRC-Prüfung relociert, VTOR auf `app_start`
+gesetzt; ein SP-Fixup sorgt dafür, dass der rohe LPC-StackTop auf gültigen
+RP2350-SRAM zeigt.
+
+---
+
+## 19. XMODEM-Upload (CLI)
+
+[src/xmodem.cpp](../src/xmodem.cpp) implementiert einen **XMODEM-CRC/1K-
+Empfänger** als robuste Alternative zum reinen HEX-Paste auf CDC#0 (das bei
+fehlender Flusskontrolle Zeichen verlieren kann).
+
+* Blockgrößen: `SOH`=128 Byte, `STX`=1024 Byte; Sync per `'C'` (CRC-Mode).
+* Integritätsprüfung: CRC16-CCITT (Poly `0x1021`) je Block, `ACK`/`NAK`.
+* `xmodem::receive(sink, ctx, pump, bytes)` ist blockierend, ruft aber je
+  Poll-Iteration `pump()` (= `usb_stdio_task` → `tud_task`) auf, damit der
+  USB-CDC-Stack während des Empfangs bedient wird.
+* Die empfangenen Bytes werden in den Intel-HEX-Parser gespeist; nach dem
+  EOF-Record wird `storage::firmware_finalize()` aufgerufen. XMODEM-Padding
+  (`0x1A`) nach EOF wird verworfen.
+
+CLI: `xmodem` → „Empfang bereit", dann die `.hex`-Datei mit einem XMODEM-
+fähigen Terminal (Tera Term, `sx`/`lrzsz`) senden.
 
 ---
 
