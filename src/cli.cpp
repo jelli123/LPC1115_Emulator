@@ -35,6 +35,16 @@ bool hex_writer(uint32_t offset, const uint8_t* data, std::size_t len) {
     return storage::firmware_write(offset, data, len);
 }
 
+// Stoppt einen nativ laufenden Gast vor einem CLI-Flash-Schreibzugriff. Noetig,
+// weil ein Erase/Program XIP stallt und Core1 sonst beim naechsten Trap (unsere
+// Fault-Handler liegen im Flash) crasht. pause_for_flash() resettet Core1 in die
+// sichere Spin-Schleife. Nach einem CLI-Reflash startet der Nutzer den Gast mit
+// 'run' neu -> kein Auto-Resume.
+void stop_guest_for_reflash() {
+    if (emulator::pause_for_flash())
+        std::puts("[CLI] Gast fuer Flash-Zugriff gestoppt ('run' zum Neustart)");
+}
+
 // Wendet ausgewaehlte Schluessel sofort auf die laufende Konfiguration an,
 // damit ein direkt folgendes 'run' sie ohne Power-Cycle beruecksichtigt
 // (andere Keys greifen erst nach erneutem config::load() beim Boot).
@@ -73,6 +83,7 @@ bool xmodem_hex_sink(const uint8_t* data, std::size_t len, void* ctxv) {
 }
 
 void cmd_xmodem() {
+    stop_guest_for_reflash();   // XIP-Schutz fuer den blockierenden Empfang
     std::puts("xmodem: Empfang (CRC/1K, additiv) bereit - Datei jetzt senden...");
     fflush(stdout);
     static hex::Parser parser(hex_writer, 0x0000'0000, 64u * 1024u);
@@ -240,6 +251,7 @@ void handle_command(char* line) {
         // Kein Auto-Erase: HEX wird additiv in den vorhandenen Slot gemischt,
         // damit z. B. ein zuvor geladener Bootloader erhalten bleibt. Zum
         // vollstaendigen Loeschen 'erase' verwenden.
+        stop_guest_for_reflash();   // XIP-Schutz fuer den folgenden Stream
         static hex::Parser parser(hex_writer, 0x0000'0000, 64u * 1024u);
         parser = hex::Parser(hex_writer, 0x0000'0000, 64u * 1024u);
         g_hex_parser = &parser;
@@ -255,6 +267,7 @@ void handle_command(char* line) {
     if (std::strcmp(tokens[0], "erase") == 0 ||
         (std::strcmp(tokens[0], "flash") == 0 && n >= 2 &&
          std::strcmp(tokens[1], "erase") == 0)) {
+        stop_guest_for_reflash();   // XIP-Schutz
         std::puts(storage::firmware_erase() ? "erased" : "err");
         return;
     }
@@ -306,6 +319,7 @@ void handle_command(char* line) {
         return;
     }
     if (std::strcmp(tokens[0], "autostart") == 0 && n >= 2) {
+        emulator::FlashPauseGuard _fp;   // XIP-Schutz; Gast laeuft danach weiter
         if (std::strcmp(tokens[1], "on") == 0) {
             config::set_autostart(true);
             config::save();
@@ -339,6 +353,7 @@ void handle_command(char* line) {
             return;
         }
         if (std::strcmp(tokens[1], "save") == 0) {
+            emulator::FlashPauseGuard _fp;   // XIP-Schutz; Gast laeuft danach weiter
             std::puts(config::save() ? "saved" : "err");
             return;
         }
@@ -359,6 +374,7 @@ void handle_command(char* line) {
             return;
         }
         if (std::strcmp(tokens[1], "save") == 0) {
+            emulator::FlashPauseGuard _fp;   // XIP-Schutz; Gast laeuft danach weiter
             std::puts(config::save() ? "saved" : "err");
             return;
         }
@@ -434,6 +450,7 @@ void handle_command(char* line) {
         if (std::strcmp(tokens[1], "finalize") == 0 && n == 3) {
             long len;
             if (!parse_int(tokens[2], 1, 64L * 1024, len)) { std::puts("err"); return; }
+            stop_guest_for_reflash();   // XIP-Schutz
             std::puts(storage::firmware_finalize(static_cast<std::size_t>(len)) ? "ok" : "err");
             return;
         }

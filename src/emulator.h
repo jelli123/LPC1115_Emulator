@@ -50,6 +50,25 @@ void load_and_start();
 void stop();
 // Asynchrones „Soft-Reset" nur des Guests (z. B. WDT-Ablauf).
 void request_guest_reset();
+// --- Flash-Schreibschutz (nur Core0) --------------------------------------
+// Ein Flash-Erase/Program blockiert XIP. Laeuft der Gast nativ auf Core1, wuerde
+// dessen naechster Trap (unsere Fault-Handler liegen im XIP-Flash) waehrend der
+// Operation crashen. Vor einem Core0-Flash-Schreibzugriff (CLI/USB-MSC) muss der
+// Gast daher pausiert werden: stop() setzt Core1 per Reset in die sichere
+// Spin-Schleife zurueck (SDK-VTOR -> Multicore-Lockout-Handler erreichbar, kein
+// Gast-Code, der korrumpiert werden koennte). Auf Core1 (IAP-Pfad im Fault-
+// Handler) sind diese Funktionen ein No-op; dort sperrt der FlashGuard statt-
+// dessen Core0 per Multicore-Lockout aus.
+bool pause_for_flash();               // true, wenn ein Gast lief
+void resume_for_flash(bool was_running);
+// RAII-Wrapper: pausiert im Konstruktor, setzt im Destruktor fort.
+struct FlashPauseGuard {
+    bool was_running;
+    FlashPauseGuard()  : was_running(pause_for_flash()) {}
+    ~FlashPauseGuard() { resume_for_flash(was_running); }
+    FlashPauseGuard(const FlashPauseGuard&)            = delete;
+    FlashPauseGuard& operator=(const FlashPauseGuard&) = delete;
+};
 State    state();
 uint64_t mem_traps();
 uint32_t pc();

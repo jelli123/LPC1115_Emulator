@@ -17,6 +17,7 @@
 #include <cstdio>
 
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
 #include "hardware/watchdog.h"
 
 extern "C" void usb_stdio_init(void);
@@ -58,6 +59,12 @@ int main() {
     }
 
     emulator::boot_core1();
+
+    // Core0 selbst als Multicore-Lockout-Victim registrieren. Damit kann der
+    // IAP-Pfad (laeuft im Fault-Handler auf Core1) Core0 vor einem gast-
+    // initiierten Flash-Schreibzugriff sicher aussperren. Core0s VTOR bleibt
+    // stets die SDK-Tabelle -> sein Lockout-Handler ist immer erreichbar.
+    multicore_lockout_victim_init();
 
     cli::init();
 

@@ -83,20 +83,32 @@ uint32_t crc32(const uint8_t* data, std::size_t len, uint32_t seed = 0xFFFF'FFFF
     return ~c;
 }
 
-// Lock-safe Flash-Schreiben: Core1 muss vorher pausiert werden, sonst
-// wird XIP gestört, während Code von dort läuft.
+// Lock-safe Flash-Schreiben: der jeweils ANDERE Core muss waehrend Erase/
+// Program ausgesperrt werden, sonst fuehrt er waehrend des XIP-Stalls Code aus
+// dem Flash aus und crasht.
+//   * Core0 schreibt (CLI/USB-MSC): Core1 aussperren. Der Aufrufer hat den Gast
+//     zuvor pausiert (emulator::FlashPauseGuard) -> Core1 steht in der Spin-
+//     Schleife mit SDK-VTOR, sein Multicore-Lockout-Handler ist erreichbar.
+//   * Core1 schreibt (IAP im Fault-Handler): Core0 aussperren. Core0 ist seit
+//     dem Start Lockout-Victim (main.cpp), sein Handler ist stets erreichbar.
+// WICHTIG: Frueher wurde unbedingt multicore_lockout_start_blocking() gerufen.
+// Von Core1 (IAP) aus sperrt das Core0 aus, der aber KEIN Victim war -> Deadlock.
+// Jetzt wird gezielt der andere Core ausgesperrt, sofern er als Victim
+// initialisiert ist.
 struct FlashGuard {
     uint32_t ints;
-    bool     core1_was_running;
-    FlashGuard() {
-        // Multicore-Lockout: blockiert Core1 nur, wenn er aktiv ist.
-        core1_was_running = multicore_lockout_victim_is_initialized(1);
-        if (core1_was_running) multicore_lockout_start_blocking();
+    bool     locked;
+    FlashGuard() : ints(0), locked(false) {
+        const uint other = get_core_num() ^ 1u;
+        if (multicore_lockout_victim_is_initialized(other)) {
+            multicore_lockout_start_blocking();
+            locked = true;
+        }
         ints = save_and_disable_interrupts();
     }
     ~FlashGuard() {
         restore_interrupts(ints);
-        if (core1_was_running) multicore_lockout_end_blocking();
+        if (locked) multicore_lockout_end_blocking();
     }
     FlashGuard(const FlashGuard&)            = delete;
     FlashGuard& operator=(const FlashGuard&) = delete;

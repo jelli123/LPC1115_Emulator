@@ -4,6 +4,7 @@
 #include "hex_parser.h"
 #include "peripherals.h"
 #include "uart_bridge.h"
+#include "emulator.h"
 
 #include "tusb.h"
 #include "pico/stdlib.h"
@@ -338,6 +339,12 @@ void parse_config(const char* buf, uint32_t len) {
 void on_volume_ready() {
     uint16_t cl; uint32_t sz;
     g_erase_request = false;
+
+    // Lauft ein Gast nativ auf Core1, vor den Flash-Schreibzugriffen pausieren
+    // (sonst crasht Core1 waehrend des XIP-Stalls). Der Guard setzt den Gast am
+    // Funktionsende fort: bei neuer BOOT.HEX startet er die NEUE Firmware, bei
+    // reiner CONFIG.INI die bisherige weiter. Lief kein Gast, ist es ein No-op.
+    emulator::FlashPauseGuard flash_pause;
 
     // CONFIG.INI zuerst (damit Pinmap vor dem Boot wirkt).
     if (find_dir_entry("CONFIG.INI", cl, sz) && sz > 0 && sz < 4096) {

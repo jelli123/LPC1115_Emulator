@@ -15,6 +15,7 @@
 #include "pico/multicore.h"
 #include "pico/time.h"
 #include "hardware/sync.h"
+#include "hardware/irq.h"   // irq_set_enabled, SIO_IRQ_FIFO
 #include "RP2350.h"   // CMSIS, via cmsis_core lib
 
 namespace {
@@ -483,11 +484,20 @@ void load_and_start() {
 void stop() {
     // Ein laufender, in unprivileged Mode bxender Gast lässt sich nicht
     // ohne Weiteres anhalten. Wir schießen Core 1 ab und reinitialisieren.
+    //
+    // WICHTIG: Core0 ist seit main() Multicore-Lockout-Victim, d.h. sein
+    // SIO-FIFO-IRQ ist aktiv. multicore_reset_core1() und boot_core1()
+    // (multicore_launch_core1) kommunizieren ueber genau diesen FIFO; wuerde
+    // der Lockout-Handler dazwischenfunken, draint er die Handshake-Bytes weg
+    // -> Hang. Daher den FIFO-IRQ um Reset+Relaunch herum stilllegen.
+    const bool fifo_irq = irq_is_enabled(SIO_IRQ_FIFO);
+    if (fifo_irq) irq_set_enabled(SIO_IRQ_FIFO, false);
     multicore_reset_core1();
     g_state.store(State::Idle);
     mpu_setup::disable();
     target_halt::on_guest_reset();   // stehengebliebene Halt-Flags loeschen
     boot_core1();
+    if (fifo_irq) irq_set_enabled(SIO_IRQ_FIFO, true);
 }
 
 void request_guest_reset() {
@@ -500,6 +510,22 @@ void request_guest_reset() {
     boot_core1();
     g_state.store(State::Running, std::memory_order_release);
     __asm volatile ("sev");
+}
+
+bool pause_for_flash() {
+    // Nur sinnvoll von Core0 aus. Der IAP-Pfad laeuft auf Core1 im Fault-
+    // Handler und sperrt Core0 selbst per Lockout aus (FlashGuard) -> hier
+    // No-op, damit Core1 sich nicht selbst zu resetten versucht.
+    if (get_core_num() != 0u) return false;
+    if (g_state.load(std::memory_order_acquire) != State::Running) return false;
+    // stop() resettet Core1 und relaunched core1_main -> Gast haelt, Core1
+    // steht in der Spin-Schleife (SDK-VTOR). Flash-Writes sind nun sicher.
+    stop();
+    return true;
+}
+
+void resume_for_flash(bool was_running) {
+    if (was_running) load_and_start();   // Firmware (ggf. neu) laden + starten
 }
 
 State    state()    { return g_state.load(); }
