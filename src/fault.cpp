@@ -551,6 +551,35 @@ extern "C" __attribute__((naked)) void isr_memmanage() {
 // pending und feuert, sobald der Gast die Interrupts wieder freigibt) und
 // kehren hinter das WFI zurück. PRIMASK des Gastes bleibt unangetastet.
 extern "C" void hardfault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
+    // Eskalierte IACCVIOL: Der Gast sprang ueber einen NICHT-relozierten
+    // LPC-Funktionspointer (rohe Flash-Adresse 0x0000xxxx oder RAM 0x1000xxxx,
+    // z. B. `blx r3` mit r3=0x00004e4d). Solche Flash-Code-Pointer werden vom
+    // hex_patcher BEWUSST nicht statisch reloziert, sondern lazy beim ersten
+    // Sprung per MemManage-IACCVIOL umgebogen (handle_memfault_c). Tut der Gast
+    // den Sprung aber innerhalb einer kritischen Sektion (PRIMASK=1, das
+    // `__disable_irq()`-Idiom), ist die MemManage-Prioritaet maskiert -> die
+    // Exception kann nicht feuern und eskaliert zu HardFault (HFSR.FORCED=1,
+    // CFSR=0). Wir relocaten den PC hier identisch zum MemManage-Handler, dann
+    // laeuft der Gast transparent weiter. PRIMASK bleibt unberuehrt (nicht
+    // Teil des Exception-Frames). Beobachtet bei bim112/BCU2; FT12 und der
+    // Bootloader rufen Flash-Pointer nie unter PRIMASK.
+    {
+        uint32_t fpc = exc_frame[6];
+        if (fpc < emulator::LPC_LOAD_MAX_SIZE) {
+            exc_frame[6] = emulator::load_base() + fpc;
+            SCB->HFSR = SCB->HFSR;           // FORCED w1c
+            ++faultsys::g_stats.mem_traps;
+            return;
+        }
+        if (fpc >= 0x1000'0000u &&
+            fpc <  0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE) {
+            exc_frame[6] = emulator::guest_ram_base() + (fpc - 0x1000'0000u);
+            SCB->HFSR = SCB->HFSR;
+            ++faultsys::g_stats.mem_traps;
+            return;
+        }
+    }
+
     if (config::wfi_pin_wakeup() && (SCB->HFSR & SCB_HFSR_FORCED_Msk)) {
         uint32_t pc = exc_frame[6];
         const uint16_t* ip = reinterpret_cast<const uint16_t*>(pc & ~1u);
@@ -570,6 +599,24 @@ extern "C" void hardfault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
             return;
         }
     }
+
+    // Eskalierter Daten-/MMIO-Zugriff: Greift der Gast unter PRIMASK (kritische
+    // Sektion, __disable_irq) auf emulierte LPC-MMIO/RAM/Flash oder die IAP-ROM
+    // (0x1FFF1FF1) zu, ist die MemManage/BusFault-Prioritaet maskiert und der
+    // Trap eskaliert zu HardFault (HFSR.FORCED). Der PC zeigt hier auf gueltigen
+    // relozierten Code (rohe Code-Fetch-Spruenge wurden oben bereits umgebogen),
+    // daher kann der volle Memory-Fault-Emulator die Instruktion am PC
+    // dekodieren und den Zugriff bedienen — unabhaengig von CFSR/BFAR, die bei
+    // einer Eskalation NICHT gelatcht werden (decode_mem_access rechnet die
+    // Effektivadresse aus Instruktion + Registern). Echte, nicht dekodierbare
+    // Faults degradieren in handle_memfault_c sauber zu Diagnose + Halt.
+    if (SCB->HFSR & SCB_HFSR_FORCED_Msk) {
+        SCB->HFSR = SCB->HFSR;               // FORCED w1c
+        handle_memfault_c(
+            reinterpret_cast<trap_decoder::StackedFrame*>(exc_frame), r4_r11);
+        return;
+    }
+
     print_exc_diag("HardFault", exc_frame, r4_r11);
     enter_fatal_halt();
 }
