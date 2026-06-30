@@ -126,15 +126,18 @@ void isr_svc() {
 // eine echte MCU).
 //
 // WICHTIG: Diese Funktion MUSS im SRAM liegen (__not_in_flash_func), nicht im
-// XIP-Flash. Nach `msr control` (nPRIV=1) + `isb` ist der Code unprivileged.
-// Die MPU (mmu.cpp) whitelistet fuer unprivileged nur das RP2350-SRAM
-// (Region 0, 0x20000000+) und PPB — das XIP-Flash (0x10000000+) ist NICHT
-// abgedeckt. Laege das Trampolin im Flash, wuerde bereits der naechste
-// Instruktions-Fetch (`bx r1`) unprivileged aus dem Flash erfolgen und von der
-// MPU als IACCVIOL (MemManageFault) abgewiesen — der Gast startet nie. Im SRAM
-// (Region 0, RWX fuer unprivileged) ist der Fetch erlaubt; `bx r1` springt dann
-// in den Gast-Code, der ebenfalls im SRAM (load_base) liegt.
-__attribute__((naked, noreturn))
+// XIP-Flash, UND auf 32 Byte aligned sein (aligned(32)). Nach `msr control`
+// (nPRIV=1) + `isb` ist der Code unprivileged. Die MPU (mmu.cpp) gibt fuer den
+// unprivilegierten Gast nur drei enge SRAM-Bereiche frei: das Code-Image, den
+// Gast-RAM und genau dieses Trampolin (eigene 32-Byte-RX-Region bei
+// &enter_guest — daher das 32-Byte-Alignment, damit eine einzelne MPU-Region
+// die Funktion sauber abdeckt). Das XIP-Flash (0x10000000+) ist NICHT abgedeckt.
+// Laege das Trampolin im Flash, wuerde bereits der naechste Instruktions-Fetch
+// (`bx r1`) unprivileged aus dem Flash erfolgen und von der MPU als IACCVIOL
+// (MemManageFault) abgewiesen — der Gast startet nie. In der dedizierten SRAM-
+// RX-Region ist der Fetch erlaubt; `bx r1` springt dann in den Gast-Code im
+// Code-Image (load_base, eigene RWX-Region).
+__attribute__((naked, noreturn, aligned(32)))
 void __not_in_flash_func(enter_guest)(uint32_t /*initial_sp*/,
                                       uint32_t /*reset_handler*/) {
     __asm volatile (
@@ -429,8 +432,16 @@ void core1_main() {
         g_vtable_base.store(load_base, std::memory_order_release);
         g_sp_fixup_pending.store(false, std::memory_order_release);
 
-        // MPU für den Gast scharf schalten.
-        mpu_setup::enable_for_guest();
+        // MPU für den Gast scharf schalten. Es werden NUR die Gast-eigenen
+        // SRAM-Bereiche freigegeben (Code-Image, Gast-RAM, enter_guest-
+        // Trampolin) — der restliche RP2350-SRAM (TinyUSB-Puffer, Core-Stacks,
+        // Emulator-Daten) bleibt fuer den unprivilegierten Gast gesperrt. So
+        // wird ein wilder Gast-Pointer/Heap-/Stack-Ueberlauf zu einem sauberen
+        // Trap statt zu stiller Korruption des Host-USB-Stacks.
+        mpu_setup::enable_for_guest(
+            load_base,
+            reinterpret_cast<uint32_t>(g_guest_ram),
+            reinterpret_cast<uint32_t>(&enter_guest));
 
         uint32_t initial_sp = dst[0];
         uint32_t reset_h    = dst[1];

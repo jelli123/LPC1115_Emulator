@@ -30,9 +30,16 @@ constexpr uint32_t LPC_PRIVPERI_END  = 0xE010'0000;
 constexpr uint32_t RP_XIP_BASE = 0x1000'0000;
 constexpr uint32_t RP_XIP_END  = 0x2000'0000;
 
-// Aktiviert die MPU-Regionen für den Gast (LPC-Firmware).
-// Muss aufgerufen werden, bevor BX in die Gast-Firmware erfolgt.
-void enable_for_guest();
+// Aktiviert die MPU-Regionen für den Gast (LPC-Firmware). Es werden NUR die
+// Gast-eigenen SRAM-Bereiche freigegeben:
+//   * firmware_base   .. +64 KB  (Code-Image, RWX)
+//   * guest_ram_base  .. +8 KB   (Gast-RAM, RWX)
+//   * trampoline_base .. +32 B   (enter_guest-Trampolin, RX)
+// Der restliche RP2350-SRAM bleibt fuer den unprivilegierten Gast gesperrt,
+// sodass wilde Pointer/Ueberlaeufe einen Trap statt stiller Speicher-Korruption
+// ausloesen. Muss aufgerufen werden, bevor BX in die Gast-Firmware erfolgt.
+void enable_for_guest(uint32_t firmware_base, uint32_t guest_ram_base,
+                      uint32_t trampoline_base);
 
 // Deaktiviert die MPU vollständig (für Host-Code auf Core 0).
 void disable();

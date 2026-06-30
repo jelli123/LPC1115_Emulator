@@ -1,4 +1,5 @@
 #include "mmu.h"
+#include "emulator.h"   // LPC_LOAD_MAX_SIZE, LPC_GUEST_RAM_SIZE
 
 #include <cstdint>
 
@@ -19,12 +20,20 @@
 //     Handler decodet die Instruktion und forwardet sie nach
 //     peripherals::mmio_*.
 //
-// Region-Layout für den Gast:
-//   0: Gast-RAM/Code-Region  0x20000000-0x20081FFF (520 KB SRAM, RWX)
-//   1: PPB                   0xE0000000-0xE00FFFFF (RW, Device, XN)
+// Region-Layout für den Gast (eng gefasst — NUR Gast-eigene Bereiche):
+//   0: Code-Image     firmware_base  .. +64 KB  (RWX, Normal)
+//   1: Gast-RAM       guest_ram_base .. +8 KB   (RWX, Normal)
+//   2: enter_guest    trampoline     .. +32 B   (RX,  Normal)
+//   3: PPB Teil A     0xE0000000-0xE000E0FF      (RW, Device, XN)
+//   4: PPB Teil B     0xE000E500-0xE00FFFFF      (RW, Device, XN)
 //
-// PPB liegt vorne im Default-Memory-Map ohnehin, aber wir whitelisten ihn,
-// damit der Gast SCB/SysTick/NVIC unprivileged sehen darf.
+// WICHTIG: Frueher gab Region 0 das GESAMTE 520-KB-SRAM unprivileged RWX frei.
+// Ein wilder Gast-Pointer, Heap- oder Stack-Ueberlauf konnte damit TinyUSB-
+// Puffer, Core-Stacks und Emulator-Daten still ueberschreiben -> USB-Stack-
+// Korruption, CLI-Verlust, Host-Instabilitaet. Jetzt sind nur die drei Gast-
+// Bereiche freigegeben; jeder Zugriff darueber hinaus trappt sauber.
+// PPB wird whitelistet, damit der Gast SCB/SysTick unprivileged sieht (NVIC
+// 0xE000E100-0xE000E4FF bleibt ausgespart -> vnvic-Trap).
 
 namespace mpu_setup {
 
@@ -54,7 +63,8 @@ void set_region(uint32_t idx, uint32_t rbar, uint32_t rlar) {
 
 } // namespace
 
-void enable_for_guest() {
+void enable_for_guest(uint32_t firmware_base, uint32_t guest_ram_base,
+                      uint32_t trampoline_base) {
     MPU->CTRL = 0;
     __DSB(); __ISB();
 
@@ -64,10 +74,28 @@ void enable_for_guest() {
 
     uint32_t r = 0;
 
-    // Gast-SRAM (RP2350 SRAM 520 KB).
+    // Gast-Code-Image (64 KB, RWX): Vektortabelle (VTOR), Gast-Code und die als
+    // Flash gemappten Daten. firmware_base ist alignas(256) -> 32-Byte-tauglich.
     set_region(r++,
-        make_rbar(0x2000'0000u, SH_INNER, AP_RW_ANY, /*xn=*/false),
-        make_rlar(0x2008'1FFFu, ATTR_NORMAL, true));
+        make_rbar(firmware_base, SH_INNER, AP_RW_ANY, /*xn=*/false),
+        make_rlar(firmware_base + emulator::LPC_LOAD_MAX_SIZE - 1u,
+                  ATTR_NORMAL, true));
+
+    // Gast-RAM (8 KB, RWX — manche Firmware fuehrt Code aus dem RAM aus, etwa
+    // ins RAM kopierte IAP-Routinen). guest_ram_base ist alignas(32).
+    set_region(r++,
+        make_rbar(guest_ram_base, SH_INNER, AP_RW_ANY, /*xn=*/false),
+        make_rlar(guest_ram_base + emulator::LPC_GUEST_RAM_SIZE - 1u,
+                  ATTR_NORMAL, true));
+
+    // enter_guest-Trampolin (32 B, RX). Wird nach `msr control` (nPRIV=1) noch
+    // unprivileged ausgefuehrt (isb; bx r1) und MUSS daher fuer den Gast
+    // ausfuehrbar sein. aligned(32) in emulator.cpp garantiert, dass diese
+    // 32-Byte-Region die ganze Funktion abdeckt. Nur RX (kein W) -> der Gast
+    // kann das Trampolin nicht modifizieren.
+    set_region(r++,
+        make_rbar(trampoline_base, SH_INNER, AP_RO_ANY, /*xn=*/false),
+        make_rlar(trampoline_base + 31u, ATTR_NORMAL, true));
 
     // PPB Teil A: 0xE0000000 - 0xE000_E0FF (DCB, ITM, DWT, FPB, SCB-Anfang,
     // SysTick). RW any, Device, XN.
