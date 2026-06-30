@@ -98,11 +98,18 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
     // Emulieren
     bool ok = true;
 
-    // LPC-Flash-Bereich: Daten aus dem geladenen Firmware-Image liefern.
-    // Der Guest liest z. B. .data-Initialisierungswerte ueber einen
-    // nicht-relocierten Flash-Pointer (Scatter-Load-Tabelle).
-    if (acc.address < emulator::LPC_LOAD_MAX_SIZE &&
-        acc.address < storage::firmware_size()) {
+    // LPC-Flash-Bereich (gesamte 64 KB): Daten aus dem geladenen Firmware-
+    // Image liefern. Der Guest liest z. B. .data-Initialisierungswerte ueber
+    // einen nicht-relocierten Flash-Pointer (Scatter-Load-Tabelle) ODER greift
+    // direkt auf hohe Flash-Sektoren zu, die nicht zum Code gehoeren — etwa
+    // ein flash-basiertes EEPROM. sblib (BCU2/MASK0701) legt sein userEeprom
+    // z. B. im letzten Sektor (0xF000-0xFFFF) ab und liest es per memcpy direkt
+    // aus dem Flash. Das g_firmware_image ist stets volle LPC_LOAD_MAX_SIZE
+    // gross und mit 0xFF gepaddet (== geloeschtes Flash); IAP-Schreibvorgaenge
+    // landen ebenfalls dort. Daher den gesamten Flashbereich bedienen, nicht
+    // nur die geladene Code-Laenge — sonst faulten EEPROM-Reads jenseits des
+    // Images und loesen einen Watchdog-Reset aus.
+    if (acc.address < emulator::LPC_LOAD_MAX_SIZE) {
         if (acc.is_load) {
             auto* img = reinterpret_cast<const uint8_t*>(emulator::load_base());
             uint32_t value = 0;
