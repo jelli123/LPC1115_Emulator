@@ -121,11 +121,22 @@ void isr_svc() {
     );
 }
 
-// Naked Trampolin: setzt MPU, wechselt auf PSP/unprivileged Thread Mode,
-// und springt mit BX in den Reset-Handler. Kehrt nie zurück (Gast läuft
-// in Endlos-Loop wie eine echte MCU).
+// Naked Trampolin: wechselt auf PSP/unprivileged Thread Mode und springt mit
+// BX in den Reset-Handler. Kehrt nie zurück (Gast läuft in Endlos-Loop wie
+// eine echte MCU).
+//
+// WICHTIG: Diese Funktion MUSS im SRAM liegen (__not_in_flash_func), nicht im
+// XIP-Flash. Nach `msr control` (nPRIV=1) + `isb` ist der Code unprivileged.
+// Die MPU (mmu.cpp) whitelistet fuer unprivileged nur das RP2350-SRAM
+// (Region 0, 0x20000000+) und PPB — das XIP-Flash (0x10000000+) ist NICHT
+// abgedeckt. Laege das Trampolin im Flash, wuerde bereits der naechste
+// Instruktions-Fetch (`bx r1`) unprivileged aus dem Flash erfolgen und von der
+// MPU als IACCVIOL (MemManageFault) abgewiesen — der Gast startet nie. Im SRAM
+// (Region 0, RWX fuer unprivileged) ist der Fetch erlaubt; `bx r1` springt dann
+// in den Gast-Code, der ebenfalls im SRAM (load_base) liegt.
 __attribute__((naked, noreturn))
-void enter_guest(uint32_t /*initial_sp*/, uint32_t /*reset_handler*/) {
+void __not_in_flash_func(enter_guest)(uint32_t /*initial_sp*/,
+                                      uint32_t /*reset_handler*/) {
     __asm volatile (
         "msr   psp, r0             \n"   // PSP = initial_sp
         "mov   r2, #3              \n"   // CONTROL.SPSEL=1, nPRIV=1
