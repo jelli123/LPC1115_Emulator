@@ -154,6 +154,49 @@ bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size) {
     return false;
 }
 
+// Sucht eine ladbare HEX-Datei im Root-Verzeichnis. Bevorzugt BOOT.HEX,
+// faellt sonst auf die erste beliebige Datei mit Endung .HEX zurueck. So
+// kann der Anwender die Datei unter ihrem Originalnamen ablegen, ohne sie
+// vorher in BOOT.HEX umbenennen zu muessen. 'out_name' (>=13 Byte) erhaelt
+// den gefundenen 8.3-Namen ("NAME.HEX") fuer die Log-Ausgabe.
+bool find_hex_entry(uint16_t& cluster, uint32_t& size, char* out_name) {
+    // 1) Bevorzugt BOOT.HEX (eindeutiges, bewusst gewaehltes Ziel).
+    if (find_dir_entry("BOOT.HEX", cluster, size) && size > 0) {
+        if (out_name) std::strcpy(out_name, "BOOT.HEX");
+        return true;
+    }
+    // 2) Erste beliebige *.HEX-Datei im Root-Verzeichnis.
+    const uint8_t* root = g_disk +
+        (RESERVED_SECTORS + SECTORS_PER_FAT) * SECTOR_SIZE;
+    for (uint32_t i = 0; i < ROOT_DIR_ENTRIES; ++i) {
+        const uint8_t* e = root + i * 32;
+        if (e[0] == 0x00) break;
+        if (e[0] == 0xE5) continue;
+        if (e[11] == 0x0F) continue;                   // LFN
+        if ((e[11] & 0x18) != 0) continue;             // Vol/Dir
+        if (toupper(static_cast<unsigned char>(e[8]))  != 'H' ||
+            toupper(static_cast<unsigned char>(e[9]))  != 'E' ||
+            toupper(static_cast<unsigned char>(e[10])) != 'X') continue;
+        cluster = static_cast<uint16_t>(e[26] | (e[27] << 8));
+        size    = static_cast<uint32_t>(e[28]) |
+                  (static_cast<uint32_t>(e[29]) << 8) |
+                  (static_cast<uint32_t>(e[30]) << 16) |
+                  (static_cast<uint32_t>(e[31]) << 24);
+        if (size == 0) continue;
+        if (out_name) {
+            int p = 0;
+            for (int j = 0; j < 8 && e[j] != ' '; ++j)
+                out_name[p++] = static_cast<char>(
+                    toupper(static_cast<unsigned char>(e[j])));
+            out_name[p++] = '.';
+            out_name[p++] = 'H'; out_name[p++] = 'E'; out_name[p++] = 'X';
+            out_name[p]   = '\0';
+        }
+        return true;
+    }
+    return false;
+}
+
 // CONFIG.INI parsen: simple key=value, eine Zeile pro Eintrag.
 //   pin.<lpc-port_pin>=<rp-gpio>      (z. B. pin.0_3=14)
 //   autostart=on|off
@@ -331,7 +374,9 @@ void on_volume_ready() {
 
     // BOOT.HEX -> in firmware-Slot persistieren (additiv/mergend; zum
     // vollstaendigen Ersetzen flash_erase=on in CONFIG.INI verwenden).
-    if (find_dir_entry("BOOT.HEX", cl, sz) && sz > 0) {
+    // Akzeptiert auch jede andere *.HEX-Datei (Originalname zulaessig).
+    char hex_name[16];
+    if (find_hex_entry(cl, sz, hex_name) && sz > 0) {
         static uint8_t hex_buf[64 * 1024 + 1024];
         uint32_t n = read_cluster_chain(cl, sz, hex_buf, sizeof hex_buf);
         // Stream-Parser mit Writer auf storage::firmware_write.
@@ -361,12 +406,12 @@ void on_volume_ready() {
             }
         }
         if (any_err || ctx.overflow) {
-            std::printf("[MSC] BOOT.HEX parsefehler\n");
+            std::printf("[MSC] %s parsefehler\n", hex_name);
         } else {
             storage::firmware_finalize(ctx.total);
             ++g_stats.boot_requests;
             g_boot_pending.store(true);
-            std::printf("[MSC] BOOT.HEX %lu B → flash\n",
+            std::printf("[MSC] %s %lu B → flash\n", hex_name,
                         static_cast<unsigned long>(ctx.total));
         }
     }
