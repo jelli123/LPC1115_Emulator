@@ -1,0 +1,43 @@
+;
+; Timer-Match-Puls-Erzeugung per PIO.
+; Generisch fuer LPC1115-PWM-/Match-Ausgaben, deren Flanken jitterfrei
+; getaktet sein sollen (z. B. praezise Einzelpulse, Bit-Timing eines
+; Software-UART/KNX-Senders, Servo-/Trigger-Pulse).
+;
+; Der LPC-PWM-Match treibt den Pin: Ausgang geht beim Match-Wert MR high
+; (aktiver Puls) und beim Timer-Reset wieder low. Die CPU rechnet pro Puls
+; aus, wie viele Counts bis zur steigenden Flanke (delay) und wie lange der
+; Puls high bleibt (width), und schiebt beide Werte in die TX-FIFO. Die PIO
+; erzeugt die Flanken danach hardware-getaktet, unabhaengig vom Poll-Jitter.
+;
+; Pin-Idle = low. Pro Kommando: { delay_counts, width_counts }.
+;
+.program match_pulse
+.wrap_target
+    pull block                 ; delay_counts -> OSR
+    out  x, 32                 ; X = delay
+    pull block                 ; width_counts -> OSR
+    out  y, 32                 ; Y = width
+delay_loop:
+    jmp  x--, delay_loop       ; warte `delay` Counts (1 Count/Instruktion)
+    set  pins, 1               ; steigende Flanke (aktiver Puls)
+high_loop:
+    jmp  y--, high_loop        ; halte high fuer `width` Counts
+    set  pins, 0               ; fallende Flanke (Puls beenden)
+.wrap
+
+% c-sdk {
+static inline void match_pulse_program_init(PIO pio, uint sm, uint offset,
+                                             uint pin, float clkdiv) {
+    pio_sm_config c = match_pulse_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, pin, 1);
+    sm_config_set_out_shift(&c, /*shift_right=*/false, /*autopull=*/false, 32);
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, /*is_out=*/true);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_pins(pio, sm, 0);          // Idle-Pegel low
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

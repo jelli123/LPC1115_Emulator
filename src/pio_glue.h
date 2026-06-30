@@ -23,10 +23,12 @@ uint16_t setup_capture(uint8_t rp_gpio, bool rising_edge);
 bool capture_read(uint16_t handle, uint32_t& out);
 
 // ---------------------------------------------------------------------------
-// Flankengenaues Timestamping (KNX-Empfang): Eine PIO-State-Machine fuehrt
+// Flankengenaues Timestamping (Input-Capture): Eine PIO-State-Machine fuehrt
 // einen frei laufenden Abwaertszaehler und schiebt bei JEDER Pin-Flanke den
 // Zaehlerstand in die FIFO. Die CPU rechnet die Differenzen in TC-Ticks um.
 // Vorteil ggue. Software-Polling: 0 % Core-Last, flankengenaue Aufloesung.
+// Generisch fuer jede Capture-Anwendung (Frequenz-/Pulsbreitenmessung,
+// Decoder, KNX-Empfang, ...).
 // ---------------------------------------------------------------------------
 
 // Richtet eine Timestamp-State-Machine fuer `rp_gpio` ein. `out_rate_hz`
@@ -39,5 +41,26 @@ bool ts_read(int handle, uint32_t& counter);
 
 // Gibt die State-Machine wieder frei (vor Neukonfiguration).
 void ts_teardown(int handle);
+
+// ---------------------------------------------------------------------------
+// Flankengenaue Match-Puls-Erzeugung (PWM/Match-Ausgang): Eine PIO-State-
+// Machine treibt den Ausgangspin. Pro Puls liefert die CPU { delay_counts,
+// width_counts }; die SM wartet `delay`, setzt den Pin high (aktiver Puls),
+// wartet `width` und setzt ihn wieder low. Vorteil ggue. Software-Bit-Bang:
+// hardware-getaktete Flanken ohne Poll-Jitter. Generisch fuer praezise
+// PWM-/Trigger-/Bit-Timing-Ausgaben (z. B. KNX-Senden).
+// ---------------------------------------------------------------------------
+
+// Richtet eine TX-State-Machine fuer `rp_gpio` ein. `out_rate_hz` liefert die
+// Zaehlrate (Counts/Sekunde) zur Umrechnung TC-Ticks -> Counts. Rueckgabe:
+// Handle >= 0, oder -1 bei Fehler/voll.
+int  tx_setup(uint8_t rp_gpio, float& out_rate_hz);
+
+// Stellt einen Puls in die FIFO. false, wenn die FIFO keinen Platz fuer
+// beide Worte hat (Puls wird dann verworfen).
+bool tx_emit(int handle, uint32_t delay_counts, uint32_t width_counts);
+
+// Gibt die State-Machine wieder frei.
+void tx_teardown(int handle);
 
 } // namespace pio_glue

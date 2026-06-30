@@ -1,12 +1,14 @@
 ;
-; KNX-/LPC-Capture per PIO: flankengenaues Timestamping ohne Core-Last.
+; Timer-Capture per PIO: flankengenaues Timestamping ohne Core-Last.
+; Generisch fuer jede LPC1115-Input-Capture-Anwendung (Frequenzzaehler,
+; Echo-/Pulsbreitenmessung, Decoder, KNX-Empfang, ...).
 ;
 ; Idee: Eine State-Machine fuehrt einen frei laufenden 32-Bit-Abwaerts-
 ; zaehler in X. Bei JEDER Flanke am Capture-Pin (steigend ODER fallend) wird
 ; der aktuelle Zaehlerstand in die RX-FIFO geschoben. Die CPU rekonstruiert
 ; aus den Differenzen aufeinanderfolgender Zaehlerstaende die exakten
 ; Flankenabstaende (in TC-Ticks umgerechnet) und ordnet jeder Flanke per
-; strikter Alternation (Bus-Idle = high -> erste Flanke fallend) eine
+; strikter Alternation (Idle-Pegel high -> erste Flanke fallend) eine
 ; Richtung zu.
 ;
 ; Wichtig: Jede "gleicher-Pegel"-Schleifeniteration dauert exakt 2 Takte,
@@ -14,10 +16,10 @@
 ; clk_sys / (clkdiv * 2) herunter. Der Zaehler-Unterlauf (alle 2^32 Schritte)
 ; loest KEINE Scheinflanke aus (separater jmp), sondern setzt nur fort.
 ;
-; FIFO-Tiefe 4 puffert mehrere Flanken; bei KNX (~104 us/Bit) reicht das
-; auch bei traegem CPU-Polling locker.
+; FIFO-Tiefe 4 puffert mehrere Flanken; bei langsamen Signalen (z. B. KNX
+; ~104 us/Bit) reicht das auch bei traegem CPU-Polling locker.
 
-.program knx_edge_ts
+.program timer_edge_ts
 
     mov x, !null            ; X = 0xFFFFFFFF (einmalig vor wrap_target)
 .wrap_target

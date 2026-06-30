@@ -167,6 +167,7 @@ bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size) {
 //   tcap.<t>=<rp-gpio>        Timer-Capture-Eingang (KNX-RX), t=0..3
 //   tmat.<t>.<m>=<rp-gpio>    Timer-Match-Ausgang (KNX-TX), t=0..3, m=0..3
 //   tcap_pio=on|off          Capture flankengenau per PIO (opt-in)
+//   tmatch_pio=on|off        Match/PWM-Ausgangspuls hardware-getaktet per PIO (opt-in)
 //   wfi_pin_wakeup=on|off   (opt-in)
 //   primask_shadow=on|off   (opt-in)
 void parse_config(const char* buf, uint32_t len) {
@@ -257,6 +258,9 @@ void parse_config(const char* buf, uint32_t len) {
         } else if (std::strcmp(line, "tcap_pio") == 0) {
             config::set_tcap_pio(std::strcmp(eq, "on") == 0 ||
                                  std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "tmatch_pio") == 0) {
+            config::set_tmatch_pio(std::strcmp(eq, "on") == 0 ||
+                                   std::strcmp(eq, "1")  == 0);
         } else if (std::strcmp(line, "wfi_pin_wakeup") == 0) {
             config::set_wfi_pin_wakeup(std::strcmp(eq, "on") == 0 ||
                                        std::strcmp(eq, "1")  == 0);

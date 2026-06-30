@@ -36,6 +36,7 @@ inline constexpr const char* KEY_ADC_BRIDGE_EN   = "adc_bridge_en";    // "0"/"1
 inline constexpr const char* KEY_TCAP_PREFIX     = "tcap.";
 inline constexpr const char* KEY_TMAT_PREFIX     = "tmat.";
 inline constexpr const char* KEY_TCAP_PIO        = "tcap_pio";        // "0"/"1" (opt-in)
+inline constexpr const char* KEY_TMATCH_PIO      = "tmatch_pio";      // "0"/"1" (opt-in, Match/PWM)
 inline constexpr const char* KEY_WFI_PIN_WAKEUP  = "wfi_pin_wakeup";   // "0"/"1" (opt-in)
 inline constexpr const char* KEY_PRIMASK_SHADOW  = "primask_shadow";   // "0"/"1" (opt-in)
 
@@ -118,7 +119,13 @@ void        set_ct_match_pin(int t, int m, int gpio);
 // aus (Software-Capture als Fallback).
 bool        tcap_pio();
 void        set_tcap_pio(bool v);
-
+// Opt-in: Match-/PWM-Ausgangspuls per PIO statt Software-Bit-Bang. Bei
+// aktivem PWM-Match erzeugt eine PIO-State-Machine die Ausgangspulse
+// (steigende Flanke an MRm, Pulsbreite bis Timer-Reset) hardware-getaktet,
+// frei vom Poll-Jitter. Default aus (Software-PWM als generischer Fallback).
+// Nutzbar fuer praezise PWM-/Trigger-/Bit-Timing-Ausgaben (z. B. KNX-Senden).
+bool        tmatch_pio();
+void        set_tmatch_pio(bool v);
 // WFI-Pin-Wakeup (opt-in, Default aus): patcht WFI der Gast-Firmware auf
 // einen SVC-Trap, sodass eine reine WFI-Warteschleife durch echte
 // RP2350-Pin-Flanken (und zeitbasierte Modelle) geweckt werden kann.

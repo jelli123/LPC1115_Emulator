@@ -40,6 +40,7 @@ int8_t   g_ct_mat[4][4] = {
     { -1, -1, -1, -1 }, { -1, -1, -1, -1 },
 };
 bool     g_tcap_pio = false;
+bool     g_tmatch_pio = false;
 
 constexpr uint32_t MAX_FREQ_HZ = 150'000'000; // RP2350-Limit, defensiv
 constexpr int      MAX_GPIO    = 47;          // RP2350-Pinanzahl konservativ
@@ -238,6 +239,9 @@ bool load() {
     if (storage::config_get(KEY_TCAP_PIO, buf, sizeof buf)) {
         g_tcap_pio = (buf[0] == '1');
     }
+    if (storage::config_get(KEY_TMATCH_PIO, buf, sizeof buf)) {
+        g_tmatch_pio = (buf[0] == '1');
+    }
     load_pin_map_from_storage();
     return true;
 }
@@ -316,6 +320,8 @@ bool save() {
     }
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_tcap_pio ? 1 : 0));
     if (!storage::config_set(KEY_TCAP_PIO, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_tmatch_pio ? 1 : 0));
+    if (!storage::config_set(KEY_TMATCH_PIO, buf)) return false;
     char key[24];
     for (std::size_t i = 0; i < LPC_PIN_COUNT; ++i) {
         if (g_pin_map.lpc_to_rp[i] < 0) continue;
@@ -402,6 +408,8 @@ void set_ct_match_pin(int t, int m, int gpio) {
 
 bool tcap_pio()            { return g_tcap_pio; }
 void set_tcap_pio(bool v)  { g_tcap_pio = v; }
+bool tmatch_pio()            { return g_tmatch_pio; }
+void set_tmatch_pio(bool v)  { g_tmatch_pio = v; }
 
 bool wfi_pin_wakeup()                { return g_wfi_pin_wakeup; }
 void set_wfi_pin_wakeup(bool v)      { g_wfi_pin_wakeup = v; }

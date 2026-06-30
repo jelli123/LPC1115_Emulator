@@ -1,0 +1,20 @@
+﻿in16-bim1122
+============
+
+This the implementation of the MDT Binary Input Sensors and Universal Interface (BE-*.01). The SW supports the 2, 4, 6, 8, and 16 times versions.
+
+Es folgende Geräte unterstützt:
+
+Binäreingang 16-fach V2.0			BE-16xxx.01
+Binäreingang  8-fach V2.0			BE-08xxx.01
+Binäreingang  4-fach V2.0			BE-04xxx.01
+Tasterinterface 6-fach/LED V1.6			BE-06001.01
+Tasterinterface 4-fach/LED V1.6			BE-04001.01
+Tasterinterface 2-fach/LED V1.6			BE-02001.01
+Tasterinterface 2-fach V1.6			BE-02230.01
+
+weitere Konfiguration siehe inc/config.h
+
+Changelog:
+V1.01 erste
+V1.02 Bugfix Logikfunktionen 2 bis 4:  externe Objekte keine Funktion

@@ -442,10 +442,11 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
 
 // =========================================================================
 // CT16Bx / CT32Bx — Match-Timer mit Soft-Tick aus time_us_64().
-// Zusätzlich: Capture (CR0) und External-Match-Ausgänge (EMR), an echte
-// RP2350-GPIOs gebrückt. Wird für den Selfbus-KNX-Buszugriff benötigt:
-//   Capture-Eingang  = Bus-Empfang (Flanken-Timestamps → CR0 + Capture-IRQ)
-//   Match-Ausgänge   = Bus-Senden (EMR steuert MATm-Pin: clear/set/toggle)
+// Modelliert generische LPC1115-Timer-Hardware: Match (MCR/MR/EMR), PWM
+// (PWMC) und Capture (CCR/CR0). Die Capture-Eingaenge und Match-/PWM-Ausgaenge
+// koennen optional an echte RP2350-GPIOs gebrueckt werden — nutzbar fuer jede
+// Capture-/PWM-Anwendung (Frequenz-/Pulsbreitenmessung, Servo-/Trigger-PWM,
+// Software-Bus-Treiber wie KNX-Selfbus: Capture = Empfang, Match = Senden).
 // =========================================================================
 struct CtModel {
     bool     enabled;
@@ -458,6 +459,7 @@ struct CtModel {
     uint32_t ccr;          // Capture Control (CAP0RE/FE/I in Bits 0..2)
     uint32_t cr0;          // Capture-Wert 0 (read-only für Gast)
     uint32_t emr;          // External Match Register (EM0..3 + EMC0..3)
+    uint32_t pwmc;         // PWM-Control: Bit m = MATm im PWM-Modus
     bool     is32;
     uint8_t  irq_num;
     uint64_t last_us;
@@ -471,6 +473,10 @@ struct CtModel {
     uint32_t pio_prev;     // letzter Zählerstand
     bool     pio_have_prev;
     bool     pio_dir_rising; // nächste erwartete Flanke steigend? (Idle high → erst fallend)
+    // PIO-Match (opt-in): Hardware-Puls-Erzeugung je PWM-Match-Kanal. Ein
+    // Handle pro Kanal (m=0..3), -1 = Software-PWM (generischer Fallback).
+    int      tx_handle[4]; // < 0 = Software-PWM für diesen Kanal
+    float    tx_rate;      // PIO-Zählrate [Counts/s] (für alle Kanäle gleich)
 };
 CtModel g_ct[4];
 
@@ -490,6 +496,90 @@ void ct_apply_external_match(CtModel& c, int m) {
         gpio_put(static_cast<uint>(c.mat_pin[m]), level);
 }
 
+// PWM-Ausgang: Ist MATm im PWM-Modus (PWMC-Bit m), folgt der MATm-Pin dem
+// PWM-Pegel: low solange TC < MRm, high sobald TC >= MRm; bei MRm==0 dauerhaft
+// high (LPC-Spezialfall). Der Pegel wird zugleich im EMR-EM-Bit gespiegelt,
+// damit getMatchChannelLevel() korrekt liest. Generischer Software-Pfad —
+// greift fuer alle Kanaele, die NICHT von einer Match-PIO getrieben werden.
+void ct_update_pwm(CtModel& c) {
+    for (int m = 0; m < 4; ++m) {
+        if (!(c.pwmc & (1u << m))) continue;
+        // Match-PIO besitzt diesen Pin: kein Software-Bit-Bang (Doppeltreiben).
+        if (c.tx_handle[m] >= 0) continue;
+        bool level = (c.mr[m] == 0u) ? true : (c.tc >= c.mr[m]);
+        uint32_t bit = 1u << m;
+        bool cur = (c.emr & bit) != 0;
+        if (level != cur) {
+            if (level) c.emr |= bit; else c.emr &= ~bit;
+            if (c.mat_pin[m] >= 0)
+                gpio_put(static_cast<uint>(c.mat_pin[m]), level);
+        }
+    }
+}
+
+// Match-PIO-Puls (opt-in, je PWM-Kanal): Beim Schreiben des PWM-Match-Registers
+// berechnet die CPU die Counts bis zur steigenden Flanke (MRm - TC) und die
+// Pulsbreite bis zum Timer-Reset (Reset-MR - MRm) und stellt den Puls in die
+// PIO-FIFO; die Flanken erzeugt danach die PIO hardware-getaktet.
+//
+// Sicherer Fallback: Eine PIO-State-Machine wird nur belegt, wenn ein gueltiges
+// PWM-Periodenmodell existiert (ein Match-Kanal mit RESET als Periode und
+// MRm < Periode). Fehlt das Modell, wird der Pin an den generischen
+// Software-PWM-Pfad zurueckgegeben — andere Programme funktionieren so
+// unveraendert, auch ohne Selfbus-typisches Puls-Schema.
+void ct_emit_tx_pulse(CtModel& c, int m) {
+    if (m < 0 || m > 3) return;
+    if (!config::tmatch_pio()) return;
+    if (!(c.pwmc & (1u << static_cast<uint32_t>(m)))) return;
+    if (c.mat_pin[m] < 0) return;
+
+    uint32_t mask   = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
+    uint32_t mr_pwm = c.mr[m] & mask;
+
+    // Periode = erster Match-Kanal mit RESET-Bit (MCR Bit 1 je Kanal×3).
+    uint32_t mr_reset = 0; bool have_reset = false;
+    for (int r = 0; r < 4; ++r) {
+        if ((c.mcr >> (r * 3)) & 0x2u) { mr_reset = c.mr[r] & mask; have_reset = true; break; }
+    }
+
+    // Kein Periodenmodell -> Pin an Software-PWM zurueckgeben (Handle freigeben).
+    if (!have_reset) {
+        if (c.tx_handle[m] >= 0) {
+            pio_glue::tx_teardown(c.tx_handle[m]);
+            c.tx_handle[m] = -1;
+            gpio_init(static_cast<uint>(c.mat_pin[m]));
+            gpio_set_dir(static_cast<uint>(c.mat_pin[m]), true);  // Software treibt Pegel
+        }
+        return;
+    }
+
+    // MRm >= Periode: in diesem Zyklus kein Puls (z. B. MR=0xffff = "aus").
+    // Handle bleibt belegt; die PIO haelt den Pin idle-low. Kein Teardown,
+    // damit kein Claim/Unclaim-Churn bei pulsweisem Senden entsteht.
+    if (mr_pwm >= mr_reset) return;
+
+    uint32_t delay_ticks = (mr_pwm - c.tc) & mask;     // bis zur steigenden Flanke
+    if (delay_ticks > (mask >> 1)) return;             // Match bereits vorbei
+    uint32_t width_ticks = (mr_reset - mr_pwm) & mask;
+    if (width_ticks == 0) return;
+
+    double f_tc = static_cast<double>(g_current_hz) / static_cast<double>(c.pre + 1u);
+    if (f_tc <= 0.0) return;
+
+    // Lazy-Allokation: SM erst beim ersten gueltigen Puls belegen.
+    if (c.tx_handle[m] < 0) {
+        float rate = 0.0f;
+        int h = pio_glue::tx_setup(static_cast<uint8_t>(c.mat_pin[m]), rate);
+        if (h >= 0) { c.tx_handle[m] = h; c.tx_rate = rate; }
+    }
+    if (c.tx_handle[m] < 0 || c.tx_rate <= 0.0f) return;  // Fallback: Software-PWM
+
+    double cnt_per_tick = static_cast<double>(c.tx_rate) / f_tc;
+    uint32_t delay_cnt = static_cast<uint32_t>(static_cast<double>(delay_ticks) * cnt_per_tick);
+    uint32_t width_cnt = static_cast<uint32_t>(static_cast<double>(width_ticks) * cnt_per_tick);
+    pio_glue::tx_emit(c.tx_handle[m], delay_cnt, width_cnt);
+}
+
 uint32_t ct_idx_for(uint32_t addr) {
     if (addr >= CT16B0_BASE && addr < CT16B0_BASE + CT_BLOCK_SIZE) return 0;
     if (addr >= CT16B1_BASE && addr < CT16B1_BASE + CT_BLOCK_SIZE) return 1;
@@ -503,13 +593,13 @@ uint32_t ct_base_for(uint32_t i) {
 }
 
 void ct_advance(CtModel& c) {
-    if (!c.enabled) { c.last_us = time_us_64(); return; }
+    if (!c.enabled) { c.last_us = time_us_64(); ct_update_pwm(c); return; }
     uint64_t now = time_us_64();
     uint64_t dt  = now - c.last_us;
     c.last_us = now;
     uint64_t ticks = (dt * static_cast<uint64_t>(g_current_hz))
                      / (1'000'000ull * static_cast<uint64_t>(c.pre + 1u));
-    if (!ticks) return;
+    if (!ticks) { ct_update_pwm(c); return; }
     uint32_t mask = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
     for (uint64_t i = 0; i < ticks; ++i) {
         c.tc = (c.tc + 1u) & mask;
@@ -523,6 +613,7 @@ void ct_advance(CtModel& c) {
             }
         }
     }
+    ct_update_pwm(c);
 }
 
 // Flankenerkennung am Capture-Eingang: liest den echten RP2350-Pin, erkennt
@@ -614,6 +705,7 @@ uint8_t ct_read_byte(uint32_t idx, uint32_t off) {
         case 0x28: return byte_of(c.ccr);
         case 0x2C: return byte_of(c.cr0);
         case 0x3C: return byte_of(c.emr);
+        case 0x74: return byte_of(c.pwmc);
         default:   return 0;
     }
 }
@@ -640,10 +732,10 @@ void ct_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
         case 0x0C: patch(c.pre);   break;
         case 0x10: patch(c.pc);    break;
         case 0x14: patch(c.mcr);   break;
-        case 0x18: patch(c.mr[0]); break;
-        case 0x1C: patch(c.mr[1]); break;
-        case 0x20: patch(c.mr[2]); break;
-        case 0x24: patch(c.mr[3]); break;
+        case 0x18: patch(c.mr[0]); if ((off & 3u) == 3u) ct_emit_tx_pulse(c, 0); break;
+        case 0x1C: patch(c.mr[1]); if ((off & 3u) == 3u) ct_emit_tx_pulse(c, 1); break;
+        case 0x20: patch(c.mr[2]); if ((off & 3u) == 3u) ct_emit_tx_pulse(c, 2); break;
+        case 0x24: patch(c.mr[3]); if ((off & 3u) == 3u) ct_emit_tx_pulse(c, 3); break;
         case 0x28: patch(c.ccr);   break;
         case 0x2C: /* CR0 read-only */ break;
         case 0x3C: {
@@ -652,13 +744,32 @@ void ct_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
             uint32_t old = c.emr;
             patch(c.emr);
             for (int m = 0; m < 4; ++m) {
+                // Match-PIO besitzt seinen Pin; manuelles EM-Setzen nicht durchreichen.
+                if (c.tx_handle[m] >= 0) continue;
                 if (c.mat_pin[m] >= 0 && (((old ^ c.emr) >> m) & 1u))
                     gpio_put(static_cast<uint>(c.mat_pin[m]), ((c.emr >> m) & 1u) != 0);
             }
             break;
         }
+        case 0x74: {
+            patch(c.pwmc);
+            // Kanal aus dem PWM-Modus genommen -> evtl. belegte Match-PIO
+            // freigeben und Pin an Software-PWM/GPIO zurueckgeben.
+            for (int m = 0; m < 4; ++m) {
+                if (!(c.pwmc & (1u << static_cast<uint32_t>(m))) && c.tx_handle[m] >= 0) {
+                    pio_glue::tx_teardown(c.tx_handle[m]);
+                    c.tx_handle[m] = -1;
+                    if (c.mat_pin[m] >= 0) {
+                        gpio_init(static_cast<uint>(c.mat_pin[m]));
+                        gpio_set_dir(static_cast<uint>(c.mat_pin[m]), true);
+                    }
+                }
+            }
+            break;
+        }
         default: break;
     }
+    ct_update_pwm(c);   // MRm-/PWMC-Schreibzugriff kann den PWM-Pegel ändern
 }
 
 // =========================================================================
@@ -790,9 +901,10 @@ uint16_t adc_sample_channel(int ch) {
 
 // =========================================================================
 // Timer-Capture-/Match-Pin-Bridge (CT16/CT32 → echte RP2350-GPIOs).
-// Bindet die in CONFIG.INI konfigurierten Capture-Eingänge (KNX-Empfang) und
-// Match-Ausgänge (KNX-Senden) an reale Pins. Capture-Pins werden als Eingang
-// mit Pull-up (KNX-Bus-Idle = high) initialisiert, Match-Pins als Ausgang.
+// Bindet die in CONFIG.INI konfigurierten Capture-Eingänge und Match-/PWM-
+// Ausgänge an reale Pins. Capture-Pins werden als Eingang mit Pull-up
+// (z. B. Bus-Idle = high) initialisiert, Match-Pins als Ausgang. Generisch
+// fuer Capture-/PWM-Anwendungen (Beispiel: KNX-Selfbus Empfang/Senden).
 // =========================================================================
 void ct_bridge_init() {
     bool use_pio = config::tcap_pio();
@@ -802,6 +914,12 @@ void ct_bridge_init() {
             pio_glue::ts_teardown(g_ct[t].pio_handle);
             g_ct[t].pio_handle = -1;
         }
+        for (int m = 0; m < 4; ++m) {
+            if (g_ct[t].tx_handle[m] >= 0) {
+                pio_glue::tx_teardown(g_ct[t].tx_handle[m]);
+                g_ct[t].tx_handle[m] = -1;
+            }
+        }
         g_ct[t].pio_have_prev  = false;
         g_ct[t].pio_dir_rising = false;
 
@@ -810,7 +928,7 @@ void ct_bridge_init() {
         if (cap >= 0) {
             gpio_init(static_cast<uint>(cap));
             gpio_set_dir(static_cast<uint>(cap), false);    // Eingang
-            gpio_pull_up(static_cast<uint>(cap));           // KNX-Bus-Idle = high
+            gpio_pull_up(static_cast<uint>(cap));           // Idle-Pegel high
             g_ct[t].cap_last = gpio_get(static_cast<uint>(cap));
             if (use_pio) {
                 float rate = 0.0f;
@@ -1297,6 +1415,7 @@ void reset() {
         c.pio_handle    = -1;
         c.pio_have_prev = false;
         c.pio_dir_rising = false;   // Idle high → erste Flanke fallend
+        for (auto& h : c.tx_handle) h = -1;
     }
 
     g_wdt = {};

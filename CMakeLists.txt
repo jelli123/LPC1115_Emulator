@@ -78,8 +78,9 @@ add_executable(emulator
 target_include_directories(emulator PRIVATE src)
 
 # PIO-Programm fuer flankengenaues Capture-Timestamping (KNX-Empfang).
-# pioasm erzeugt den Header knx_edge_ts.pio.h ins Build-Verzeichnis.
-pico_generate_pio_header(emulator ${CMAKE_CURRENT_LIST_DIR}/src/knx_edge_ts.pio)
+# pioasm erzeugt den Header timer_edge_ts.pio.h ins Build-Verzeichnis.
+pico_generate_pio_header(emulator ${CMAKE_CURRENT_LIST_DIR}/src/timer_edge_ts.pio)
+pico_generate_pio_header(emulator ${CMAKE_CURRENT_LIST_DIR}/src/match_pulse.pio)
 
 
 # tusb_config.h aus src/ verwenden statt SDK-Default.

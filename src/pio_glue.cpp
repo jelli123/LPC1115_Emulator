@@ -7,7 +7,8 @@
 #include "hardware/gpio.h"
 #include "pico/stdlib.h"
 
-#include "knx_edge_ts.pio.h"   // von pioasm erzeugt (pico_generate_pio_header)
+#include "timer_edge_ts.pio.h"  // von pioasm erzeugt (pico_generate_pio_header)
+#include "match_pulse.pio.h"     // von pioasm erzeugt (pico_generate_pio_header)
 
 // ---------------------------------------------------------------------------
 // PIO-Programm: Edge-Capture mit 32-Bit-Cycle-Counter.
@@ -103,7 +104,6 @@ void init() {
     g_program_offset = -1;
     g_pio = pio0;
 }
-
 uint16_t setup_capture(uint8_t rp_gpio, bool /*rising_edge*/) {
     if (!ensure_program()) {
         std::printf("[PIO] kein Platz für edge_capture-Programm\n");
@@ -136,7 +136,7 @@ bool capture_read(uint16_t handle, uint32_t& out) {
 }
 
 // ---------------------------------------------------------------------------
-// Flankengenaues Timestamping (knx_edge_ts-Programm).
+// Flankengenaues Timestamping (timer_edge_ts-Programm).
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -155,11 +155,11 @@ int  g_ts_offset = -1;
 bool ts_ensure_program() {
     if (g_ts_loaded) return true;
     g_ts_pio = pio0;
-    if (!pio_can_add_program(g_ts_pio, &knx_edge_ts_program)) {
+    if (!pio_can_add_program(g_ts_pio, &timer_edge_ts_program)) {
         g_ts_pio = pio1;
-        if (!pio_can_add_program(g_ts_pio, &knx_edge_ts_program)) return false;
+        if (!pio_can_add_program(g_ts_pio, &timer_edge_ts_program)) return false;
     }
-    g_ts_offset = pio_add_program(g_ts_pio, &knx_edge_ts_program);
+    g_ts_offset = pio_add_program(g_ts_pio, &timer_edge_ts_program);
     g_ts_loaded = true;
     return true;
 }
@@ -168,7 +168,7 @@ bool ts_ensure_program() {
 
 int ts_setup(uint8_t rp_gpio, float& out_rate_hz) {
     if (!ts_ensure_program()) {
-        std::printf("[PIO] kein Platz fuer knx_edge_ts-Programm\n");
+        std::printf("[PIO] kein Platz fuer timer_edge_ts-Programm\n");
         return -1;
     }
     int slot = -1;
@@ -186,7 +186,7 @@ int ts_setup(uint8_t rp_gpio, float& out_rate_hz) {
     if (clkdiv < 1.0f) clkdiv = 1.0f;
     out_rate_hz = sysclk / (2.0f * clkdiv);
 
-    pio_sm_config c = knx_edge_ts_program_get_default_config(g_ts_offset);
+    pio_sm_config c = timer_edge_ts_program_get_default_config(g_ts_offset);
     sm_config_set_jmp_pin(&c, rp_gpio);
     sm_config_set_in_pins(&c, rp_gpio);
     sm_config_set_in_shift(&c, /*shift_right=*/false, /*autopush=*/false, 32);
@@ -214,6 +214,83 @@ bool ts_read(int handle, uint32_t& counter) {
 void ts_teardown(int handle) {
     if (handle < 0 || handle >= static_cast<int>(MAX_HANDLES)) return;
     auto& t = g_ts[handle];
+    if (!t.used) return;
+    pio_sm_set_enabled(t.pio, t.sm, false);
+    pio_sm_unclaim(t.pio, t.sm);
+    t = {};
+}
+
+// ---------------------------------------------------------------------------
+// TX-Puls-Erzeugung (match_pulse-Programm).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct Tx {
+    bool    used;
+    PIO     pio;
+    uint    sm;
+    uint8_t gpio;
+};
+Tx   g_tx[MAX_HANDLES]{};
+
+PIO  g_tx_pio = pio0;
+bool g_tx_loaded = false;
+int  g_tx_offset = -1;
+
+bool tx_ensure_program() {
+    if (g_tx_loaded) return true;
+    g_tx_pio = pio0;
+    if (!pio_can_add_program(g_tx_pio, &match_pulse_program)) {
+        g_tx_pio = pio1;
+        if (!pio_can_add_program(g_tx_pio, &match_pulse_program)) return false;
+    }
+    g_tx_offset = pio_add_program(g_tx_pio, &match_pulse_program);
+    g_tx_loaded = true;
+    return true;
+}
+
+} // namespace
+
+int tx_setup(uint8_t rp_gpio, float& out_rate_hz) {
+    if (!tx_ensure_program()) {
+        std::printf("[PIO] kein Platz fuer match_pulse-Programm\n");
+        return -1;
+    }
+    int slot = -1;
+    for (int i = 0; i < static_cast<int>(MAX_HANDLES); ++i)
+        if (!g_tx[i].used) { slot = i; break; }
+    if (slot < 0) return -1;
+
+    int sm = pio_claim_unused_sm(g_tx_pio, false);
+    if (sm < 0) return -1;
+
+    // Zaehlrate ~1 MHz (1 Count = 1 PIO-Instruktion = 1 Tick der jmp-Schleife).
+    float sysclk = static_cast<float>(clock_get_hz(clk_sys));
+    float clkdiv = sysclk / 1'000'000.0f;
+    if (clkdiv < 1.0f) clkdiv = 1.0f;
+    out_rate_hz = sysclk / clkdiv;
+
+    match_pulse_program_init(g_tx_pio, static_cast<uint>(sm),
+                             static_cast<uint>(g_tx_offset), rp_gpio, clkdiv);
+
+    g_tx[slot] = { true, g_tx_pio, static_cast<uint>(sm), rp_gpio };
+    return slot;
+}
+
+bool tx_emit(int handle, uint32_t delay_counts, uint32_t width_counts) {
+    if (handle < 0 || handle >= static_cast<int>(MAX_HANDLES)) return false;
+    auto& t = g_tx[handle];
+    if (!t.used) return false;
+    // Beide Worte muessen zusammen passen, sonst Puls verwerfen (kein Teilpuls).
+    if (pio_sm_get_tx_fifo_level(t.pio, t.sm) > 2) return false;
+    pio_sm_put(t.pio, t.sm, delay_counts);
+    pio_sm_put(t.pio, t.sm, width_counts);
+    return true;
+}
+
+void tx_teardown(int handle) {
+    if (handle < 0 || handle >= static_cast<int>(MAX_HANDLES)) return;
+    auto& t = g_tx[handle];
     if (!t.used) return;
     pio_sm_set_enabled(t.pio, t.sm, false);
     pio_sm_unclaim(t.pio, t.sm);
