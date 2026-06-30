@@ -26,6 +26,34 @@ void init() { g_stats = {}; }
 
 } // namespace faultsys
 
+namespace {
+
+// Bildet eine Gast-Adresse (LPC-Sicht 0x0000.. / 0x1000.. ODER bereits auf
+// das RP2350-SRAM relozierte Adresse) auf einen lesbaren Host-Pointer ab und
+// liest 4 Bytes. Liefert false, wenn die Adresse in keinem gemappten Bereich
+// liegt (dann kein Zugriff -> handler-safe, auch fuer Muelladressen).
+bool guest_read32_safe(uint32_t addr, uint32_t& out) {
+    const uint32_t lb = emulator::load_base();
+    const uint32_t rb = emulator::guest_ram_base();
+    uint32_t host;
+    if (addr < emulator::LPC_LOAD_MAX_SIZE) {
+        host = lb + addr;                                   // LPC-Flash [0,64K)
+    } else if (addr >= 0x1000'0000u &&
+               addr <  0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE) {
+        host = rb + (addr - 0x1000'0000u);                  // LPC-SRAM
+    } else if (addr >= lb && addr < lb + emulator::LPC_LOAD_MAX_SIZE) {
+        host = addr;                                        // reloziertes Flash
+    } else if (addr >= rb && addr < rb + emulator::LPC_GUEST_RAM_SIZE) {
+        host = addr;                                        // reloziertes SRAM
+    } else {
+        return false;
+    }
+    std::memcpy(&out, reinterpret_cast<const void*>(host), 4);
+    return true;
+}
+
+} // namespace
+
 // --- Trap-Handler (in C, von Asm-Wrapper aus aufgerufen) ------------------
 //
 // frame zeigt auf den exception-stacked Frame des Gastes
@@ -93,6 +121,48 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
                     static_cast<unsigned long>(frame->pc),
                     static_cast<unsigned long>(SCB->CFSR),
                     static_cast<unsigned long>(SCB->BFAR));
+
+        // --- Erweiterte Diagnose ------------------------------------------
+        // Register-Frame des Gastes (Cortex-M Standard-Stacking) + Gast-SP.
+        const uint32_t lb = emulator::load_base();
+        auto lpc = [&](uint32_t a) -> long {            // Host->LPC-Offset, sonst -1
+            return (a >= lb && a < lb + emulator::LPC_LOAD_MAX_SIZE)
+                       ? static_cast<long>(a - lb) : -1L;
+        };
+        std::printf("[FAULT]  r0=%08lx r1=%08lx r2=%08lx r3=%08lx r12=%08lx\n",
+                    (unsigned long)frame->r0, (unsigned long)frame->r1,
+                    (unsigned long)frame->r2, (unsigned long)frame->r3,
+                    (unsigned long)frame->r12);
+        std::printf("[FAULT]  LR=%08lx (LPC 0x%lx)  xPSR=%08lx  SP=%08lx\n",
+                    (unsigned long)frame->lr, lpc(frame->lr & ~1u),
+                    (unsigned long)frame->xpsr, (unsigned long)guest_sp);
+        std::printf("[FAULT]  r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
+                    (unsigned long)r4_r11[0], (unsigned long)r4_r11[1],
+                    (unsigned long)r4_r11[2], (unsigned long)r4_r11[3]);
+
+        // Bei IACCVIOL (Code-Fetch an nicht gemappter Adresse): wilder Sprung,
+        // typ. ueber korrupten C++-Vtable-/Funktionspointer. LR = Aufrufer,
+        // r0 = this-Pointer bei virtuellen Aufrufen. Vtable-Kette aufdroeseln.
+        if (SCB->CFSR & 0x01u) {
+            uint32_t vt = 0, m0 = 0, m2 = 0, m11 = 0;
+            std::printf("[FAULT]  Code-Fetch (IACCVIOL): wilder Sprung nach 0x%08lx\n",
+                        (unsigned long)frame->pc);
+            if (guest_read32_safe(frame->r0, vt)) {
+                std::printf("[FAULT]  this=r0=0x%08lx -> vtable=0x%08lx\n",
+                            (unsigned long)frame->r0, (unsigned long)vt);
+                bool b0  = guest_read32_safe(vt + 0,  m0);
+                bool b2  = guest_read32_safe(vt + 8,  m2);
+                bool b11 = guest_read32_safe(vt + 44, m11);
+                std::printf("[FAULT]  vtable[0]=%s vtable[2]=%s vtable[11]=%s\n",
+                            b0  ? "" : "?", b2 ? "" : "?", b11 ? "" : "?");
+                std::printf("[FAULT]   = 0x%08lx / 0x%08lx / 0x%08lx\n",
+                            (unsigned long)m0, (unsigned long)m2,
+                            (unsigned long)m11);
+            } else {
+                std::printf("[FAULT]  this=r0=0x%08lx (nicht gemappt)\n",
+                            (unsigned long)frame->r0);
+            }
+        }
         SCB->CFSR = SCB->CFSR;          // Sticky-Bits clearen
         // Endlosschleife mit Watchdog-Reset.
         watchdog_enable(50, true);
