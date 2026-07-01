@@ -65,6 +65,13 @@ an, ohne dass die CLI verbunden sein muss:
 So kann man am USB-Stecker schon vor dem Öffnen des Terminals erkennen,
 ob die Firmware bereit ist.
 
+> **Fehler halten an statt zu rebooten:** Ein nicht emulierbarer Gast-Fehler
+> führt **nicht** mehr zu einem Reset des RP2350. Der Gast geht in den Zustand
+> `Faulted` (LED flackert), die CLI bleibt bedienbar, und der komplette
+> Fehlerbericht erscheint seriell **und** als Datei `FAULT.TXT` auf dem
+> USB-Laufwerk (siehe Abschnitt 3a). Auch ein `NVIC_SystemReset()` der Firmware
+> (z. B. Selfbus-Neustart) startet nur den **Gast** neu, nicht das ganze Board.
+
 ---
 
 ## 3. CLI-Übersicht (CDC#0)
@@ -128,6 +135,77 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 
 ---
 
+## 3a. Diagnose: `stats`, `FAULT.TXT` und Stacktrace
+
+### `stats` / `status` – Bedeutung der Felder
+
+```
+State=Running PC=0x20002fdd mmio-traps=1031 MMIO R=268 W=320  GPIO=4  PLL-cfg=1  NVIC-W=8
+CPU-target=48000000 Hz  GDB=off
+```
+
+| Feld          | Bedeutung                                                                 |
+|---------------|---------------------------------------------------------------------------|
+| `State`       | `Idle` bereit · `Running` Gast läuft · `Halted` angehalten (Debugger) · `Faulted` Gast-Fehler |
+| `PC`          | Reset-PC, **nur beim Start gesetzt** – kein Live-Programmzähler. Ändert sich während der Ausführung nicht. |
+| `mmio-traps`  | Summe aller erfolgreich emulierten Trap-Zugriffe (MMIO + RAM-Fallback + Flash-Lesevorgänge). Steigt, solange der Gast mit LPC-Peripherie arbeitet. |
+| `MMIO R / W`  | Lese-/Schreibzugriffe auf modellierte LPC-Peripherie                      |
+| `GPIO`        | GPIO-Schreibzugriffe (Pin-Ausgaben)                                       |
+| `PLL-cfg`     | Anzahl PLL-/Takt-Rekonfigurationen des Gastes                             |
+| `NVIC-W`      | Schreibzugriffe auf den Schatten-NVIC (`ISER`/`ICER`/`ISPR`/`ICPR`/`IPR`) |
+| `CPU-target`  | übernommene LPC-Soll-Frequenz (Zeitbasis der Timer/UART-Baud). Der **reale** RP2350-Takt bleibt bei 150 MHz. |
+| `GDB`         | GDB-Stub aktiv (`on`/`off`)                                               |
+
+> **Eingefrorene Zähler sind normal:** Bleiben `mmio-traps` bei erneutem
+> `stats` konstant, dreht der Gast meist eine Warteschleife (z. B. KNX-Bus-
+> Idle ohne Telegramme). Der Gast läuft trotzdem.
+
+### `FAULT.TXT` / Stacktrace lesen
+
+Bei einem nicht emulierbaren Fehler hält der Gast an (`State=Faulted`) und der
+vollständige Bericht wird seriell ausgegeben **und** als `FAULT.TXT` auf das
+USB-Laufwerk gelegt – so ist die Analyse **auch ohne CLI/Serial** möglich.
+Kopfzeile:
+
+```
+[FAULT] HardFault @PC=0x00004e4c (LPC 0xffffffff) CFSR=0x00000000 HFSR=0x40000000
+```
+
+* **Typ** – `HardFault`, `UsageFault`, `non-decodable` (unbekannte Instruktion
+  am Trap) oder `mmio rejected` (Zugriff auf nicht modellierte Peripherie).
+* **PC** – Programmzähler beim Fehler. `LPC 0x…` = Offset im LPC-Flash-Abbild;
+  `0xffffffff` = die Adresse liegt nicht im Flash-Abbild.
+* **CFSR/HFSR** – ARM-Fault-Statusregister; die gesetzten Bits werden darunter
+  im Klartext aufgeschlüsselt.
+
+Weitere Zeilen: `r0`–`r12`, `LR` (+ LPC-Offset), `xPSR`, `SP`, `r4`–`r7`, die
+gefehlerte Instruktion `instr@PC` (zwei 16-Bit-Halbworte) und ggf. `MMFAR`/`BFAR`
+(Fehleradresse).
+
+**Abkürzungen der Fault-Bits:**
+
+| Bit            | Bedeutung                                                          |
+|----------------|--------------------------------------------------------------------|
+| `IACCVIOL`     | Code-Ausführung an gesperrter Adresse (wilder Sprung/Funktionspointer) |
+| `DACCVIOL`     | Datenzugriff an gesperrter Adresse (MPU)                           |
+| `MSTKERR` / `MUNSTKERR` | Fehler beim Exception-Stacking / -Unstacking              |
+| `IBUSERR`      | Bus-Fehler beim Instruktions-Fetch                                 |
+| `PRECISERR` / `IMPRECISERR` | präziser / verzögerter Datenbus-Fehler                |
+| `UNDEFINSTR`   | illegale/unbekannte Instruktion                                    |
+| `INVSTATE`     | ungültiger Thumb-/EPSR-Zustand (z. B. Sprung ohne Thumb-Bit)       |
+| `INVPC`        | ungültiger `EXC_RETURN`/PC bei Exception-Rückkehr                   |
+| `NOCP`         | Coprozessor/FPU angesprochen, aber nicht verfügbar                 |
+| `STKOF`        | Stack-Overflow (Stack-Limit verletzt)                              |
+| `UNALIGNED`    | nicht ausgerichteter Speicherzugriff                               |
+| `DIVBYZERO`    | Division durch Null                                                |
+| `FORCED`       | eskalierter Fault (häufig: Fehler in kritischer Sektion mit gesperrten IRQs) |
+| `VECTTBL`      | Fehler beim Lesen der Vektortabelle                                |
+
+Weiterlaufen: CLI `reset` bzw. `run`, oder neue Firmware aufspielen. `FAULT.TXT`
+wird beim nächsten Fehler überschrieben (nur im RAM – nach Power-Cycle weg).
+
+---
+
 ## 4. Firmware aufspielen
 
 > **Wichtig – additives Laden:** Alle drei Upload-Wege schreiben seit
@@ -141,6 +219,19 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 
 Der Emulator stellt sich auch als **USB-Mass-Storage-Volume** dar
 (LUN0, FAT12, 256 KiB, Label `LPC1115EMU`).
+
+Auf dem Laufwerk liegen ab Werk zwei generierte Dateien:
+
+| Datei         | Inhalt                                                              |
+|---------------|--------------------------------------------------------------------|
+| `HELP.HTM`    | Kurzanleitung (im Browser lesbar) – CLI, CONFIG.INI, `stats`, FAULT-Abkürzungen, Pinmap. |
+| `CONFIG.INI`  | **Aktuelle** Einstellungen als aktive Zeilen (inkl. GPIO-Mapping) + auskommentierte Optionen mit Kurzerklärung. Editierbar. |
+| `FAULT.TXT`   | erscheint nur nach einem Gast-Fehler (kompletter Fehlerbericht, siehe Abschnitt 3a). |
+
+Die `CONFIG.INI` wird bei jedem Boot aus dem aktuell geladenen Zustand neu
+erzeugt und ist damit stets eine korrekte Referenz. Ein bloßes Auswerfen ohne
+Änderung löst **kein** erneutes Anwenden aus (Inhalts-Hash-Erkennung) – per CLI
+vorgenommene Änderungen bleiben also erhalten.
 
 1. RP2350 anstecken → Volume erscheint im Datei-Manager / Finder.
 2. Datei `BOOT.HEX` (Intel-HEX, max. 64 KiB) hineinkopieren.
@@ -526,7 +617,7 @@ emu> uart stop
 | LED dauerhaft dunkel nach Reset           | Firmware crasht früh / nicht geflasht – UF2 erneut kopieren |
 | LED blinkt 1 Hz, kein USB-Gerät sichtbar  | Host-USB-Kabel defekt / nur Ladekabel              |
 | `info` zeigt Reset = 0x0                  | HEX-Datei unvollständig empfangen → erneut         |
-| `run` führt sofort zu `HardFault`         | Stack-Top liegt außerhalb 0x10000000-0x10001FFF    |
+| LED flackert (8 Hz), `stats` zeigt `Faulted` | Gast-Fehler – `FAULT.TXT` auf dem Laufwerk bzw. seriellen `[FAULT]`-Block lesen (Abschnitt 3a) |
 | GDB sagt „Remote connection closed"       | TinyUSB hat Re-Enum gemacht – Port neu öffnen      |
 | `swd start` → „SWCLK must be SWDIO+1"     | PIO-Programm nutzt relatives `wait pin 1`          |
 | OpenOCD findet kein Target                | Pull-Ups (10 kΩ) auf SWDIO, GND verbinden!         |

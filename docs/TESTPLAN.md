@@ -28,7 +28,7 @@ Legende: ⬜ offen · ✅ ok · ❌ Fehler
 |---|------|----------|-----------|:------:|
 | A1 | UF2-Flash | Board im BOOTSEL anstecken, `emulator.uf2` kopieren | Board re-enumeriert | ⬜ |
 | A2 | CDC-Ports | Geräte-Manager / `ls /dev/ttyACM*` | 3 serielle Ports (CLI, GDB, UART-Bridge) | ⬜ |
-| A3 | MSC-Volume | Datei-Explorer | Laufwerk `LPC1115EMU` (FAT12) sichtbar | ⬜ |
+| A3 | MSC-Volume | Datei-Explorer | Laufwerk `LPC1115EMU` (FAT12) mit `HELP.HTM` + `CONFIG.INI` sichtbar | ⬜ |
 | A4 | CLI-Prompt | Terminal an CDC#0, Enter | `emu>`-Prompt | ⬜ |
 | A5 | Status-LED | ohne geladene Firmware | Onboard-LED (GP25) ~1 Hz Heartbeat | ⬜ |
 
@@ -39,6 +39,8 @@ Legende: ⬜ offen · ✅ ok · ❌ Fehler
 | B1 | Hilfe | `help` | Befehlsliste inkl. `xmodem`, `erase`, `cfg …` | ⬜ |
 | B2 | Version | `version` | `LPC1115-Emu  RP2350  SDK=2.2.0` | ⬜ |
 | B3 | Status | `status` (oder `stats`) | Zustand, Zähler, GDB-Status | ⬜ |
+| B5 | HELP.HTM | `HELP.HTM` vom Laufwerk im Browser öffnen | Kurzanleitung wird angezeigt | ⬜ |
+| B6 | CONFIG.INI-Referenz | `CONFIG.INI` vom Laufwerk öffnen | aktive Zeilen = aktueller Zustand (inkl. `pin.*`), Optionen auskommentiert | ⬜ |
 | B4 | Reset | `reset` | Neustart, erneuter Prompt | ⬜ |
 
 ## C — Firmware-Upload (alle Wege)
@@ -147,6 +149,19 @@ Beispiel-HEX aus [../examples](../examples).
 | L4 | EEPROM-Persist | Parameter via ETS schreiben, `reset` | Parameter überleben | ⬜ |
 | L5 | OTA-Update | App per KNX in emulierten BL programmieren | neue App startet (Handover) | ⬜ |
 
+## M — Fehleranzeige & Robustheit
+
+| # | Test | Schritte | Erwartung | Status |
+|---|------|----------|-----------|:------:|
+| M1 | Fault hält an | Firmware mit provoziertem Fehler `run` | `State=Faulted`, LED flackert, **kein** Board-Reset, CLI weiter bedienbar | ⬜ |
+| M2 | FAULT.TXT | nach M1 Laufwerk öffnen | `FAULT.TXT` mit `[FAULT]`-Block (Typ, CFSR/HFSR, Register, `instr@PC`) | ⬜ |
+| M3 | Recovery | nach M1 `reset` bzw. neue `BOOT.HEX` | Gast läuft wieder / neue Firmware startet | ⬜ |
+| M4 | NVIC_SystemReset | Firmware ruft `NVIC_SystemReset()` (z. B. Selfbus-Neustart) | nur Gast startet neu, USB/CLI bleiben, kein Board-Reset | ⬜ |
+| M5 | Reflash bei Betrieb | während `Running` neue `BOOT.HEX` aufspielen (MSC oder `upload`) | läuft sauber durch (Gast wird gestoppt/neu gestartet), kein Hang | ⬜ |
+| M6 | IRQ-Dauerlauf | interruptgetriebene Firmware (Timer/KNX) mehrere Minuten laufen lassen | keine Faults durch IRQ-Rückkehr; Zähler steigen | ⬜ |
+| M7 | Re-Eject ohne Änderung | Laufwerk ohne Schreibzugriff erneut auswerfen | **kein** erneutes Laden/Neustart (Inhalts-Hash-Dedup) | ⬜ |
+| M8 | CLI-Änderung bleibt | `pinmap set …`, `cfg save`, dann Laufwerk auswerfen | CLI-Änderung wird **nicht** durch stale CONFIG.INI überschrieben | ⬜ |
+
 ---
 
 ## Fehlerbilder (Kurzreferenz)
@@ -154,7 +169,7 @@ Beispiel-HEX aus [../examples](../examples).
 | Symptom | Wahrscheinliche Ursache |
 |---------|--------------------------|
 | Selbsttest-UART stumm | Terminal nicht 19200 8N1 oder falscher Port (uart0 ≠ CDC#0) |
-| `run` → HardFault (LED flackert) | Stack-Top außerhalb 0x10000000–0x10001FFF |
+| `run` → HardFault (LED flackert) | Stack-Top außerhalb 0x10000000–0x10001FFF — Details in `FAULT.TXT` / seriellem `[FAULT]`-Block |
 | Zweite App ersetzt BL nicht | Laden ist **additiv** – vor Vollersatz `erase` |
 | BL springt nicht in App | `app_start` ≠ `applicationFirstAddress`, oder `autodesc=off` |
 | `xmodem` „kein Sender erkannt" | Sender ohne CRC/1K, falscher Port |

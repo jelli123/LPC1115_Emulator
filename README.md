@@ -12,17 +12,19 @@ native Geschwindigkeit; Interpretation findet nicht statt.
 | USB-CDC #0  CLI/stdio         |    | unprivileged Thread Mode  |
 | USB-CDC #1  GDB Remote (opt.) |    | PSP-Stack                 |
 | Storage (Wear-Leveling, CRC)  |    | Native LPC-Firmware in    |
-| peripherals::mmio_*           |    | RP2350-SRAM @ 0x20040000  |
+| peripherals::mmio_*           |    | RP2350-SRAM (aligned Array)|
 | pio_glue (Edge-Capture)       |    +---------------------------+
 +-------------------------------+
               ^                          Trap & Emulate
               |
      +-- ARMv8-M MPU ---------------+ ────► BusFault / MemManage
-     | RW: 0x20000000-2008_1FFF     |        ↓
-     | RW: 0xE000_0000-E000_E0FF    |        decoded LDR/STR
-     | TRAP: 0xE000_E100-E000_E4FF  |        ↓
-     | RW: 0xE000_E500-E00F_FFFF    |        peripherals::mmio_* / vnvic
-     | TRAP: 0x4000_0000-4FFF_FFFF  |
+     | RW: Gast-Image (64K) + RAM   |        ↓
+     | RX: enter_guest-Trampolin    |        decoded LDR/STR
+     | RW: 0xE000_0000-E000_E0FF    |        ↓
+     | TRAP:0xE000_E100-E000_E4FF   |        peripherals::mmio_* / vnvic
+     | RO:  0xE000_ED00-E000_ED1F   |  ◄─ AIRCR-Trap (nur Gast-Reset)
+     | RW: uebriger PPB-Bereich     |
+     | (uebriges SRAM: gesperrt)    |
      +------------------------------+
 ```
 
@@ -76,8 +78,16 @@ Der Gast schreibt seine PLL-Konfiguration in `LPC SYSCON`
 auf `SYSPLLCTRL`/`SYSPLLCLKSEL`/`MAINCLKSEL`/`SYSAHBCLKDIV` läuft durch
 [peripherals::mmio_write8](src/peripherals.cpp). Sobald ein vollständiges
 32-bit-Wort beisammen ist, berechnet der Handler die Soll-Frequenz nach
-`F_OUT = F_CLKIN × (MSEL+1)` und ruft `set_sys_clock_khz()` auf — der
-RP2350 läuft anschließend mit dieser Frequenz.
+`F_OUT = F_CLKIN × (MSEL+1)` und übernimmt sie als **Zeitbasis der emulierten
+Peripherie** (Timer-Tick-Skalierung, UART-Baud). Der **reale** RP2350-Takt
+bleibt bei 150 MHz (SDK-Default) und wird bewusst **nicht** umgeschaltet:
+
+* Die emulierten Timer skalieren reale Wall-Clock-Zeit (`time_us_64()`) mit
+  der Soll-Frequenz — der Silizium-Takt ist für die Genauigkeit irrelevant.
+* Trap-and-Emulate braucht die volle 150-MHz-Reserve; ein Herunterregeln
+  würde den Emulator selbst ausbremsen.
+* Ein `set_sys_clock_khz()` von Core 1 aus würde zudem den USB-/CLI-Betrieb
+  auf Core 0 stören.
 
 Vorteil gegenüber HEX-Heuristik: kein Pattern-Matching auf Code; die
 echten Werte werden zur Laufzeit übernommen.
@@ -106,6 +116,13 @@ Gast bemerkt nicht, dass die Exception nicht aus echter NVIC-Hardware
 kommt. Das funktioniert **automatisch für jeden LPC-IRQ-Index** (0..31)
 — der Handler-Pointer wird live aus der Gast-Vector-Tabelle geholt.
 
+Weil der injizierte Handler im **Thread-Mode** (mit `LR=0xFFFFFFFD`) läuft,
+ist sein regulärer Rücksprung (`POP {pc}`/`BX LR`) dort keine gültige
+Exception-Rückkehr — der Core faultet beim Anspringen von `0xFFFFFFFC`. Dieser
+Fall wird im Fault-Handler ([fault.cpp](src/fault.cpp) `try_injected_irq_return`)
+abgefangen: er legt den darunter liegenden Original-Frame frei und setzt den
+unterbrochenen Gast-Code nahtlos fort.
+
 Mapping LPC-Peripherie → IRQ-Index ist zentral in
 [lpc_irqs.h](src/lpc_irqs.h) (Quelle: UM10398 Tab. 51) hinterlegt.
 
@@ -114,7 +131,7 @@ Mapping LPC-Peripherie → IRQ-Index ist zentral in
 | Peripherie       | Status      | IRQ        | Anmerkung                       |
 |------------------|-------------|------------|---------------------------------|
 | GPIO0            | nutzbar     | -          | Mapping → RP2350-GPIO über `pin`; Eingänge lesen echte Pin-Pegel |
-| SYSCON / PLL     | nutzbar     | -          | retargeted RP2350-PLL           |
+| SYSCON / PLL     | nutzbar     | -          | Soll-Takt als Zeitbasis; RP2350 bleibt 150 MHz |
 | SysTick          | nativ       | (SysTick)  | M0/M33 register-kompatibel      |
 | UART0 (16550)    | nutzbar     | UART0 (21) | Backend = RP2350 `uart0`        |
 | CT16B0/CT16B1    | nutzbar     | 16/17      | Match-IRQ via irq_inject        |
@@ -313,11 +330,33 @@ KNX-Bus** in den emulierten Bootloader geschrieben werden (IAP-Pfad).
 ## Sicherheits-Eigenschaften
 
 * MPU isoliert den Gast: er kann **nicht** in Host-Speicher schreiben
-  (XIP, Konfiguration, Storage, Host-Stack).
+  (XIP, Konfiguration, Storage, Host-Stack). Dem unprivilegierten Gast sind
+  **nur** die eigenen SRAM-Bereiche freigegeben (Code-Image 64 KiB, Gast-RAM
+  8 KiB, das `enter_guest`-Trampolin) plus PPB — der übrige RP2350-SRAM
+  (TinyUSB-Puffer, Core-Stacks) bleibt gesperrt. Ein wilder Pointer/Überlauf
+  wird so zu einem sauberen Trap statt zu stiller Korruption.
+* Der SCB-Kontrollblock (`0xE000ED00-0xED1F`) ist für den Gast **read-only**:
+  ein `AIRCR.SYSRESETREQ` (`NVIC_SystemReset()`) trapt und startet nur den
+  **Gast** neu — nicht das echte RP2350-Silizium.
 * `MPU.PRIVDEFENA = 1` für Host → Host-Code sieht weiterhin den vollen
   Speicher; Gast (unprivileged) **nur** explizit erlaubte Regionen.
 * Privileg wechselt beim Sprung in den Gast — Gast kann sich nicht
   selbst re-privilegieren, ohne durch unsere Handler zu laufen.
+
+## Fehlerbehandlung & Diagnose
+
+Ein nicht emulierbarer Gast-Fehler führt **nicht** zu einem Board-Reset,
+sondern hält den Gast an (`State=Faulted`, LED flackert 8 Hz). Core 0 (USB/CLI)
+läuft weiter. Der komplette Fault-Bericht (Typ, `CFSR/HFSR` im Klartext,
+Register, gefehlerte Instruktion) erscheint
+
+* seriell auf CDC#0 als `[FAULT] …`-Block **und**
+* als Datei `FAULT.TXT` auf dem USB-Laufwerk (Analyse ohne CLI möglich).
+
+Das Laufwerk enthält zudem ab Werk `HELP.HTM` (Kurzanleitung im Browser) und
+eine aus dem aktuellen Zustand generierte `CONFIG.INI` (aktive Einstellungen +
+auskommentierte Optionen). Die Feld- und Abkürzungs-Erklärungen stehen in
+[docs/USERGUIDE.md](docs/USERGUIDE.md#3a-diagnose-stats-faulttxt-und-stacktrace).
 * Fault-Handler clearn `CFSR`-Sticky-Bits explizit.
 * CRC32 schützt Konfig-Snapshot und Firmware-Image.
 * Watchdog-Reset bei nicht-decodierbaren Faults und HardFaults.

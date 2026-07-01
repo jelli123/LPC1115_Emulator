@@ -16,16 +16,20 @@ Das ist ein klassischer **Trap-and-Emulate-Hypervisor** ohne Interpreter.
 
 ## 2. Speicher-Layout
 
-| Region                   | Guest-Sicht (LPC)        | Host-Realität (RP2350)        |
+| Region                   | Guest-Sicht (LPC)        | Host-Realität (RP2350)         |
 |--------------------------|--------------------------|--------------------------------|
-| Code-Flash               | `0x00000000-0x0000FFFF`  | RAM-Image @ `0x20040000`       |
-| RAM                      | `0x10000000-0x10001FFF`  | RAM @ `0x20060000`             |
+| Code-Flash               | `0x00000000-0x0000FFFF`  | aligned SRAM-Array (`load_base()`) |
+| RAM                      | `0x10000000-0x10001FFF`  | aligned SRAM-Array (`guest_ram_base()`) |
 | APB-Peripherie           | `0x40000000-0x4007FFFF`  | **MPU-Trap** → `peripherals::` |
 | AHB-GPIO                 | `0x50000000-0x5003FFFF`  | **MPU-Trap** → `peripherals::` |
-| PPB / SCB / SysTick      | `0xE000E000-0xE000EFFF`  | **echt** (Cortex-M33)          |
+| PPB / SCB / SysTick      | `0xE000E000-0xE000EFFF`  | **echt** (Cortex-M33), außer NVIC + SCB-Ctrl |
 | NVIC                     | `0xE000E100-0xE000E4FF`  | **MPU-Trap** → `vnvic::`       |
-| IAP-ROM-Stub             | `0x1FFF1000-0x1FFF1FFF`  | RAM-Stub mit `BKPT`-Trampolin  |
+| SCB-Ctrl (inkl. AIRCR)   | `0xE000ED00-0xE000ED1F`  | **read-only** → Trap (`NVIC_SystemReset` → nur Gast) |
+| IAP-ROM-Einsprung        | `0x1FFF1FF1`             | Prefetch-Trap → `iap::dispatch` |
 
+Die SRAM-Adressen sind **nicht** fest, sondern werden als `alignas`-Arrays
+allokiert (`g_firmware_image` 256-aligned für VTOR, `g_guest_ram` 32-aligned);
+die Laufzeit-Basis liefern `emulator::load_base()` / `guest_ram_base()`.
 Der Reset-Vector aus dem geladenen Image wird beim `run` in einen
 synthetischen Initial-Frame auf der Guest-PSP geschrieben; danach erfolgt
 ein `BX` mit `EXC_RETURN = 0xFFFFFFFD` (Thread, PSP, unprivilegiert).
@@ -34,21 +38,37 @@ ein `BX` mit `EXC_RETURN = 0xFFFFFFFD` (Thread, PSP, unprivilegiert).
 
 ## 3. MPU-Konfiguration
 
-ARMv8-M MPU mit acht Regionen:
+ARMv8-M MPU, eng gefasst — dem unprivilegierten Gast werden **nur die
+eigenen** SRAM-Bereiche freigegeben ([src/mmu.cpp](../src/mmu.cpp)):
 
-| #  | Bereich                  | Attribute                        |
-|----|--------------------------|----------------------------------|
-| 0  | Host-Code (XIP)          | RX, privilegiert + ungelegt      |
-| 1  | Host-Stack/RAM           | RW, privilegiert                 |
-| 2  | Guest-Code-Image         | RX, alle                         |
-| 3  | Guest-RAM                | RW + XN, alle                    |
-| 4  | LPC-Peripherie (APB)     | **kein Zugriff** für Guest       |
-| 5  | LPC-GPIO                 | **kein Zugriff** für Guest       |
-| 6  | NVIC-Range               | **kein Zugriff** für Guest       |
-| 7  | IAP-ROM-Stub             | RX, alle                         |
+| #  | Bereich                       | Attribute                         |
+|----|-------------------------------|-----------------------------------|
+| 0  | Gast-Code-Image (64 KiB)      | RWX, Normal                       |
+| 1  | Gast-RAM (8 KiB)              | RWX, Normal                       |
+| 2  | `enter_guest`-Trampolin (32 B)| RX, Normal                        |
+| 3  | PPB Teil A `0xE0000000-E0FF`  | RW, Device, XN                    |
+| 4  | PPB Teil B1 `0xE500-ECFF`     | RW, Device, XN                    |
+| 5  | SCB-Ctrl `0xED00-ED1F`        | **RO**, Device, XN → AIRCR-Trap   |
+| 6  | PPB Teil B2 `0xED20-0xE00FFFFF`| RW, Device, XN                   |
 
-`PRIVDEFENA = 1` lässt den Host (Core 0, privilegiert) alles sehen –
-sonst nur, was Region 0/1 erlaubt.
+* `PRIVDEFENA = 1`: der **Host** (Core 0, privilegiert) sieht via Default-Map
+  weiterhin den vollen Speicher (Flash-Code, RP2350-HW, TinyUSB). Der **Gast**
+  (unprivilegiert) sieht nur die Regionen oben.
+* Der übrige RP2350-SRAM (TinyUSB-Puffer, Core-Stacks, Emulator-Daten) ist für
+  den Gast **nicht** freigegeben — ein wilder Pointer/Heap-/Stack-Überlauf trapt
+  sauber, statt Host-Speicher still zu korrumpieren.
+* Die **NVIC-Range** `0xE000E100-0xE000E4FF` ist bewusst *nicht* whitelistet →
+  jeder Gast-Zugriff trapt nach [vnvic](../src/vnvic.cpp).
+* Der **SCB-Kontrollblock** `0xE000ED00-0xED1F` ist read-only: Gast-Schreib-
+  zugriffe (v. a. `AIRCR.SYSRESETREQ` via `NVIC_SystemReset()`) trappen und
+  werden emuliert — ein `SYSRESETREQ` startet nur den **Gast** neu, nicht das
+  echte RP2350-Silizium. Lesezugriffe (CPUID/ICSR-Status) laufen dank RO nativ.
+* LPC-Peripherie `0x40000000-0x4FFFFFFF` liegt in **keiner** Region → für den
+  unprivilegierten Gast gesperrt → Trap nach `peripherals::mmio_*`.
+* Das `enter_guest`-Trampolin muss im SRAM liegen (`__not_in_flash_func`,
+  32-Byte-aligned): nach dem Privilegienwechsel (`msr control`) erfolgt der
+  nächste Instruktions-Fetch unprivilegiert — läge er im XIP-Flash, würde die
+  MPU ihn als `IACCVIOL` abweisen und der Gast könnte nie starten.
 
 ---
 
@@ -134,6 +154,14 @@ Cortex-M-Exception-Frame auf der Guest-PSP, lädt `PC` aus
 `vector_table[16+N]`, setzt `LR = EXC_RETURN`, und kehrt zurück. Der
 Guest landet im richtigen ISR.
 
+Da der injizierte Handler im **Thread-Mode** läuft (`LR=0xFFFFFFFD`), ist sein
+regulärer Rücksprung dort keine gültige Exception-Rückkehr; der Core faultet
+beim Anspringen von `0xFFFFFFFC`. `fault.cpp:try_injected_irq_return()` erkennt
+den `EXC_RETURN`-artigen PC im Thread-Mode, hebt den PSP um den 32-Byte-Fault-
+Frame an und legt so den darunter liegenden Original-Frame frei — der Gast setzt
+nahtlos fort. `pendsv_inject_c()` läuft nur auf Core 1 (Guard `get_core_num()`),
+da das überschriebene PendSV-Symbol auch in Core 0s Vektortabelle steht.
+
 IRQ-Tabelle: [src/lpc_irqs.h](../src/lpc_irqs.h) (UM10398 Tab. 51).
 
 ---
@@ -142,7 +170,7 @@ IRQ-Tabelle: [src/lpc_irqs.h](../src/lpc_irqs.h) (UM10398 Tab. 51).
 
 | Block           | Status | Hinweise                                      |
 |-----------------|--------|-----------------------------------------------|
-| SYSCON / PLL    | ✅     | `MSEL`-Schreiben → `set_sys_clock_khz()`      |
+| SYSCON / PLL    | ✅     | `MSEL`-Schreiben → Soll-Takt als Zeitbasis (RP2350-Takt unverändert) |
 | GPIO0..GPIO3    | ✅     | echte RP-GPIOs via `pin_map`, masked DATA     |
 | IOCON           | ✅     | RAM-Schatten, kein Effekt (RP-Pinmux ist los) |
 | UART0 (16550)   | ✅     | Backend = RP2350 `uart0`                      |
@@ -158,9 +186,14 @@ IRQ-Tabelle: [src/lpc_irqs.h](../src/lpc_irqs.h) (UM10398 Tab. 51).
 | RTC             | ❌     | LPC1115 hat keinen RTC-Block (entfällt)       |
 
 PLL-Modell: `F_OUT = F_CLKIN × (M+1)`, gültig 156-320 MHz CCO.
-Re-Targeting wird in einem **Post-Hook** nach dem letzten Byte des
-SYSCON-Word-Schreibens ausgeführt, damit kein 4-faches Re-Targeting
-entsteht.
+Die berechnete Soll-Frequenz wird in einem **Post-Hook** nach dem letzten
+Byte des SYSCON-Word-Schreibens übernommen (kein 4-faches Re-Targeting) —
+als **Zeitbasis** der emulierten Timer/UART-Baud (`g_current_hz`). Der reale
+RP2350-`clk_sys` bleibt bewusst bei 150 MHz (SDK-Default): die Timer skalieren
+reale Wall-Clock-Zeit, und ein `set_sys_clock_khz()` von Core 1 aus würde
+USB/CLI auf Core 0 stören. Einbuße: gast-eigene SysTick/Busy-Loops laufen mit
+150 MHz statt der LPC-Soll-Frequenz; das Bit-Timing (KNX) läuft über die
+real-zeit-skalierten CT16/CT32-Capture/Match-Modelle und bleibt korrekt.
 
 ---
 
@@ -397,7 +430,75 @@ der TX läuft synchron zur PIO-Clock (typ. 150 MHz / Default-Clkdiv =
 1.0). Die effektive obere SWCLK-Frequenz wird dann durch die
 RX-Sampling-Latenz und den Trn-Pfad bestimmt; konservativ
 **≈ 25 MHz** SWCLK.
+---
 
+## 16. Fehler-Handling & `FAULT.TXT`
+
+Ein nicht emulierbarer Gast-Fault führt **nicht** mehr zu einem Watchdog-/
+Board-Reset (der früher die Diagnose und die USB-Sitzung vernichtete), sondern
+zu einem sauberen **Halt** ([src/fault.cpp](../src/fault.cpp) `enter_fatal_halt`):
+
+* `emulator::notify_guest_faulted()` setzt `State::Faulted` (LED flackert 8 Hz).
+* Core 1 parkt in `for(;;) __wfe()`; **Core 0 (USB/CLI) läuft weiter**.
+* Recovery per CLI `reset`/`run` oder neues Image.
+
+**Diagnose (dual-sink).** `femit()` schreibt jede `[FAULT]`-Zeile gleichzeitig
+seriell und in einen RAM-Puffer. `print_fault_cause()` schlüsselt `CFSR/HFSR`
+in Klartext auf (`IACCVIOL`, `UNDEFINSTR`, `FORCED`, …); `print_exc_diag()`
+ergänzt Register, `instr@PC` und `MMFAR/BFAR`.
+
+**`FAULT.TXT` auf dem USB-MSC** (mbed-DAPLink-Stil). Am Ende der Fault-Sequenz
+gibt `report_commit()` den Puffer frei; `usb_msc::poll()` (Core 0) baut ein
+frisches Volume mit `FAULT.TXT` (+ `HELP.HTM`/`CONFIG.INI`) und erzwingt per
+simuliertem Medienwechsel (`test_unit_ready` meldet kurz *not present*, dann
+*UNIT ATTENTION*) ein Neueinlesen des Hosts. So ist die Analyse ohne CLI/Serial
+möglich. Der Report liegt nur im RAM (nach Power-Cycle weg).
+
+**Eskalierte Faults unter `PRIMASK`.** Läuft der Gast in einer kritischen
+Sektion (`__disable_irq()`, `PRIMASK=1`) und trapt dort (Flash-Funktionspointer-
+Sprung oder MMIO), ist die MemManage/BusFault-Priorität maskiert und der Trap
+eskaliert zu **HardFault** (`HFSR.FORCED`). `hardfault_c()` behandelt das
+gestuft: (1) rohe Code-Fetch-Adresse relozieren, (2) WFI-Wakeup, (3) den vollen
+Memory-Fault-Emulator (`handle_memfault_c`) delegieren. Damit laufen auch
+`PRIMASK`-nutzende Firmwares (z. B. bim112/BCU2) transparent.
+
+**AIRCR-Trap.** `NVIC_SystemReset()` schreibt `SCB->AIRCR` mit `SYSRESETREQ`.
+Da der SCB-Kontrollblock read-only gemappt ist, trapt der Schreibzugriff und
+wird in `handle_memfault_c` erkannt (VECTKEY `0x05FA` + `SYSRESETREQ`): statt
+das Silizium zu rebooten, löst er `emulator::request_guest_reset()` aus — nur
+der Gast startet neu, USB/CLI bleiben.
+
+---
+
+## 17. Flash-Schreiben bei laufendem Gast (Multicore-Lockout)
+
+Ein Flash-Erase/Program stallt XIP; läuft währenddessen Code aus dem Flash,
+crasht der betroffene Core. Betroffen sind zwei Pfade:
+
+* **Core 0 schreibt** (CLI `upload`/`erase`/`finalize`, `xmodem`, `cfg save`,
+  USB-MSC-Eject): Vor dem Schreiben wird der Gast pausiert
+  (`emulator::FlashPauseGuard` → `pause_for_flash()` → `stop()`), sodass Core 1
+  in der SDK-Spin-Schleife steht (SDK-VTOR). `stop()` legt zudem Core 0s
+  `SIO_IRQ_FIFO` während Reset+Relaunch still, damit der Lockout-Handler nicht
+  die Multicore-Handshake-Bytes wegdrainiert.
+* **Core 1 schreibt** (IAP `persist()` im Fault-Handler, z. B. Selfbus-EEPROM/
+  OTA): sperrt Core 0 per `multicore_lockout_start_blocking()` aus. Dafür ist
+  Core 0 in [main.cpp](../src/main.cpp) als `multicore_lockout_victim_init()`
+  registriert; sein VTOR bleibt stets die SDK-Tabelle, der Lockout-Handler ist
+  also immer erreichbar.
+
+`storage::FlashGuard` ist core-aware und sperrt jeweils den *anderen* Core aus,
+sofern dieser als Victim initialisiert ist. Da ein Core-0-Flash immer zuerst den
+Gast pausiert, können sich die beiden Lockout-Pfade nicht gegenseitig
+verklemmen. Kosten: Ein Core-0-Flash bei laufendem Gast startet den Gast neu
+(beim Reflash gewollt; bei `cfg save` kurzer Neustart) — kein Hang, keine stille
+Korruption.
+
+**Cross-Core-Halt-Grenze.** Ein frei laufender Gast (Core 1, Gast-VTOR) lässt
+sich von Core 0 aus **nicht** asynchron per PendSV anhalten (ICSR ist per-Core
+gebankt). CLI `stop`/`halt` versucht daher kurz einen kooperativen Halt (falls
+der Gast gerade trapt) und fällt sonst auf einen erzwungenen Core-Reset zurück
+(`halted (forced core reset)`).
 ---
 
 ## 16. USB-Mass-Storage-Boot

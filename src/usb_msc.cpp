@@ -6,6 +6,7 @@
 #include "uart_bridge.h"
 #include "emulator.h"
 #include "fault.h"
+#include "help_html.h"
 
 #include "tusb.h"
 #include "pico/stdlib.h"
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdarg>
 
 #include "pico/time.h"
 
@@ -55,6 +57,12 @@ volatile uint32_t  g_last_write_ms = 0;
 // und den Gast unnoetig neu startet.
 uint32_t g_last_volume_hash = 0;
 bool     g_have_volume_hash = false;
+
+// Naechster freier FAT12-Cluster fuer device-seitig injizierte Dateien
+// (HELP.HTM, CONFIG.INI, FAULT.TXT). Wird von format_blank auf 2 zurueckgesetzt
+// und von fat_write_file pro Datei weitergezaehlt, sodass mehrere Dateien
+// nacheinander (nicht ueberlappend) abgelegt werden koennen.
+uint16_t g_next_free_cluster = 2;
 
 // --- Media-Change (fuer FAULT.TXT sichtbar machen) ------------------------
 // Um eine device-seitig injizierte Datei (FAULT.TXT) fuer den Host sichtbar zu
@@ -120,6 +128,7 @@ void format_blank() {
     std::memcpy(root, VOL_LABEL, 11);
     root[11] = 0x08;                                   // Volume-ID-Attribut
 
+    g_next_free_cluster = 2;                           // Datenbereich wieder frei
     g_dirty.store(true);
 }
 
@@ -372,10 +381,11 @@ uint32_t volume_hash() {
     return h;
 }
 
-// Schreibt eine kleine Datei frisch in die (zuvor per format_blank geleerte)
-// RAM-Disk: freien Root-Directory-Eintrag + FAT12-Cluster-Kette + Datensektoren.
-// Nur fuer wenige Cluster gedacht (FAULT.TXT << Volume-Groesse). name im
-// "NAME.EXT"-Format (wird via to_83 auf 8.3 normalisiert).
+// Schreibt eine Datei frisch in die (zuvor per format_blank geleerte) RAM-Disk:
+// freier Root-Directory-Eintrag + FAT12-Cluster-Kette + Datensektoren. Cluster
+// werden sequentiell aus g_next_free_cluster vergeben, sodass MEHRERE Dateien
+// (HELP.HTM, CONFIG.INI, FAULT.TXT) nacheinander abgelegt werden koennen. name
+// im "NAME.EXT"-Format (wird via to_83 auf 8.3 normalisiert).
 void fat_write_file(const char* name, const uint8_t* data, uint32_t len) {
     uint8_t* fat  = g_disk + RESERVED_SECTORS * SECTOR_SIZE;
     uint8_t* root = g_disk + (RESERVED_SECTORS + SECTORS_PER_FAT) * SECTOR_SIZE;
@@ -388,18 +398,19 @@ void fat_write_file(const char* name, const uint8_t* data, uint32_t len) {
     }
     if (!de) return;
 
+    uint32_t clusters = (len + SECTOR_SIZE - 1u) / SECTOR_SIZE;
+    if (clusters == 0) clusters = 1;
+    const uint16_t first = g_next_free_cluster;
+    // FAT12 (1 Sektor) fasst ~341 Cluster-Eintraege; defensiv begrenzen.
+    if (first + clusters > 340u) return;
+
     char name83[11];
     to_83(name, name83);
     std::memset(de, 0, 32);
     std::memcpy(de, name83, 11);
     de[11] = 0x01;                               // Attribut: read-only
 
-    uint32_t clusters = (len + SECTOR_SIZE - 1u) / SECTOR_SIZE;
-    if (clusters == 0) clusters = 1;
-    if (clusters > TOTAL_CLUSTERS) clusters = TOTAL_CLUSTERS;
-    const uint16_t first = 2;                     // frische Disk -> Cluster 2..N frei
-
-    // FAT12-Kette 2->3->...->N->EOF(0xFFF).
+    // FAT12-Kette first -> first+1 -> ... -> EOF(0xFFF).
     for (uint32_t k = 0; k < clusters; ++k) {
         uint16_t cur  = static_cast<uint16_t>(first + k);
         uint16_t next = (k + 1u < clusters) ? static_cast<uint16_t>(cur + 1) : 0x0FFFu;
@@ -413,11 +424,14 @@ void fat_write_file(const char* name, const uint8_t* data, uint32_t len) {
         }
     }
 
-    // Datensektoren fuellen.
-    uint8_t* region = g_disk + FIRST_DATA_SECTOR * SECTOR_SIZE;
+    // Datensektoren fuellen (am Cluster-Offset des ersten Clusters).
+    uint8_t* region = g_disk +
+        (FIRST_DATA_SECTOR + (first - 2u) * SECTORS_PER_CLUSTER) * SECTOR_SIZE;
     uint32_t cap = clusters * SECTORS_PER_CLUSTER * SECTOR_SIZE;
     uint32_t n   = (len < cap) ? len : cap;
     std::memcpy(region, data, n);
+
+    g_next_free_cluster = static_cast<uint16_t>(first + clusters);
 
     de[26] = static_cast<uint8_t>(first & 0xFF);
     de[27] = static_cast<uint8_t>((first >> 8) & 0xFF);
@@ -425,6 +439,155 @@ void fat_write_file(const char* name, const uint8_t* data, uint32_t len) {
     de[29] = static_cast<uint8_t>((n >> 8) & 0xFF);
     de[30] = static_cast<uint8_t>((n >> 16) & 0xFF);
     de[31] = static_cast<uint8_t>((n >> 24) & 0xFF);
+}
+
+// ------------------------------------------------------------------------
+// Die HTML-Kurzanleitung (HELP.HTM) liegt in einer eigenen Quelldatei
+// (help_html.cpp) als reiner HTML-Raw-String und wird ueber help_html.h
+// (HELP_HTML / HELP_HTML_LEN) eingebunden. So kann der HTML-Inhalt unabhaengig
+// von dieser MSC-Logik direkt editiert werden.
+// ------------------------------------------------------------------------
+
+// snprintf-Append-Helfer fuer den CONFIG.INI-Generator.
+void cfg_append(char* buf, uint32_t cap, uint32_t& pos, const char* fmt, ...) {
+    if (pos >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = std::vsnprintf(buf + pos, cap - pos, fmt, ap);
+    va_end(ap);
+    if (n > 0) pos += static_cast<uint32_t>(n);
+    if (pos > cap) pos = cap;
+}
+
+// Erzeugt eine CONFIG.INI aus dem AKTUELL geladenen Zustand: aktive Zeilen fuer
+// die gesetzten Werte (inkl. GPIO-Mapping), auskommentierte Vorlagen fuer die
+// uebrigen Optionen, jeweils mit kurzer Erklaerung. So dient die Datei zugleich
+// als lesbare Referenz und als Ausgangspunkt fuer eigene Anpassungen.
+void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
+    uint32_t p = 0;
+    #define A(...) cfg_append(buf, cap, p, __VA_ARGS__)
+    A("# ================================================================\n");
+    A("# LPC1115-Emulator auf RP2350 - CONFIG.INI\n");
+    A("# Aktive Zeilen = aktuelle Einstellungen. Mit '#' beginnende Zeilen\n");
+    A("# sind auskommentierte Optionen/Vorlagen. Wird beim Auswerfen des\n");
+    A("# Laufwerks uebernommen. Werte: on/off oder Zahl (dez/0x-hex).\n");
+    A("# ================================================================\n\n");
+
+    A("# --- Allgemein --------------------------------------------------\n");
+    A("# autostart: nach Reset automatisch die geladene Firmware starten.\n");
+    A("autostart=%s\n", config::autostart() ? "on" : "off");
+    A("# freq_hz: LPC-Soll-Takt (Zeitbasis der emulierten Timer/UART-Baud).\n");
+    A("#          Der reale RP2350-Takt bleibt bei 150 MHz.\n");
+    A("freq_hz=%lu\n", static_cast<unsigned long>(config::target_frequency_hz()));
+    A("# flash_erase: on = Firmware-Slot VOR dem Laden von BOOT.HEX komplett\n");
+    A("#              loeschen (sonst additiver Merge). Aktion, kein Zustand.\n");
+    A("#flash_erase=off\n\n");
+
+    A("# --- GPIO-Mapping  LPC-Pin -> RP2350-GPIO -----------------------\n");
+    A("# Format: pin.<port>_<pin>=<gpio>   (z. B. pin.1_8=1)\n");
+    A("# GP25 = Status-LED (reserviert); GP26..29 fuer ADC-Bridge frei.\n");
+    {
+        const auto& m = config::pin_map();
+        for (std::size_t i = 0; i < config::LPC_PIN_COUNT; ++i) {
+            if (m.lpc_to_rp[i] >= 0) {
+                A("pin.%u_%u=%d\n", static_cast<unsigned>(i / 12),
+                  static_cast<unsigned>(i % 12),
+                  static_cast<int>(m.lpc_to_rp[i]));
+            }
+        }
+    }
+    A("# Beispiel weitere Pins:  #pin.2_0=27   #pin.2_1=28\n\n");
+
+    A("# --- Zweistufiger Boot (Bootloader + Applikation) ---------------\n");
+    A("# app_start: Flash-Adresse der Applikation (= applicationFirstAddress\n");
+    A("#            des Bootloaders; Selfbus-Standard 0x3000).\n");
+    A("app_start=0x%lx\n", static_cast<unsigned long>(config::app_start_addr()));
+    A("# desc_addr: Adresse des Boot-Descriptors (0 = automatisch app_start-0x100).\n");
+    A("desc_addr=0x%lx\n", static_cast<unsigned long>(config::descriptor_addr()));
+    A("# autodesc: gueltigen Boot-Descriptor beim Laden automatisch erzeugen.\n");
+    A("autodesc=%s\n\n", config::autodesc() ? "on" : "off");
+
+    A("# --- UART-Bridge (LPC-UART0 <-> RP2350 uart0, CDC#2) ------------\n");
+    A("# uart_bridge_en/tx/rx: physische Bruecke der LPC-UART auf GPIOs.\n");
+    if (config::uart_bridge_enabled()) {
+        A("uart_bridge_en=on\n");
+        A("uart_bridge_tx=%d\n", config::uart_bridge_tx_pin());
+        A("uart_bridge_rx=%d\n", config::uart_bridge_rx_pin());
+    } else {
+        A("#uart_bridge_en=on\n#uart_bridge_tx=4\n#uart_bridge_rx=5\n");
+    }
+    A("\n");
+
+    A("# --- I2C-Bridge (LPC-I2C-Master -> echte RP2350-Hardware) -------\n");
+    A("# inst: 0=i2c0,1=i2c1. sda/scl: GPIOs (externe Pull-ups noetig). hz: Bustakt.\n");
+    if (config::i2c_bridge_enabled()) {
+        A("i2c_bridge_en=on\n");
+        A("i2c_bridge_inst=%d\n", config::i2c_bridge_instance());
+        A("i2c_bridge_sda=%d\n", config::i2c_bridge_sda_pin());
+        A("i2c_bridge_scl=%d\n", config::i2c_bridge_scl_pin());
+        A("i2c_bridge_hz=%lu\n", static_cast<unsigned long>(config::i2c_bridge_hz()));
+    } else {
+        A("#i2c_bridge_en=on\n#i2c_bridge_inst=0\n#i2c_bridge_sda=6\n");
+        A("#i2c_bridge_scl=7\n#i2c_bridge_hz=100000\n");
+    }
+    A("\n");
+
+    A("# --- SPI-Bridge (LPC-SSP-Master -> echte RP2350-Hardware) ------\n");
+    A("# inst: 0=spi0,1=spi1. lpc: 0=SSP0,1=SSP1. sck/mosi/miso: GPIOs. hz: Bustakt.\n");
+    if (config::spi_bridge_enabled()) {
+        A("spi_bridge_en=on\n");
+        A("spi_bridge_inst=%d\n", config::spi_bridge_instance());
+        A("spi_bridge_lpc=%d\n", config::spi_bridge_lpc());
+        A("spi_bridge_sck=%d\n", config::spi_bridge_sck_pin());
+        A("spi_bridge_mosi=%d\n", config::spi_bridge_mosi_pin());
+        A("spi_bridge_miso=%d\n", config::spi_bridge_miso_pin());
+        A("spi_bridge_hz=%lu\n", static_cast<unsigned long>(config::spi_bridge_hz()));
+    } else {
+        A("#spi_bridge_en=on\n#spi_bridge_inst=0\n#spi_bridge_lpc=0\n");
+        A("#spi_bridge_sck=18\n#spi_bridge_mosi=19\n#spi_bridge_miso=16\n#spi_bridge_hz=1000000\n");
+    }
+    A("\n");
+
+    A("# --- ADC-Bridge (LPC-ADC 0..3 -> RP2350 ADC an GP26..29) -------\n");
+    A("adc_bridge_en=%s\n\n", config::adc_bridge_enabled() ? "on" : "off");
+
+    A("# --- KNX-Bus / Timer-Capture+Match (CT16/CT32 auf GPIOs) -------\n");
+    A("# tcap.<t>=<gpio>   Capture-Eingang (Bus-RX), t: 0=CT16B0 1=CT16B1 2=CT32B0 3=CT32B1\n");
+    A("# tmat.<t>.<m>=<gpio> Match-Ausgang (Bus-TX), m=0..3\n");
+    for (int t = 0; t < 4; ++t) {
+        if (config::ct_capture_pin(t) >= 0)
+            A("tcap.%d=%d\n", t, config::ct_capture_pin(t));
+        for (int mm = 0; mm < 4; ++mm)
+            if (config::ct_match_pin(t, mm) >= 0)
+                A("tmat.%d.%d=%d\n", t, mm, config::ct_match_pin(t, mm));
+    }
+    A("# Beispiel KNX auf CT16B1:  #tcap.1=15   #tmat.1.0=14\n");
+    A("# tcap_pio / tmatch_pio: flankengenaue Capture/PWM per PIO (opt-in).\n");
+    A("%stcap_pio=%s\n", config::tcap_pio() ? "" : "#", config::tcap_pio() ? "on" : "off");
+    A("%stmatch_pio=%s\n\n", config::tmatch_pio() ? "" : "#", config::tmatch_pio() ? "on" : "off");
+
+    A("# --- Experimentell (opt-in) ------------------------------------\n");
+    A("# wfi_pin_wakeup: WFI der Firmware auf Pin-/Timer-Wakeup patchen.\n");
+    A("%swfi_pin_wakeup=%s\n", config::wfi_pin_wakeup() ? "" : "#",
+      config::wfi_pin_wakeup() ? "on" : "off");
+    A("# primask_shadow: __disable_irq()/__enable_irq() der Firmware nachbilden.\n");
+    A("%sprimask_shadow=%s\n", config::primask_shadow() ? "" : "#",
+      config::primask_shadow() ? "on" : "off");
+    #undef A
+    out_len = p;
+}
+
+// Legt HELP.HTM und eine aus dem aktuellen Zustand generierte CONFIG.INI auf das
+// Laufwerk. Nach format_blank() aufzurufen (frische FAT), damit der Anwender die
+// Referenz stets vorfindet (mbed-DAPLink-Stil: Geraet bringt Doku selbst mit).
+void build_info_files() {
+    fat_write_file("HELP.HTM",
+                   reinterpret_cast<const uint8_t*>(HELP_HTML),
+                   HELP_HTML_LEN);
+    static char cfg[3072];
+    uint32_t len = 0;
+    build_config_ini(cfg, sizeof cfg, len);
+    fat_write_file("CONFIG.INI", reinterpret_cast<const uint8_t*>(cfg), len);
 }
 
 // Baut ein frisches Volume, das nur FAULT.TXT enthaelt (mbed-DAPLink-Stil).
@@ -437,6 +600,7 @@ void build_fault_volume(const char* text, uint32_t len) {
         fat_write_file("FAULT.TXT",
                        reinterpret_cast<const uint8_t*>(text), len);
     }
+    build_info_files();                          // HELP.HTM + CONFIG.INI beibehalten
     g_dirty.store(false);
     g_volume_processed.store(true);
     g_last_volume_hash = volume_hash();
@@ -555,10 +719,19 @@ void on_volume_ready() {
 
 void init() {
     std::memset(&g_stats, 0, sizeof g_stats);
-    // Persistente Wiederherstellung wäre möglich (storage::msc_load_volume).
-    // Fürs Erste: bei jedem Power-Cycle ein leeres FAT12 anlegen und auf
-    // die nächsten Host-Schreibvorgänge warten.
+    // Persistente Wiederherstellung waere moeglich (storage::msc_load_volume).
+    // Fuers Erste: bei jedem Power-Cycle ein leeres FAT12 anlegen und HELP.HTM
+    // + eine aus dem aktuellen Zustand generierte CONFIG.INI ablegen, dann auf
+    // die naechsten Host-Schreibvorgaenge warten.
     format_blank();
+    build_info_files();
+    // Ausgangszustand als "verarbeitet" registrieren: Ein Auswerfen OHNE Host-
+    // Aenderung (gleicher Inhalt) wird dann per volume_hash dedupliziert und
+    // loest KEIN erneutes Parsen der (ggf. stale) CONFIG.INI aus -> per CLI
+    // vorgenommene Aenderungen bleiben erhalten. Erst echte Host-Schreibzugriffe
+    // (neue BOOT.HEX / editierte CONFIG.INI) aendern den Hash und werden verarbeitet.
+    g_last_volume_hash = volume_hash();
+    g_have_volume_hash = true;
 }
 
 bool consume_pending_boot_request() {
