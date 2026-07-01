@@ -210,14 +210,25 @@ void cmd_info() {
                 static_cast<unsigned long>(sz));
 }
 
-// Port_Pin-String (z.B. "1_8") in LPC-Pin-Index konvertieren
+// Port_Pin-String (z.B. "1_8") in LPC-Pin-Index konvertieren.
+// Bewusst OHNE sscanf: sscanf ist auf newlib-nano extrem stack-hungrig
+// (haeufig 500-1000+ Bytes) und sprengt im tiefen handle_command-Aufrufkontext
+// den knappen ~2 KB Core0-Stack -> stiller Hang ("CLI wartet auf Eingaben").
+// Manuelles strtol-Parsing ist stack-arm und reentrant-sicher.
 bool parse_port_pin(const char* s, long& out) {
-    int port, pin;
-    if (std::sscanf(s, "%d_%d", &port, &pin) == 2) {
-        out = static_cast<long>(port * 12 + pin);
-        return out >= 0 && out < static_cast<long>(config::LPC_PIN_COUNT);
+    char* end = nullptr;
+    long port = std::strtol(s, &end, 10);
+    if (end != s && *end == '_') {
+        const char* p2 = end + 1;
+        char* end2 = nullptr;
+        long pin = std::strtol(p2, &end2, 10);
+        if (end2 != p2 && *end2 == '\0' && port >= 0 && pin >= 0 && pin < 12) {
+            out = port * 12 + pin;
+            return out >= 0 && out < static_cast<long>(config::LPC_PIN_COUNT);
+        }
+        return false;
     }
-    // Fallback: numerischer Index
+    // Fallback: reiner numerischer Index (z.B. "24").
     return parse_int(s, 0, static_cast<long>(config::LPC_PIN_COUNT - 1), out);
 }
 
@@ -401,7 +412,7 @@ void handle_command(char* line) {
             }
             return;
         }
-        if (std::strcmp(tokens[1], "set") == 0 && n == 4) {
+        if (std::strcmp(tokens[1], "set") == 0 && n >= 4) {
             long lpc, rp;
             if (!parse_port_pin(tokens[2], lpc) ||
                 !parse_int(tokens[3], -1, 47, rp)) {
@@ -419,7 +430,7 @@ void handle_command(char* line) {
     }
     // Legacy-Alias: "pin" = "pinmap"
     if (std::strcmp(tokens[0], "pin") == 0 && n >= 2) {
-        if (std::strcmp(tokens[1], "set") == 0 && n == 4) {
+        if (std::strcmp(tokens[1], "set") == 0 && n >= 4) {
             long lpc, rp;
             if (!parse_port_pin(tokens[2], lpc) ||
                 !parse_int(tokens[3], -1, 47, rp)) {

@@ -251,6 +251,22 @@ bool find_hex_entry(uint16_t& cluster, uint32_t& size, char* out_name) {
 //   tmatch_pio=on|off        Match/PWM-Ausgangspuls hardware-getaktet per PIO (opt-in)
 //   wfi_pin_wakeup=on|off   (opt-in)
 //   primask_shadow=on|off   (opt-in)
+//
+// Hinweis: Zahlen werden per strtol geparst (NICHT sscanf). sscanf ist auf
+// newlib-nano stark stack-hungrig und kann in tiefen Aufrufkontexten den
+// knappen Core0-Stack sprengen (gleiche Klasse wie der fruehere CLI-Hang).
+
+// Eine vorzeichenlose Dezimalzahl am Anfang von s parsen. Liefert false, wenn
+// dort keine Ziffer steht; setzt *endp hinter die Zahl (falls endp != nullptr).
+bool cfg_parse_int(const char* s, int& out, const char** endp = nullptr) {
+    char* end = nullptr;
+    long v = std::strtol(s, &end, 10);
+    if (end == s) return false;
+    out = static_cast<int>(v);
+    if (endp) *endp = end;
+    return true;
+}
+
 void parse_config(const char* buf, uint32_t len) {
     char line[96];
     uint32_t i = 0;
@@ -276,23 +292,24 @@ void parse_config(const char* buf, uint32_t len) {
         ++g_stats.parsed_lines;
         if (std::strncmp(line, "pin.", 4) == 0) {
             // pin.<port>_<pin>=<rp-gpio>
-            int port, pin, rp;
-            if (std::sscanf(line + 4, "%d_%d", &port, &pin) == 2 &&
-                std::sscanf(eq, "%d", &rp) == 1) {
+            int port = 0, pin = 0, rp = 0;
+            const char* p = nullptr;
+            if (cfg_parse_int(line + 4, port, &p) && *p == '_' &&
+                cfg_parse_int(p + 1, pin) && cfg_parse_int(eq, rp)) {
                 config::set_pin_map(static_cast<uint8_t>(port * 12 + pin), rp);
             }
         } else if (std::strncmp(line, "tcap.", 5) == 0) {
             // tcap.<t>=<rp-gpio>
-            int t, rp;
-            if (std::sscanf(line + 5, "%d", &t) == 1 &&
-                std::sscanf(eq, "%d", &rp) == 1) {
+            int t = 0, rp = 0;
+            if (cfg_parse_int(line + 5, t) && cfg_parse_int(eq, rp)) {
                 config::set_ct_capture_pin(t, rp);
             }
         } else if (std::strncmp(line, "tmat.", 5) == 0) {
             // tmat.<t>.<m>=<rp-gpio>
-            int t, m, rp;
-            if (std::sscanf(line + 5, "%d.%d", &t, &m) == 2 &&
-                std::sscanf(eq, "%d", &rp) == 1) {
+            int t = 0, m = 0, rp = 0;
+            const char* p = nullptr;
+            if (cfg_parse_int(line + 5, t, &p) && *p == '.' &&
+                cfg_parse_int(p + 1, m) && cfg_parse_int(eq, rp)) {
                 config::set_ct_match_pin(t, m, rp);
             }
         } else if (std::strcmp(line, "autostart") == 0) {
