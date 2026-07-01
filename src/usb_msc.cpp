@@ -48,6 +48,13 @@ bool              g_erase_request = false;
 constexpr uint32_t WRITE_IDLE_TIMEOUT_MS = 2000;
 volatile uint32_t  g_last_write_ms = 0;
 
+// Hash des zuletzt VERARBEITETEN Volume-Zustands (siehe volume_hash). Verhindert,
+// dass ein inhaltlich unveraenderter Re-Trigger (z. B. Host-Re-Mount nach Eject,
+// der nur FAT-Metadaten neu schreibt) dieselbe BOOT.HEX ein zweites Mal flasht
+// und den Gast unnoetig neu startet.
+uint32_t g_last_volume_hash = 0;
+bool     g_have_volume_hash = false;
+
 const char VOL_LABEL[11]  = { 'L','P','C','1','1','1','5','E','M','U',' ' };
 const char OEM_NAME[8]    = { 'M','S','D','O','S','5','.','0' };
 
@@ -335,9 +342,34 @@ void parse_config(const char* buf, uint32_t len) {
     }
 }
 
+// FNV-1a-Hash ueber den gesamten Volume-Inhalt. Dient als Aenderungs-Detektor:
+// nur wenn sich der Hash seit der letzten Verarbeitung geaendert hat, wird das
+// Volume erneut nach BOOT.HEX/CONFIG.INI durchsucht + geflasht. g_disk ist
+// alignas(4) und VOLUME_BYTES durch 4 teilbar -> wortweise Iteration sicher.
+uint32_t volume_hash() {
+    uint32_t h = 2166136261u;                    // FNV-1a offset basis
+    const uint32_t* p = reinterpret_cast<const uint32_t*>(g_disk);
+    for (uint32_t i = 0; i < VOLUME_BYTES / 4u; ++i) {
+        h = (h ^ p[i]) * 16777619u;              // FNV-1a prime
+    }
+    return h;
+}
+
 // Trigger nach Eject vom Hauptloop aufgerufen.
 void on_volume_ready() {
     uint16_t cl; uint32_t sz;
+
+    // Re-Processing nur bei ECHTER Aenderung: Inhalts-Hash des Volumes bilden.
+    // Manche Hosts schreiben nach dem Eject beim Re-Mount erneut FAT-/Meta-
+    // daten -> g_dirty + Dirty-Timeout -> on_volume_ready() erneut, OBWOHL sich
+    // der Inhalt nicht geaendert hat. Ist der Hash identisch zum zuletzt
+    // verarbeiteten, hier fruehzeitig raus — VOR dem FlashPauseGuard, damit ein
+    // laufender Gast in diesem Fall NICHT unnoetig gestoppt/neu gestartet wird.
+    const uint32_t vh = volume_hash();
+    if (g_have_volume_hash && vh == g_last_volume_hash) {
+        return;
+    }
+
     g_erase_request = false;
 
     // Lauft ein Gast nativ auf Core1, vor den Flash-Schreibzugriffen pausieren
@@ -422,6 +454,13 @@ void on_volume_ready() {
                         static_cast<unsigned long>(ctx.total));
         }
     }
+
+    // Verarbeiteten Volume-Zustand merken -> inhaltlich identische Re-Trigger
+    // (Host-Re-Mount ohne echte Aenderung) werden ab jetzt uebersprungen. Der
+    // Hash wurde am Funktionsanfang gebildet; on_volume_ready() schreibt selbst
+    // nicht in g_disk, daher ist vh weiterhin gueltig.
+    g_last_volume_hash = vh;
+    g_have_volume_hash = true;
 }
 
 } // namespace
