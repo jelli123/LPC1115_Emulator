@@ -24,10 +24,13 @@
 //   0: Code-Image     firmware_base  .. +64 KB  (RWX, Normal)
 //   1: Gast-RAM       guest_ram_base .. +8 KB   (RWX, Normal)
 //   2: enter_guest    trampoline     .. +32 B   (RX,  Normal)
-//   3: PPB Teil A     0xE0000000-0xE000E0FF      (RW,  Device, XN)
-//   4: PPB Teil B1    0xE000E500-0xE000ECFF      (RW,  Device, XN)
-//   5: SCB-Ctrl-Block 0xE000ED00-0xE000ED1F      (RO,  Device, XN) -> AIRCR-Trap
-//   6: PPB Teil B2    0xE000ED20-0xE00FFFFF      (RW,  Device, XN)
+//   3: PPB Teil A0    0xE0000000-0xE000DFFF      (RW,  Device, XN)
+//   4: PPB Teil A1    0xE000E020-0xE000E0FF      (RW,  Device, XN)  [SysTick-Loch davor]
+//   5: PPB Teil B1    0xE000E500-0xE000ECFF      (RW,  Device, XN)
+//   6: SCB-Ctrl-Block 0xE000ED00-0xE000ED1F      (RO,  Device, XN) -> AIRCR-Trap
+//   7: PPB Teil B2    0xE000ED20-0xE00FFFFF      (RW,  Device, XN)
+// Ungemappte Loecher (trappen -> Emulation): 0xE000E000-0xE000E01F (ICTR/ACTLR/
+// SysTick, peripherals.cpp) und 0xE000E100-0xE000E4FF (NVIC, vnvic).
 //
 // WICHTIG: Frueher gab Region 0 das GESAMTE 520-KB-SRAM unprivileged RWX frei.
 // Ein wilder Gast-Pointer, Heap- oder Stack-Ueberlauf konnte damit TinyUSB-
@@ -99,10 +102,26 @@ void enable_for_guest(uint32_t firmware_base, uint32_t guest_ram_base,
         make_rbar(trampoline_base, SH_INNER, AP_RO_ANY, /*xn=*/false),
         make_rlar(trampoline_base + 31u, ATTR_NORMAL, true));
 
-    // PPB Teil A: 0xE0000000 - 0xE000_E0FF (DCB, ITM, DWT, FPB, SCB-Anfang,
-    // SysTick). RW any, Device, XN.
+    // PPB Teil A0: 0xE0000000 - 0xE000DFFF (ITM, DWT, FPB, TPIU ...). RW, Device, XN.
     set_region(r++,
         make_rbar(LPC_PRIVPERI_BASE, SH_NS, AP_RW_ANY, /*xn=*/true),
+        make_rlar(0xE000'DFFFu, ATTR_DEVICE, true));
+
+    // PPB Teil A1: 0xE000E020 - 0xE000_E0FF (SCS-Anfang ab NVIC-Type-Ende).
+    // RW any, Device, XN.
+    //
+    // BEWUSSTES LOCH davor: 0xE000E000 - 0xE000E01F ist NICHT gemappt und trappt
+    // damit fuer den unprivilegierten Gast (MemManage) -> fault.cpp emuliert es.
+    // Dieser 32-Byte-Block enthaelt ICTR (0xE000E004), ACTLR (0xE000E008) und die
+    // SysTick-Register SYST_CSR/RVR/CVR/CALIB (0xE000E010-0xE000E01F). SysTick ist
+    // auf dem Cortex-M33 privilegiert-only: der unprivilegierte Gast koennte es
+    // NATIV weder konfigurieren (writes waeren WI) noch korrekt lesen -> seine
+    // SysTick-basierte Zeit (millis(), Tick-getriebene Schleifen) liefe nie.
+    // Durch das Trapping emuliert der Host SysTick zeitbasiert und injiziert die
+    // SysTick-Exception (peripherals.cpp). 32-Byte-Granularitaet der MPU zwingt
+    // den ganzen Block; ICTR/ACTLR werden mit-emuliert (harmlos).
+    set_region(r++,
+        make_rbar(0xE000'E020u, SH_NS, AP_RW_ANY, /*xn=*/true),
         make_rlar(0xE000'E0FFu, ATTR_DEVICE, true));
 
     // NVIC-Region 0xE000_E100 - 0xE000_E4FF wird *nicht* whitelistet.

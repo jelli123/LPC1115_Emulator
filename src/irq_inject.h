@@ -23,6 +23,13 @@ void init();
 // Wird von Peripherie-Modellen aufgerufen.
 void pend(uint8_t lpc_irq);
 
+// SysTick-Exception (Vektor-Slot 15) in den Gast injizieren. SysTick ist auf
+// dem Cortex-M33 privilegiert-only und wird daher vom Host emuliert
+// (peripherals.cpp systick_advance); bei einem Reload-Unterlauf mit gesetztem
+// TICKINT ruft das Modell diese Funktion, die den Gast-SysTick-Handler
+// (vtable[15]) ueber denselben PendSV-Frame-Mechanismus wie IRQs ausfuehrt.
+void pend_systick();
+
 // Im Host-Loop pollen, falls direkter ICSR-Schreibvorgang aus IRQ-fremdem
 // Code unsicher wäre (PendSV-Set ist atomar, daher leer).
 void poll();

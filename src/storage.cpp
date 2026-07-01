@@ -54,12 +54,20 @@ constexpr std::size_t config_region_offset =
 constexpr std::size_t firmware_region_offset =
     config_region_offset - firmware_region_size;
 
-// In-RAM Konfig-Snapshot. Sehr klein gehalten.
+// In-RAM Konfig-Snapshot.
+// Groessen so gewaehlt, dass alle Eintraege + ConfigHeader in EINEN Flash-
+// Sektor (SECTOR_SIZE, i.d.R. 4096 B) passen:
+//   MAX_KV * sizeof(KV) + sizeof(ConfigHeader) <= SECTOR_SIZE
+//   56 * 64 + 16 = 3600 <= 4096.
+// 56 Eintraege decken die volle Default-Pinmap (23) + alle Skalar-Keys (~18)
+// mit Reserve ab. Frueher MAX_KV=32 -> config_set gab bei Ueberlauf false ->
+// save() brach VOR dem Commit ab -> Pinmap ueberlebte keinen Power-Cycle.
+// key: laengster ist "spi_bridge_miso" (15) + NUL. value: nur Zahlen (<=10).
 struct KV {
-    char key[32];
-    char value[96];
+    char key[24];
+    char value[40];
 };
-constexpr std::size_t MAX_KV = 32;
+constexpr std::size_t MAX_KV = 56;
 
 KV       kv_table[MAX_KV];
 uint32_t kv_count       = 0;

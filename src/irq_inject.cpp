@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 
 #include "RP2350.h"
 #include "hardware/sync.h"
@@ -66,6 +67,33 @@ uint32_t lookup_handler(uint8_t lpc_irq) {
     return v;                  // mit Thumb-Bit
 }
 
+// SysTick-Exception (Slot 15) pending-Flag. Wird vom Host-SysTick-Modell
+// (peripherals.cpp) via pend_systick() gesetzt und in pendsv_inject_c mit
+// Vorrang vor den NVIC-IRQs konsumiert.
+std::atomic<bool> g_systick_pending{false};
+
+// Synthetisiert einen Exception-Frame fuer 'handler' oben auf den Gast-PSP,
+// sodass beim PendSV-EXC_RETURN der Gast-Handler im Thread-Mode anlaeuft. Der
+// Ruecksprung (LR=0xFFFFFFFD) wird vom Fault-Handler (try_injected_irq_return)
+// abgefangen und der Original-Frame freigelegt. Gemeinsam fuer IRQs + SysTick.
+void inject_frame(uint32_t handler) {
+    auto* psp = read_guest_psp();
+    auto* base = psp;
+    if ((reinterpret_cast<uintptr_t>(base) & 4u) != 0u) {
+        --base;                         // 4 Byte Padding fuer 8-Byte-Alignment
+    }
+    auto* frame = reinterpret_cast<StackFrame*>(base) - 1;
+    frame->r0  = 0; frame->r1 = 0; frame->r2 = 0; frame->r3 = 0;
+    frame->r12 = 0;
+    frame->lr  = 0xFFFF'FFFDu;          // EXC_RETURN: thread, PSP, no FP
+    frame->return_pc = handler & ~1u;   // PC ohne Thumb-Bit
+    frame->xpsr = XPSR_THUMB
+                | (((reinterpret_cast<uintptr_t>(base) & 4u)
+                    != (reinterpret_cast<uintptr_t>(psp) & 4u))
+                   ? (1u << 9) : 0u);
+    write_guest_psp(reinterpret_cast<uint32_t*>(frame));
+}
+
 // Atomar: nimm das nächste pending+enabled IRQ und claime es.
 int8_t take_next_irq() {
     uint32_t save = save_and_disable_interrupts();
@@ -89,6 +117,12 @@ void pend(uint8_t lpc_irq) {
     if (lpc_irq >= lpc_irq::COUNT) return;
     vnvic::pend_irq(lpc_irq);
     // PendSV anstoßen — atomar, in jedem Kontext zulässig.
+    SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+    __DSB();
+}
+
+void pend_systick() {
+    g_systick_pending.store(true, std::memory_order_release);
     SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
     __DSB();
 }
@@ -122,6 +156,17 @@ extern "C" void pendsv_inject_c() {
     // im vNVIC pending und feuert beim Verlassen (CPSIE -> erneutes PendSV).
     if (vnvic::primask()) return;
 
+    // SysTick-Exception hat Vorrang (hoehere Exception-Prioritaet als IRQs) und
+    // wird ueber denselben Frame-Mechanismus injiziert. Handler = Gast-vtable[15].
+    if (g_systick_pending.exchange(false, std::memory_order_acq_rel)) {
+        auto* vt = reinterpret_cast<uint32_t*>(emulator::vtable_base());
+        uint32_t h = vt[15];
+        if (h != 0u && (h & ~1u) != 0u) {
+            inject_frame(h);
+            return;   // ein Frame pro PendSV-Lauf; IRQs folgen beim naechsten
+        }
+    }
+
     // Solange Pending+Enabled vorliegt, einen Frame synthetisieren.
     // Wir injizieren maximal einen IRQ pro PendSV-Lauf, um Tail-Chaining
     // dem Hardware-Mechanismus zu überlassen.
@@ -134,27 +179,7 @@ extern "C" void pendsv_inject_c() {
         return;
     }
 
-    auto* psp = read_guest_psp();
-
-    // Stack-Top muss 8-byte aligned sein, bevor wir den Frame ablegen.
-    auto* base = psp;
-    if ((reinterpret_cast<uintptr_t>(base) & 4u) != 0u) {
-        --base;                         // 4 Byte Padding
-        // Padding-Bit im xPSR setzen wir gleich.
-    }
-
-    auto* frame = reinterpret_cast<StackFrame*>(base) - 1;
-
-    frame->r0  = 0; frame->r1 = 0; frame->r2 = 0; frame->r3 = 0;
-    frame->r12 = 0;
-    frame->lr  = 0xFFFF'FFFDu;          // EXC_RETURN: thread, PSP, no FP
-    frame->return_pc = handler & ~1u;   // PC ohne Thumb-Bit
-    frame->xpsr = XPSR_THUMB
-                | (((reinterpret_cast<uintptr_t>(base) & 4u)
-                    != (reinterpret_cast<uintptr_t>(psp) & 4u))
-                   ? (1u << 9) : 0u);
-
-    write_guest_psp(reinterpret_cast<uint32_t*>(frame));
+    inject_frame(handler);
 }
 
 } // namespace irq_inject

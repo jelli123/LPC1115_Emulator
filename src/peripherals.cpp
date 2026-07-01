@@ -200,6 +200,140 @@ void gpio_apply_port(uint8_t port, uint32_t /*old_data*/, uint32_t new_data, uin
 }
 uint32_t        g_systick_load = 0, g_systick_val = 0, g_systick_ctrl = 0;
 
+// =========================================================================
+// SysTick-Emulation (0xE000E010-0xE000E01F). Notwendig, weil SysTick auf dem
+// Cortex-M33 privilegiert-only ist: der unprivilegierte Gast koennte es nativ
+// weder konfigurieren noch korrekt lesen. Die MPU (mmu.cpp) laesst den Block
+// 0xE000E000-0xE000E01F trappen; hier wird SysTick zeitbasiert nachgebildet und
+// die SysTick-Exception (Slot 15) via irq_inject::pend_systick() injiziert.
+//
+// Zeitbasis: reale Wall-Clock (time_us_64) skaliert mit g_current_hz (der vom
+// Gast programmierten LPC-Soll-Frequenz), analog ct_advance/wdt_advance. Damit
+// tickt SysTick mit der von der Gast-Firmware erwarteten Rate (z. B. 1 ms bei
+// RVR = f/1000), unabhaengig vom realen 150-MHz-RP2350-Takt.
+extern uint32_t g_current_hz;   // weiter unten definiert (SYSCON-Takt-Schatten)
+struct SysTick {
+    uint32_t csr;      // [0]=ENABLE [1]=TICKINT [2]=CLKSOURCE [16]=COUNTFLAG
+    uint32_t rvr;      // 24-bit Reload
+    uint32_t cvr;      // 24-bit Current
+    uint64_t last_us;  // Zeitpunkt des letzten advance
+    double   frac;     // Rest-Tick-Bruchteil
+};
+SysTick g_systick{};
+
+constexpr uint32_t SYST_CSR_ENABLE    = 1u << 0;
+constexpr uint32_t SYST_CSR_TICKINT   = 1u << 1;
+constexpr uint32_t SYST_CSR_COUNTFLAG = 1u << 16;
+
+// Treibt den SysTick-Zaehler entsprechend der verstrichenen Zeit weiter und
+// injiziert bei jedem Reload-Unterlauf (CVR laeuft durch 0) die SysTick-
+// Exception, falls TICKINT gesetzt ist. Wird aus poll_timed_sources() und aus
+// dem SysTick-MMIO-Trap aufgerufen.
+void systick_advance() {
+    uint64_t now = time_us_64();
+    if (!(g_systick.csr & SYST_CSR_ENABLE) || g_systick.rvr == 0) {
+        g_systick.last_us = now;
+        return;
+    }
+    uint64_t dt = now - g_systick.last_us;
+    g_systick.last_us = now;
+    uint32_t hz = g_current_hz ? g_current_hz : 12'000'000u;
+    // Verstrichene SysTick-Ticks (Prozessortakt) = dt[us] * hz / 1e6.
+    double ticks_f = g_systick.frac +
+        (static_cast<double>(dt) * static_cast<double>(hz)) / 1'000'000.0;
+    uint64_t ticks = static_cast<uint64_t>(ticks_f);
+    g_systick.frac = ticks_f - static_cast<double>(ticks);
+    if (ticks == 0) return;
+
+    uint32_t period = (g_systick.rvr & 0xFF'FFFFu) + 1u;   // RELOAD+1 Ticks/Zyklus
+    uint32_t cur = g_systick.cvr & 0xFF'FFFFu;
+    bool underflow = false;
+    // cur zaehlt abwaerts; jeder Durchlauf durch 0 = ein SysTick-Ereignis.
+    uint64_t rem = ticks;
+    if (rem > cur) {
+        underflow = true;
+        rem -= (cur + 1u);                 // bis inkl. Nulldurchgang
+        rem %= period;                     // volle Zyklen ueberspringen
+        cur = period - 1u - static_cast<uint32_t>(rem);
+    } else {
+        cur -= static_cast<uint32_t>(rem);
+    }
+    g_systick.cvr = cur & 0xFF'FFFFu;
+    if (underflow) {
+        g_systick.csr |= SYST_CSR_COUNTFLAG;
+        if (g_systick.csr & SYST_CSR_TICKINT) {
+            irq_inject::pend_systick();
+        }
+    }
+}
+
+uint32_t systick_read32(uint32_t addr) {
+    switch (addr & 0xFFu) {
+        case 0x10:                          // SYST_CSR
+        {
+            systick_advance();
+            uint32_t v = g_systick.csr;
+            g_systick.csr &= ~SYST_CSR_COUNTFLAG;   // COUNTFLAG liest sich clear
+            return v;
+        }
+        case 0x14: return g_systick.rvr;    // SYST_RVR
+        case 0x18: systick_advance(); return g_systick.cvr;   // SYST_CVR
+        case 0x1C: return 0x4000'0000u;     // SYST_CALIB: NOREF=0, kein exakter 10ms
+        default:   return 0;                // ICTR/ACTLR-Bereich (0x00..0x0C)
+    }
+}
+
+void systick_write32(uint32_t addr, uint32_t value) {
+    switch (addr & 0xFFu) {
+        case 0x10:                          // SYST_CSR
+            systick_advance();
+            g_systick.csr = value & 0x7u;   // ENABLE|TICKINT|CLKSOURCE
+            g_systick.last_us = time_us_64();
+            g_systick.frac = 0.0;
+            break;
+        case 0x14: g_systick.rvr = value & 0xFF'FFFFu; break;  // SYST_RVR
+        case 0x18:                          // SYST_CVR: jeder Write -> 0, COUNTFLAG clear
+            g_systick.cvr = 0;
+            g_systick.csr &= ~SYST_CSR_COUNTFLAG;
+            g_systick.frac = 0.0;
+            break;
+        default: break;                     // ICTR (RO) / ACTLR: ignorieren
+    }
+}
+
+// Byteweiser SysTick-Write-Sammler: buendelt die 4 Bytes eines STR zu einem
+// 32-bit-Wort und ruft systick_write32 beim letzten Byte des Registers. Nutzt
+// den aktuellen Registerwert als Default fuer nicht (mit)geschriebene Bytes.
+struct SysTickCollector { uint32_t aligned; uint8_t bytes[4]; uint8_t mask; };
+SysTickCollector g_systick_collector{0, {0,0,0,0}, 0};
+
+void systick_collect_byte(uint32_t addr, uint8_t val) {
+    uint32_t aligned = addr & ~3u;
+    if (g_systick_collector.mask != 0 &&
+        g_systick_collector.aligned != aligned) {
+        // Vorheriges Wort unvollstaendig -> mit aktuellem Wert flushen.
+        uint32_t cur = systick_read32(g_systick_collector.aligned);
+        for (int i = 0; i < 4; ++i)
+            if (g_systick_collector.mask & (1u << i))
+                cur = (cur & ~(0xFFu << (i * 8))) |
+                      (static_cast<uint32_t>(g_systick_collector.bytes[i]) << (i * 8));
+        systick_write32(g_systick_collector.aligned, cur);
+        g_systick_collector = {0, {0,0,0,0}, 0};
+    }
+    g_systick_collector.aligned = aligned;
+    uint32_t lane = addr & 3u;
+    g_systick_collector.bytes[lane] = val;
+    g_systick_collector.mask |= static_cast<uint8_t>(1u << lane);
+    if (g_systick_collector.mask == 0xF) {
+        uint32_t v = static_cast<uint32_t>(g_systick_collector.bytes[0])
+                   | (static_cast<uint32_t>(g_systick_collector.bytes[1]) << 8)
+                   | (static_cast<uint32_t>(g_systick_collector.bytes[2]) << 16)
+                   | (static_cast<uint32_t>(g_systick_collector.bytes[3]) << 24);
+        systick_write32(aligned, v);
+        g_systick_collector = {0, {0,0,0,0}, 0};
+    }
+}
+
 // SYSCON-Schattenregister
 uint32_t        g_syspllctrl   = 0;       // MSEL[4:0], PSEL[6:5]
 uint32_t        g_syspllclksel = 0;       // 0 = IRC, 1 = SYSOSC
@@ -1478,6 +1612,9 @@ void reset() {
     std::memset(g_gpio, 0, sizeof g_gpio);
     std::memset(g_iocon, 0, sizeof g_iocon);
     g_systick_load = g_systick_val = g_systick_ctrl = 0;
+    g_systick = {};
+    g_systick.last_us = time_us_64();
+    g_systick_collector = {0, {0,0,0,0}, 0};
     g_syspllctrl   = 0;
     g_syspllclksel = 0;
     g_mainclksel   = 0;
@@ -1693,6 +1830,7 @@ void sample_pin_interrupts() {
 void poll_timed_sources() {
     for (auto& c : g_ct) { ct_advance(c); ct_sample_capture(c); }
     wdt_advance();
+    systick_advance();
 }
 
 bool capture_armed() {
@@ -1803,8 +1941,11 @@ bool mmio_read8(uint32_t addr, uint8_t& out) {
         out = static_cast<uint8_t>((v >> ((addr & 3u) * 8)) & 0xFFu);
         return true;
     }
-    if (addr >= SYSTICK_CTRL && addr < SYSTICK_CTRL + 4) {
-        out = static_cast<uint8_t>((g_systick_ctrl >> ((addr - SYSTICK_CTRL)*8)) & 0xFFu);
+    // SysTick + ICTR/ACTLR-Block (0xE000E000-0xE000E01F): von der MPU getrappt,
+    // da SysTick auf dem M33 privilegiert-only ist. Emuliert (systick_read32).
+    if (addr >= 0xE000'E000u && addr <= 0xE000'E01Fu) {
+        uint32_t v = systick_read32(addr & ~3u);
+        out = static_cast<uint8_t>((v >> ((addr & 3u) * 8u)) & 0xFFu);
         return true;
     }
     if (addr >= UART0_BASE && addr < UART0_END) {
@@ -1909,9 +2050,14 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
         syscon_collect_byte(addr, val);
         return true;
     }
-    if (addr == SYSTICK_CTRL) { g_systick_ctrl = val; return true; }
-    if (addr == SYSTICK_LOAD) { g_systick_load = val; return true; }
-    if (addr == SYSTICK_VAL ) { g_systick_val  = 0;   return true; }
+    // SysTick + ICTR/ACTLR-Block (0xE000E000-0xE000E01F): byteweise sammeln und
+    // beim vollstaendigen 32-bit-Wort emulieren (systick_write32). Der Gast
+    // schreibt via STR (4x mmio_write8); die Register-Semantik (CSR/RVR/CVR)
+    // ist nur wortweise sinnvoll.
+    if (addr >= 0xE000'E000u && addr <= 0xE000'E01Fu) {
+        systick_collect_byte(addr, val);
+        return true;
+    }
     if (addr >= UART0_BASE && addr < UART0_END) {
         if ((addr & 3u) == 0u) uart0_write_reg(addr & ~3u, val);
         return true;

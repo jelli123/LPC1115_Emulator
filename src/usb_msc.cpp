@@ -730,9 +730,12 @@ void on_volume_ready() {
 
     // Verarbeiteten Volume-Zustand merken -> inhaltlich identische Re-Trigger
     // (Host-Re-Mount ohne echte Aenderung) werden ab jetzt uebersprungen. Der
-    // Hash wurde am Funktionsanfang gebildet; on_volume_ready() schreibt selbst
-    // nicht in g_disk, daher ist vh weiterhin gueltig.
-    g_last_volume_hash = vh;
+    // Hash wird HIER frisch berechnet (nicht der am Funktionsanfang gebildete
+    // vh): on_volume_ready selbst schreibt zwar nicht in g_disk, aber ein Host
+    // kann waehrend der langen Flash-Operationen weitere identische Sektoren
+    // geschrieben haben -> der aktuelle g_disk-Stand ist die verlaessliche
+    // Referenz fuer den naechsten Dedup-Vergleich.
+    g_last_volume_hash = volume_hash();
     g_have_volume_hash = true;
 }
 
