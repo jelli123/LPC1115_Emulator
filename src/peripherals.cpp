@@ -231,6 +231,62 @@ uint32_t        g_current_hz   = 12'000'000; // Default IRC
 peripherals::Stats g_stats{};
 bool            g_in_post_hook = false;
 bool            g_pll_reconfig_pending = false;
+
+// IOCON-Registeroffset (Byte, relativ zu IOCON_BASE) je LPC-Pin. Reihenfolge =
+// physisches LPC11xx-IOCON-Layout (UM10398 / CMSIS LPC_IOCON_TypeDef, exakt wie
+// sblib platform.cpp ioconOffsets). 0xFFFF = kein IOCON-Register. Wird genutzt,
+// um die MODE-Bits (Pull-up/-down) eines Pins auf den echten RP2350-Pad
+// anzuwenden — sonst floaten LPC-Input-Pins (z. B. der Selfbus-PROG-Taster mit
+// INPUT|PULL_UP) auf dem RP2350-Default (Pull-down) und werden nie erkannt.
+constexpr uint16_t IOCON_NONE = 0xFFFFu;
+constexpr uint16_t IOCON_OFF[4][12] = {
+    // Port 0: P0_0..P0_11
+    { 0x00C, 0x010, 0x01C, 0x02C, 0x030, 0x034,
+      0x04C, 0x050, 0x060, 0x064, 0x068, 0x074 },
+    // Port 1: P1_0..P1_11
+    { 0x078, 0x07C, 0x080, 0x090, 0x094, 0x0A0,
+      0x0A4, 0x0A8, 0x014, 0x038, 0x06C, 0x098 },
+    // Port 2: P2_0..P2_11
+    { 0x008, 0x028, 0x05C, 0x08C, 0x040, 0x044,
+      0x000, 0x020, 0x024, 0x054, 0x058, 0x070 },
+    // Port 3: P3_0..P3_5 (Rest nicht bestueckt)
+    { 0x084, 0x088, 0x09C, 0x0AC, 0x03C, 0x048,
+      IOCON_NONE, IOCON_NONE, IOCON_NONE, IOCON_NONE, IOCON_NONE, IOCON_NONE },
+};
+
+// Wendet die IOCON-MODE-Bits (Pull-up/-down) eines LPC-Pins auf den gemappten
+// echten RP2350-Pad an. Fuer Output-Pins werden die Pulls deaktiviert (der Pin
+// treibt aktiv). Bridge-Pins (ADC/SPI/Capture/Match) bleiben unberuehrt.
+void apply_pull_to_hw(uint8_t port, uint8_t pin) {
+    if (port >= 4u || pin >= 12u) return;
+    uint16_t off = IOCON_OFF[port][pin];
+    if (off == IOCON_NONE) return;
+    const auto& pm = config::pin_map();
+    uint8_t lpc = lpc_pin_idx(port, pin);
+    if (lpc >= config::LPC_PIN_COUNT) return;
+    int g = pm.lpc_to_rp[lpc];
+    if (g < 0 || bridge_owns_gpio(g)) return;
+    if ((g_gpio[port].dir >> pin) & 1u) {            // Output -> kein Pull
+        gpio_disable_pulls(static_cast<uint>(g));
+        return;
+    }
+    switch ((g_iocon[off] >> 3) & 0x3u) {            // IOCON MODE[1:0]
+        case 0x1: gpio_pull_down(static_cast<uint>(g)); break;   // pull-down
+        case 0x2: gpio_pull_up(static_cast<uint>(g));   break;   // pull-up
+        default:  gpio_disable_pulls(static_cast<uint>(g)); break;// inactive/repeater
+    }
+}
+
+// Reverse-Lookup: IOCON-Byteoffset (word-aligned) -> Pin, dann Pull anwenden.
+void apply_iocon_pull(uint32_t byte_off) {
+    for (uint8_t port = 0; port < 4u; ++port)
+        for (uint8_t pin = 0; pin < 12u; ++pin)
+            if (IOCON_OFF[port][pin] == byte_off) {
+                apply_pull_to_hw(port, pin);
+                return;
+            }
+}
+
 void apply_gpio_to_hw(uint8_t lpc_pin, bool out, bool level) {
     auto pm = config::pin_map();
     if (lpc_pin >= config::LPC_PIN_COUNT) return;
@@ -239,7 +295,15 @@ void apply_gpio_to_hw(uint8_t lpc_pin, bool out, bool level) {
     if (bridge_owns_gpio(g)) return;   // ADC/SPI/Timer-Capture/Match besitzen den Pin
     gpio_init(static_cast<uint>(g));
     gpio_set_dir(static_cast<uint>(g), out);
-    if (out) gpio_put(static_cast<uint>(g), level);
+    if (out) {
+        gpio_disable_pulls(static_cast<uint>(g));    // Ausgang treibt aktiv
+        gpio_put(static_cast<uint>(g), level);
+    } else {
+        // Eingang: Pull-Konfiguration aus dem IOCON-Schatten anwenden, damit ein
+        // Taster gegen GND (PROG-Pin, INPUT|PULL_UP) sauber erkannt wird.
+        apply_pull_to_hw(static_cast<uint8_t>(lpc_pin / 12u),
+                         static_cast<uint8_t>(lpc_pin % 12u));
+    }
 }
 
 // LPC1115-PLL-Modell (UM10398, Kap. 3.5.5):
@@ -1834,7 +1898,12 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
         return true;  // andere GPIO-Subregister still akzeptieren
     }
     if (addr >= IOCON_BASE && addr < IOCON_END) {
-        g_iocon[addr - IOCON_BASE] = val; return true;
+        uint32_t off = addr - IOCON_BASE;
+        g_iocon[off] = val;
+        // MODE-Bits (Pull-up/-down) liegen in Byte 0 des 32-bit-Registers.
+        // Nach jedem Byte-Write den Pull des zugehoerigen Pins nachziehen.
+        apply_iocon_pull(off & ~3u);
+        return true;
     }
     if (addr >= SYSCON_BASE && addr < SYSCON_BASE + 0x300) {
         syscon_collect_byte(addr, val);

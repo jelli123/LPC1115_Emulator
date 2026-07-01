@@ -136,6 +136,28 @@ void apply_defaults() {
     g_tcap_pio = false;
 }
 
+// Weist einem LPC-Pin einen RP2350-GPIO zu und erzwingt dabei Eindeutigkeit:
+// ein physischer GPIO gehoert immer nur EINEM LPC-Pin. Ist der Ziel-GPIO schon
+// einem anderen Pin (z. B. der Default-Belegung) zugeordnet, wird die alte
+// Zuordnung geloest. verbose=true gibt das auf der CLI aus (Nutzer-Aktion),
+// verbose=false bleibt still (Boot-Ladepfad).
+void assign_pin_unique(uint8_t lpc_pin, int gpio, bool verbose) {
+    if (gpio >= 0) {
+        for (std::size_t i = 0; i < LPC_PIN_COUNT; ++i) {
+            if (i != lpc_pin && g_pin_map.lpc_to_rp[i] == gpio) {
+                if (verbose) {
+                    std::printf("[CFG] GP%d: P%u_%u -> P%u_%u (Neuzuordnung, alte geloest)\n",
+                                gpio,
+                                static_cast<unsigned>(i / 12), static_cast<unsigned>(i % 12),
+                                static_cast<unsigned>(lpc_pin / 12), static_cast<unsigned>(lpc_pin % 12));
+                }
+                g_pin_map.lpc_to_rp[i] = -1;
+            }
+        }
+    }
+    g_pin_map.lpc_to_rp[lpc_pin] = static_cast<int8_t>(gpio);
+}
+
 void load_pin_map_from_storage() {
     char buf[16];
     char key[24];
@@ -146,7 +168,11 @@ void load_pin_map_from_storage() {
         uint32_t v;
         if (!parse_uint32(buf, v)) continue;
         if (v > static_cast<uint32_t>(MAX_GPIO)) continue;
-        g_pin_map.lpc_to_rp[i] = static_cast<int8_t>(v);
+        // Ueber die Eindeutigkeits-Zuweisung: eine persistierte Zuordnung
+        // verdraengt einen kollidierenden Default (der von apply_defaults davor
+        // gesetzt wurde), damit nach einem Reboot keine doppelte Belegung
+        // wieder auftaucht. Still (kein CLI-Spam beim Boot).
+        assign_pin_unique(static_cast<uint8_t>(i), static_cast<int>(v), /*verbose=*/false);
     }
 }
 
@@ -383,7 +409,11 @@ const PinMap& pin_map() { return g_pin_map; }
 bool set_pin_map(uint8_t lpc_pin, int rp2350_gpio) {
     if (lpc_pin >= LPC_PIN_COUNT) return false;
     if (rp2350_gpio < -1 || rp2350_gpio > MAX_GPIO) return false;
-    g_pin_map.lpc_to_rp[lpc_pin] = static_cast<int8_t>(rp2350_gpio);
+    // Eindeutigkeit erzwingen (siehe assign_pin_unique): ein physischer GPIO
+    // kann nur EINEM LPC-Pin gehoeren. Eine kollidierende alte Zuordnung (z. B.
+    // die Default-Belegung P1_3->GP17) wird geloest, damit die neue tatsaechlich
+    // greift und `pinmap show` keine doppelte, mehrdeutige Belegung mehr zeigt.
+    assign_pin_unique(lpc_pin, rp2350_gpio, /*verbose=*/true);
     return true;
 }
 
