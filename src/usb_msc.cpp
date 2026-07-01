@@ -584,7 +584,9 @@ void build_info_files() {
     fat_write_file("HELP.HTM",
                    reinterpret_cast<const uint8_t*>(HELP_HTML),
                    HELP_HTML_LEN);
-    static char cfg[3072];
+    // Reichlich bemessen: die generierte CONFIG.INI (Kommentare + alle mapped
+    // Pins) liegt bei ~3.7 KB; 6 KiB laesst Raum fuer volle Pinmaps/Bridges.
+    static char cfg[6144];
     uint32_t len = 0;
     build_config_ini(cfg, sizeof cfg, len);
     fat_write_file("CONFIG.INI", reinterpret_cast<const uint8_t*>(cfg), len);
@@ -630,9 +632,11 @@ void on_volume_ready() {
     // reiner CONFIG.INI die bisherige weiter. Lief kein Gast, ist es ein No-op.
     emulator::FlashPauseGuard flash_pause;
 
-    // CONFIG.INI zuerst (damit Pinmap vor dem Boot wirkt).
-    if (find_dir_entry("CONFIG.INI", cl, sz) && sz > 0 && sz < 4096) {
-        char buf[4096];
+    // CONFIG.INI zuerst (damit Pinmap vor dem Boot wirkt). Puffer grosszuegig
+    // (>= generierte Groesse ~3.7 KB + Nutzer-Zusaetze); statisch, da
+    // on_volume_ready nicht reentrant ist (nur poll() auf Core0).
+    if (find_dir_entry("CONFIG.INI", cl, sz) && sz > 0 && sz < 8192) {
+        static char buf[8192];
         uint32_t n = read_cluster_chain(cl, sz, reinterpret_cast<uint8_t*>(buf),
                                         sizeof buf);
         parse_config(buf, n);
