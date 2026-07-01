@@ -52,6 +52,38 @@ bool guest_read32_safe(uint32_t addr, uint32_t& out) {
     return true;
 }
 
+// Rueckkehr eines injizierten LPC-IRQ-Handlers. Die IRQ-Injektion
+// (irq_inject.cpp) legt einen synthetischen Exception-Frame auf den Gast-PSP,
+// sodass der LPC-Handler nach dem PendSV-EXC_RETURN im THREAD-Mode mit
+// LR=0xFFFFFFFD anlaeuft. Beendet sich der Handler regulaer (POP {..,pc} bzw.
+// BX LR mit eben diesem 0xFFFFFFFD), laedt er PC=0xFFFFFFFD — im Thread-Mode ist
+// das KEINE gueltige Exception-Rueckkehr: der Core versucht 0xFFFFFFFC
+// anzuspringen und faultet (BusFault; unter PRIMASK zu HardFault eskaliert).
+// Der vom IRQ unterbrochene Original-Gast-Frame liegt genau 32 Byte OBERHALB des
+// Fault-Frames auf dem PSP (der Handler hat seinen eigenen Stack balanciert).
+// Wir heben den PSP um diese 32 Byte an; die anschliessende HW-Exception-
+// Rueckkehr unseres Fault-Handlers pop't dann jenen Original-Frame und setzt den
+// unterbrochenen Gast-Code transparent fort (HW behandelt ein evtl. Alignment-
+// Padding des Original-Frames selbst via xPSR-Bit 9).
+//
+// Ohne diese Behandlung wuerde JEDER injizierte IRQ beim Ruecksprung faulten
+// (betrifft alle Firmware mit Interrupts, z. B. KNX-Timer/Bus-IRQs).
+// Signatur: PC im EXC_RETURN-Bereich (>=0xFFFFFFE0) UND Fault aus Thread-Mode
+// (Frame liegt auf PSP) UND der Original-Frame ist plausibel (xPSR.T gesetzt).
+bool try_injected_irq_return(uint32_t* frame) {
+    if ((frame[6] & 0xFFFF'FFE0u) != 0xFFFF'FFE0u) return false;  // PC != EXC_RETURN
+    uint32_t psp;
+    __asm volatile ("mrs %0, psp" : "=r"(psp));
+    if (reinterpret_cast<uint32_t>(frame) != psp) return false;   // nicht Thread/PSP
+    const uint32_t* orig = frame + 8;                             // Frame 32 B darueber
+    if (!(orig[7] & (1u << 24))) return false;                    // xPSR.T plausibel?
+    psp += 32u;                                                   // Fault-Frame ueberspringen
+    __asm volatile ("msr psp, %0" :: "r"(psp));
+    __ISB();
+    ++faultsys::g_stats.mem_traps;
+    return true;
+}
+
 // Dekodiert die wichtigsten CFSR/HFSR-Bits (ARMv8-M) in Klartext.
 void print_fault_cause() {
     const uint32_t c = SCB->CFSR;
@@ -144,6 +176,11 @@ void print_exc_diag(const char* tag, const uint32_t* f, const uint32_t* r4_r11) 
 extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
                                   uint32_t* r4_r11_lr) {
     using namespace trap_decoder;
+
+    // Rueckkehr eines injizierten LPC-IRQ-Handlers (PC im EXC_RETURN-Bereich,
+    // Thread-Mode): Original-Frame freilegen + transparent fortsetzen. Muss
+    // VOR jeder PC-Dereferenzierung stehen (PC=0xFFFFFFFC ist nicht lesbar).
+    if (try_injected_irq_return(reinterpret_cast<uint32_t*>(frame))) return;
 
     // IAP-ROM-Trap: Guest hat über Funktionspointer 0x1FFF1FF1 in den
     // BootROM gesprungen. Adresse existiert auf RP2350 nicht → Prefetch-
@@ -551,6 +588,11 @@ extern "C" __attribute__((naked)) void isr_memmanage() {
 // pending und feuert, sobald der Gast die Interrupts wieder freigibt) und
 // kehren hinter das WFI zurück. PRIMASK des Gastes bleibt unangetastet.
 extern "C" void hardfault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
+    // Rueckkehr eines injizierten LPC-IRQ-Handlers, der unter PRIMASK lief und
+    // dessen 0xFFFFFFFD-Ruecksprung daher zu HardFault eskalierte. Zuerst
+    // pruefen (vor jeder PC-Dereferenzierung wie dem WFI-Check unten).
+    if (try_injected_irq_return(exc_frame)) return;
+
     // Eskalierte IACCVIOL: Der Gast sprang ueber einen NICHT-relozierten
     // LPC-Funktionspointer (rohe Flash-Adresse 0x0000xxxx oder RAM 0x1000xxxx,
     // z. B. `blx r3` mit r3=0x00004e4d). Solche Flash-Code-Pointer werden vom

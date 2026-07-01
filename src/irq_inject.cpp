@@ -24,9 +24,14 @@
 //
 // Beim EXC_RETURN nach unserem PendSV (LR=0xFFFFFFFD = thread mode, PSP)
 // pop't der Core den synthetisierten Frame und springt in den LPC-IRQ-
-// Handler. Wenn der Handler mit `BX LR` zurückkehrt (LR ist 0xFFFFFFFD
-// im neuen Frame), pop't der Core den darunter liegenden, originalen
-// Frame des Gast-Codes — dieser läuft nahtlos weiter.
+// Handler. Dieser laeuft damit im THREAD-Mode (nicht Handler-Mode!) mit
+// LR=0xFFFFFFFD. Kehrt er regulaer zurueck (POP {..,pc} / BX LR mit dem
+// 0xFFFFFFFD), ist das im Thread-Mode KEINE gueltige Exception-Rueckkehr: der
+// Core faultet beim Anspringen von 0xFFFFFFFC. Dieser Fault wird im Fault-
+// Handler (fault.cpp try_injected_irq_return) abgefangen, der den darunter
+// liegenden Original-Frame freilegt und den Gast nahtlos fortsetzt. Der frueher
+// hier angenommene "der Core pop't den Original-Frame automatisch" gilt NUR im
+// Handler-Mode und trifft auf diese Thread-Mode-Injektion NICHT zu.
 
 namespace irq_inject {
 
