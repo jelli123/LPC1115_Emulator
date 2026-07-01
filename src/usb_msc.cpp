@@ -5,6 +5,7 @@
 #include "peripherals.h"
 #include "uart_bridge.h"
 #include "emulator.h"
+#include "fault.h"
 
 #include "tusb.h"
 #include "pico/stdlib.h"
@@ -54,6 +55,22 @@ volatile uint32_t  g_last_write_ms = 0;
 // und den Gast unnoetig neu startet.
 uint32_t g_last_volume_hash = 0;
 bool     g_have_volume_hash = false;
+
+// --- Media-Change (fuer FAULT.TXT sichtbar machen) ------------------------
+// Um eine device-seitig injizierte Datei (FAULT.TXT) fuer den Host sichtbar zu
+// machen, simulieren wir Auswurf+Wiedereinlegen des Mediums: waehrend eines
+// kurzen Fensters meldet test_unit_ready "medium not present", danach einmalig
+// UNIT ATTENTION ("medium may have changed"). Der Host verwirft dann seinen
+// FAT-/Directory-Cache und liest das Volume frisch ein. Alles auf Core0
+// (TinyUSB-Task + poll laufen kooperativ auf demselben Core) -> keine Atomics.
+volatile uint32_t g_media_absent_until = 0;   // ms-Zeitpunkt, bis Medium "weg"
+bool              g_media_absent      = false;
+bool              g_media_attention   = false; // one-shot nach Wiederkehr
+
+void trigger_media_change() {
+    g_media_absent_until = to_ms_since_boot(get_absolute_time()) + 700u;
+    g_media_absent = true;
+}
 
 const char VOL_LABEL[11]  = { 'L','P','C','1','1','1','5','E','M','U',' ' };
 const char OEM_NAME[8]    = { 'M','S','D','O','S','5','.','0' };
@@ -355,6 +372,77 @@ uint32_t volume_hash() {
     return h;
 }
 
+// Schreibt eine kleine Datei frisch in die (zuvor per format_blank geleerte)
+// RAM-Disk: freien Root-Directory-Eintrag + FAT12-Cluster-Kette + Datensektoren.
+// Nur fuer wenige Cluster gedacht (FAULT.TXT << Volume-Groesse). name im
+// "NAME.EXT"-Format (wird via to_83 auf 8.3 normalisiert).
+void fat_write_file(const char* name, const uint8_t* data, uint32_t len) {
+    uint8_t* fat  = g_disk + RESERVED_SECTORS * SECTOR_SIZE;
+    uint8_t* root = g_disk + (RESERVED_SECTORS + SECTORS_PER_FAT) * SECTOR_SIZE;
+
+    // Freien Directory-Eintrag suchen (0x00 = Ende, 0xE5 = geloescht).
+    uint8_t* de = nullptr;
+    for (uint32_t i = 0; i < ROOT_DIR_ENTRIES; ++i) {
+        uint8_t* e = root + i * 32;
+        if (e[0] == 0x00 || e[0] == 0xE5) { de = e; break; }
+    }
+    if (!de) return;
+
+    char name83[11];
+    to_83(name, name83);
+    std::memset(de, 0, 32);
+    std::memcpy(de, name83, 11);
+    de[11] = 0x01;                               // Attribut: read-only
+
+    uint32_t clusters = (len + SECTOR_SIZE - 1u) / SECTOR_SIZE;
+    if (clusters == 0) clusters = 1;
+    if (clusters > TOTAL_CLUSTERS) clusters = TOTAL_CLUSTERS;
+    const uint16_t first = 2;                     // frische Disk -> Cluster 2..N frei
+
+    // FAT12-Kette 2->3->...->N->EOF(0xFFF).
+    for (uint32_t k = 0; k < clusters; ++k) {
+        uint16_t cur  = static_cast<uint16_t>(first + k);
+        uint16_t next = (k + 1u < clusters) ? static_cast<uint16_t>(cur + 1) : 0x0FFFu;
+        uint32_t off  = (cur * 3u) / 2u;
+        if (cur & 1u) {
+            fat[off]     = static_cast<uint8_t>((fat[off] & 0x0F) | ((next << 4) & 0xF0));
+            fat[off + 1] = static_cast<uint8_t>((next >> 4) & 0xFF);
+        } else {
+            fat[off]     = static_cast<uint8_t>(next & 0xFF);
+            fat[off + 1] = static_cast<uint8_t>((fat[off + 1] & 0xF0) | ((next >> 8) & 0x0F));
+        }
+    }
+
+    // Datensektoren fuellen.
+    uint8_t* region = g_disk + FIRST_DATA_SECTOR * SECTOR_SIZE;
+    uint32_t cap = clusters * SECTORS_PER_CLUSTER * SECTOR_SIZE;
+    uint32_t n   = (len < cap) ? len : cap;
+    std::memcpy(region, data, n);
+
+    de[26] = static_cast<uint8_t>(first & 0xFF);
+    de[27] = static_cast<uint8_t>((first >> 8) & 0xFF);
+    de[28] = static_cast<uint8_t>(n & 0xFF);
+    de[29] = static_cast<uint8_t>((n >> 8) & 0xFF);
+    de[30] = static_cast<uint8_t>((n >> 16) & 0xFF);
+    de[31] = static_cast<uint8_t>((n >> 24) & 0xFF);
+}
+
+// Baut ein frisches Volume, das nur FAULT.TXT enthaelt (mbed-DAPLink-Stil).
+// Die RAM-Disk ist nur ein Transfer-Puffer (echte Firmware liegt im Flash-Slot),
+// daher ist das Ueberschreiben unkritisch. Dedup-/Dirty-State wird so gesetzt,
+// dass poll() das injizierte Volume NICHT als neuen Upload interpretiert.
+void build_fault_volume(const char* text, uint32_t len) {
+    format_blank();                              // frisches FAT12 (nur Volume-Label)
+    if (len > 0) {
+        fat_write_file("FAULT.TXT",
+                       reinterpret_cast<const uint8_t*>(text), len);
+    }
+    g_dirty.store(false);
+    g_volume_processed.store(true);
+    g_last_volume_hash = volume_hash();
+    g_have_volume_hash = true;
+}
+
 // Trigger nach Eject vom Hauptloop aufgerufen.
 void on_volume_ready() {
     uint16_t cl; uint32_t sz;
@@ -478,6 +566,16 @@ bool consume_pending_boot_request() {
 }
 
 void poll() {
+    // Fatal-Fault vom Gast (Core1): kompletten [FAULT]-Report als FAULT.TXT auf
+    // das Laufwerk legen und den Host zum Neueinlesen zwingen, damit ein Fehler
+    // auch ohne CLI/Serial analysierbar ist. Hat Vorrang; einmal pro Fault.
+    if (faultsys::report_ready()) {
+        build_fault_volume(faultsys::report_data(), faultsys::report_length());
+        faultsys::clear_report();
+        trigger_media_change();
+        return;
+    }
+
     // Eject-Flag: wurde im USB-Callback gesetzt, jetzt im Hauptloop sicher
     // verarbeiten (Flash-Operationen brauchen lange + deaktivieren IRQs).
     if (g_eject_pending.exchange(false)) {
@@ -533,7 +631,26 @@ void tud_msc_inquiry_cb(uint8_t /*lun*/, uint8_t vendor[8],
     std::memcpy(rev,     r, 4);
 }
 
-bool tud_msc_test_unit_ready_cb(uint8_t /*lun*/) { return true; }
+bool tud_msc_test_unit_ready_cb(uint8_t lun) {
+    // Media-Change-Sequenz (macht device-seitig injizierte FAULT.TXT sichtbar):
+    // waehrend des Absent-Fensters "medium not present", danach einmalig
+    // UNIT ATTENTION -> Host liest das Volume frisch ein.
+    if (usb_msc::g_media_absent) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (static_cast<int32_t>(now - usb_msc::g_media_absent_until) < 0) {
+            tud_msc_set_sense(lun, 0x02, 0x3A, 0x00);  // NOT READY, medium not present
+            return false;
+        }
+        usb_msc::g_media_absent    = false;
+        usb_msc::g_media_attention = true;             // Wiederkehr signalisieren
+    }
+    if (usb_msc::g_media_attention) {
+        usb_msc::g_media_attention = false;
+        tud_msc_set_sense(lun, 0x06, 0x28, 0x00);      // UNIT ATTENTION, medium may have changed
+        return false;
+    }
+    return true;
+}
 
 void tud_msc_capacity_cb(uint8_t /*lun*/, uint32_t* block_count,
                          uint16_t* block_size) {

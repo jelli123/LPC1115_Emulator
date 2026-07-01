@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdarg>
+#include <atomic>
 #include "hardware/watchdog.h"
 #include "pico/stdlib.h"
 #include "RP2350.h"
@@ -18,11 +20,38 @@ namespace faultsys {
 
 namespace {
 Stats g_stats{};
+
+// --- Fault-Report-Puffer (Core1 schreibt, Core0 liest) --------------------
+// Aufgebaut aus denselben Zeilen wie die serielle [FAULT]-Diagnose (femit
+// spiegelt jeden printf hier hinein). Ein einzelner fataler Fault passt locker
+// in 2 KiB. g_report_ready wird mit release gesetzt, nachdem der Puffer fertig
+// ist; Core0 liest mit acquire.
+char                 g_report[2048];
+uint32_t             g_report_len = 0;
+std::atomic<bool>    g_report_ready{false};
+
+void report_reset() {
+    g_report_len = 0;
+    g_report[0]  = '\0';
+    g_report_ready.store(false, std::memory_order_relaxed);
 }
+
+void report_puts(const char* s) {
+    while (*s && g_report_len + 1u < sizeof g_report) g_report[g_report_len++] = *s++;
+    g_report[g_report_len] = '\0';
+}
+
+void report_commit() { g_report_ready.store(true, std::memory_order_release); }
+} // namespace
 
 Stats stats() { return g_stats; }
 
 void init() { g_stats = {}; }
+
+bool        report_ready()  { return g_report_ready.load(std::memory_order_acquire); }
+const char* report_data()   { return g_report; }
+uint32_t    report_length() { return g_report_len; }
+void        clear_report()  { g_report_ready.store(false, std::memory_order_release); }
 
 } // namespace faultsys
 
@@ -50,6 +79,21 @@ bool guest_read32_safe(uint32_t addr, uint32_t& out) {
     }
     std::memcpy(&out, reinterpret_cast<const void*>(host), 4);
     return true;
+}
+
+// Dual-Sink: gibt eine Zeile seriell aus UND haengt sie an den Fault-Report an
+// (fuer FAULT.TXT auf dem USB-MSC). Wird von der gesamten [FAULT]-Diagnose
+// genutzt. Bei nicht-fatalen Traps NICHT verwendet (kein Report noetig).
+__attribute__((format(printf, 1, 2)))
+void femit(const char* fmt, ...) {
+    char line[192];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = std::vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    std::fputs(line, stdout);
+    faultsys::report_puts(line);
 }
 
 // Rueckkehr eines injizierten LPC-IRQ-Handlers. Die IRQ-Injektion
@@ -89,62 +133,63 @@ void print_fault_cause() {
     const uint32_t c = SCB->CFSR;
     const uint32_t h = SCB->HFSR;
     // MemManage (MMFSR, Bits 0-7)
-    if (c & (1u<<0))  std::printf("[FAULT]  MMFSR.IACCVIOL  (Code-Fetch verboten)\n");
-    if (c & (1u<<1))  std::printf("[FAULT]  MMFSR.DACCVIOL  (Daten-Zugriff verboten)\n");
-    if (c & (1u<<3))  std::printf("[FAULT]  MMFSR.MUNSTKERR (Unstacking-Fehler)\n");
-    if (c & (1u<<4))  std::printf("[FAULT]  MMFSR.MSTKERR   (Stacking-Fehler)\n");
-    if (c & (1u<<5))  std::printf("[FAULT]  MMFSR.MLSPERR   (Lazy-FP-Stacking)\n");
+    if (c & (1u<<0))  femit("[FAULT]  MMFSR.IACCVIOL  (Code-Fetch verboten)\n");
+    if (c & (1u<<1))  femit("[FAULT]  MMFSR.DACCVIOL  (Daten-Zugriff verboten)\n");
+    if (c & (1u<<3))  femit("[FAULT]  MMFSR.MUNSTKERR (Unstacking-Fehler)\n");
+    if (c & (1u<<4))  femit("[FAULT]  MMFSR.MSTKERR   (Stacking-Fehler)\n");
+    if (c & (1u<<5))  femit("[FAULT]  MMFSR.MLSPERR   (Lazy-FP-Stacking)\n");
     // BusFault (BFSR, Bits 8-15)
-    if (c & (1u<<8))  std::printf("[FAULT]  BFSR.IBUSERR    (Instruktions-Bus)\n");
-    if (c & (1u<<9))  std::printf("[FAULT]  BFSR.PRECISERR  (praeziser Daten-Bus)\n");
-    if (c & (1u<<10)) std::printf("[FAULT]  BFSR.IMPRECISERR(impraeziser Daten-Bus)\n");
-    if (c & (1u<<11)) std::printf("[FAULT]  BFSR.UNSTKERR\n");
-    if (c & (1u<<12)) std::printf("[FAULT]  BFSR.STKERR\n");
+    if (c & (1u<<8))  femit("[FAULT]  BFSR.IBUSERR    (Instruktions-Bus)\n");
+    if (c & (1u<<9))  femit("[FAULT]  BFSR.PRECISERR  (praeziser Daten-Bus)\n");
+    if (c & (1u<<10)) femit("[FAULT]  BFSR.IMPRECISERR(impraeziser Daten-Bus)\n");
+    if (c & (1u<<11)) femit("[FAULT]  BFSR.UNSTKERR\n");
+    if (c & (1u<<12)) femit("[FAULT]  BFSR.STKERR\n");
     // UsageFault (UFSR, Bits 16-25)
-    if (c & (1u<<16)) std::printf("[FAULT]  UFSR.UNDEFINSTR (illegale Instruktion)\n");
-    if (c & (1u<<17)) std::printf("[FAULT]  UFSR.INVSTATE   (ungueltiger Thumb/EPSR-State)\n");
-    if (c & (1u<<18)) std::printf("[FAULT]  UFSR.INVPC      (ungueltiger EXC_RETURN/PC)\n");
-    if (c & (1u<<19)) std::printf("[FAULT]  UFSR.NOCP       (Coprozessor/FPU nicht da)\n");
-    if (c & (1u<<20)) std::printf("[FAULT]  UFSR.STKOF      (Stack-Overflow)\n");
-    if (c & (1u<<24)) std::printf("[FAULT]  UFSR.UNALIGNED  (unaligned Zugriff)\n");
-    if (c & (1u<<25)) std::printf("[FAULT]  UFSR.DIVBYZERO  (Division durch 0)\n");
-    if (h & (1u<<30)) std::printf("[FAULT]  HFSR.FORCED     (eskalierter Fault)\n");
-    if (h & (1u<<1))  std::printf("[FAULT]  HFSR.VECTTBL    (Vektortabellen-Lesefehler)\n");
+    if (c & (1u<<16)) femit("[FAULT]  UFSR.UNDEFINSTR (illegale Instruktion)\n");
+    if (c & (1u<<17)) femit("[FAULT]  UFSR.INVSTATE   (ungueltiger Thumb/EPSR-State)\n");
+    if (c & (1u<<18)) femit("[FAULT]  UFSR.INVPC      (ungueltiger EXC_RETURN/PC)\n");
+    if (c & (1u<<19)) femit("[FAULT]  UFSR.NOCP       (Coprozessor/FPU nicht da)\n");
+    if (c & (1u<<20)) femit("[FAULT]  UFSR.STKOF      (Stack-Overflow)\n");
+    if (c & (1u<<24)) femit("[FAULT]  UFSR.UNALIGNED  (unaligned Zugriff)\n");
+    if (c & (1u<<25)) femit("[FAULT]  UFSR.DIVBYZERO  (Division durch 0)\n");
+    if (h & (1u<<30)) femit("[FAULT]  HFSR.FORCED     (eskalierter Fault)\n");
+    if (h & (1u<<1))  femit("[FAULT]  HFSR.VECTTBL    (Vektortabellen-Lesefehler)\n");
 }
 
 // Gemeinsame Diagnose-Ausgabe fuer die fatalen Exception-Handler. f = Standard-
 // exception-stacked Frame (r0,r1,r2,r3,r12,lr,pc,xpsr). r4_r11 optional (vom
 // Asm-Wrapper gepushter Block) — nullptr, wenn nicht verfuegbar.
 void print_exc_diag(const char* tag, const uint32_t* f, const uint32_t* r4_r11) {
+    faultsys::report_reset();       // frischer Report fuer diese Fault-Sequenz
     const uint32_t lb = emulator::load_base();
     auto lpc = [&](uint32_t a) -> long {            // Host->LPC-Offset, sonst -1
         return (a >= lb && a < lb + emulator::LPC_LOAD_MAX_SIZE)
                    ? static_cast<long>(a - lb) : -1L;
     };
-    std::printf("[FAULT] %s @PC=0x%08lx (LPC 0x%lx) CFSR=0x%08lx HFSR=0x%08lx\n",
+    femit("[FAULT] %s @PC=0x%08lx (LPC 0x%lx) CFSR=0x%08lx HFSR=0x%08lx\n",
                 tag, (unsigned long)f[6], lpc(f[6] & ~1u),
                 (unsigned long)SCB->CFSR, (unsigned long)SCB->HFSR);
     print_fault_cause();
-    std::printf("[FAULT]  r0=%08lx r1=%08lx r2=%08lx r3=%08lx r12=%08lx\n",
+    femit("[FAULT]  r0=%08lx r1=%08lx r2=%08lx r3=%08lx r12=%08lx\n",
                 (unsigned long)f[0], (unsigned long)f[1], (unsigned long)f[2],
                 (unsigned long)f[3], (unsigned long)f[4]);
-    std::printf("[FAULT]  LR=%08lx (LPC 0x%lx)  xPSR=%08lx  SP=%08lx\n",
+    femit("[FAULT]  LR=%08lx (LPC 0x%lx)  xPSR=%08lx  SP=%08lx\n",
                 (unsigned long)f[5], lpc(f[5] & ~1u), (unsigned long)f[7],
                 (unsigned long)(reinterpret_cast<uint32_t>(f) + 0x20u));
     if (r4_r11)
-        std::printf("[FAULT]  r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
+        femit("[FAULT]  r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
                     (unsigned long)r4_r11[0], (unsigned long)r4_r11[1],
                     (unsigned long)r4_r11[2], (unsigned long)r4_r11[3]);
     // Gefehlerte Instruktion(en) am PC, wenn die Adresse gemappt ist.
     uint32_t iw = 0;
     if (guest_read32_safe(f[6] & ~1u, iw))
-        std::printf("[FAULT]  instr@PC = 0x%04lx 0x%04lx\n",
+        femit("[FAULT]  instr@PC = 0x%04lx 0x%04lx\n",
                     (unsigned long)(iw & 0xFFFFu), (unsigned long)(iw >> 16));
     // Fault-Adressen, falls gueltig (MMARVALID=Bit7, BFARVALID=Bit15 in CFSR).
     if (SCB->CFSR & (1u<<7))
-        std::printf("[FAULT]  MMFAR=0x%08lx\n", (unsigned long)SCB->MMFAR);
+        femit("[FAULT]  MMFAR=0x%08lx\n", (unsigned long)SCB->MMFAR);
     if (SCB->CFSR & (1u<<15))
-        std::printf("[FAULT]  BFAR=0x%08lx\n", (unsigned long)SCB->BFAR);
+        femit("[FAULT]  BFAR=0x%08lx\n", (unsigned long)SCB->BFAR);
 }
 
 // Nicht-emulierbarer Gast-Fault: Gast ANHALTEN statt das ganze Silizium per
@@ -156,8 +201,9 @@ void print_exc_diag(const char* tag, const uint32_t* f, const uint32_t* r4_r11) 
 // erneutes Flashen. Laeuft auf Core1 und kehrt nie zurueck (Core1 parkt).
 [[noreturn]] void enter_fatal_halt() {
     emulator::notify_guest_faulted();
-    std::printf("[FAULT] Gast angehalten (State=Faulted) — 'reset' oder neue "
+    femit("[FAULT] Gast angehalten (State=Faulted) — 'reset' oder neue "
                 "Firmware zum Fortfahren.\n");
+    faultsys::report_commit();   // Core0 legt den Report als FAULT.TXT ab
     for (;;) __asm volatile ("wfe");
 }
 
@@ -231,7 +277,8 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
         ++faultsys::g_stats.real_faults;
         faultsys::g_stats.last_fault_pc   = frame->pc;
         faultsys::g_stats.last_fault_addr = SCB->BFAR;
-        std::printf("[FAULT] non-decodable @PC=0x%08lx CFSR=0x%08lx BFAR=0x%08lx\n",
+        faultsys::report_reset();       // frischer Report fuer diese Fault-Sequenz
+        femit("[FAULT] non-decodable @PC=0x%08lx CFSR=0x%08lx BFAR=0x%08lx\n",
                     static_cast<unsigned long>(frame->pc),
                     static_cast<unsigned long>(SCB->CFSR),
                     static_cast<unsigned long>(SCB->BFAR));
@@ -243,14 +290,14 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
             return (a >= lb && a < lb + emulator::LPC_LOAD_MAX_SIZE)
                        ? static_cast<long>(a - lb) : -1L;
         };
-        std::printf("[FAULT]  r0=%08lx r1=%08lx r2=%08lx r3=%08lx r12=%08lx\n",
+        femit("[FAULT]  r0=%08lx r1=%08lx r2=%08lx r3=%08lx r12=%08lx\n",
                     (unsigned long)frame->r0, (unsigned long)frame->r1,
                     (unsigned long)frame->r2, (unsigned long)frame->r3,
                     (unsigned long)frame->r12);
-        std::printf("[FAULT]  LR=%08lx (LPC 0x%lx)  xPSR=%08lx  SP=%08lx\n",
+        femit("[FAULT]  LR=%08lx (LPC 0x%lx)  xPSR=%08lx  SP=%08lx\n",
                     (unsigned long)frame->lr, lpc(frame->lr & ~1u),
                     (unsigned long)frame->xpsr, (unsigned long)guest_sp);
-        std::printf("[FAULT]  r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
+        femit("[FAULT]  r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
                     (unsigned long)r4_r11[0], (unsigned long)r4_r11[1],
                     (unsigned long)r4_r11[2], (unsigned long)r4_r11[3]);
 
@@ -259,21 +306,21 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
         // r0 = this-Pointer bei virtuellen Aufrufen. Vtable-Kette aufdroeseln.
         if (SCB->CFSR & 0x01u) {
             uint32_t vt = 0, m0 = 0, m2 = 0, m11 = 0;
-            std::printf("[FAULT]  Code-Fetch (IACCVIOL): wilder Sprung nach 0x%08lx\n",
+            femit("[FAULT]  Code-Fetch (IACCVIOL): wilder Sprung nach 0x%08lx\n",
                         (unsigned long)frame->pc);
             if (guest_read32_safe(frame->r0, vt)) {
-                std::printf("[FAULT]  this=r0=0x%08lx -> vtable=0x%08lx\n",
+                femit("[FAULT]  this=r0=0x%08lx -> vtable=0x%08lx\n",
                             (unsigned long)frame->r0, (unsigned long)vt);
                 bool b0  = guest_read32_safe(vt + 0,  m0);
                 bool b2  = guest_read32_safe(vt + 8,  m2);
                 bool b11 = guest_read32_safe(vt + 44, m11);
-                std::printf("[FAULT]  vtable[0]=%s vtable[2]=%s vtable[11]=%s\n",
+                femit("[FAULT]  vtable[0]=%s vtable[2]=%s vtable[11]=%s\n",
                             b0  ? "" : "?", b2 ? "" : "?", b11 ? "" : "?");
-                std::printf("[FAULT]   = 0x%08lx / 0x%08lx / 0x%08lx\n",
+                femit("[FAULT]   = 0x%08lx / 0x%08lx / 0x%08lx\n",
                             (unsigned long)m0, (unsigned long)m2,
                             (unsigned long)m11);
             } else {
-                std::printf("[FAULT]  this=r0=0x%08lx (nicht gemappt)\n",
+                femit("[FAULT]  this=r0=0x%08lx (nicht gemappt)\n",
                             (unsigned long)frame->r0);
             }
         }
@@ -510,7 +557,8 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
         ++faultsys::g_stats.real_faults;
         faultsys::g_stats.last_fault_pc   = frame->pc;
         faultsys::g_stats.last_fault_addr = acc.address;
-        std::printf("[FAULT] mmio rejected @PC=0x%08lx addr=0x%08lx\n",
+        faultsys::report_reset();       // frischer Report fuer diese Fault-Sequenz
+        femit("[FAULT] mmio rejected @PC=0x%08lx addr=0x%08lx\n",
                     static_cast<unsigned long>(frame->pc),
                     static_cast<unsigned long>(acc.address));
         SCB->CFSR = SCB->CFSR;

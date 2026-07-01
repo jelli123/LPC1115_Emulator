@@ -23,6 +23,17 @@ struct Stats {
 void init();
 Stats stats();
 
+// --- Fault-Report (fuer USB-MSC FAULT.TXT) --------------------------------
+// Bei einem fatalen Gast-Fault sammelt der Fault-Handler (Core1) die komplette
+// Diagnose zusaetzlich zum seriellen printf in einem RAM-Puffer. Core0 (USB-MSC)
+// legt den Text als FAULT.TXT auf das Laufwerk, damit ein Fehler auch ohne
+// CLI/Serial analysierbar ist. Der Puffer wird beim Beginn jeder Fault-Sequenz
+// zurueckgesetzt und am Ende (enter_fatal_halt) freigegeben.
+bool        report_ready();     // true: neuer, noch nicht abgeholter Report da
+const char* report_data();      // NUL-terminierter Report-Text
+uint32_t    report_length();    // Laenge ohne NUL
+void        clear_report();      // vom Konsumenten (Core0) nach Abholung
+
 } // namespace faultsys
 
 void setup_fault_handlers();
