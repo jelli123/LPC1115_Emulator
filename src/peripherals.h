@@ -71,4 +71,8 @@ void systick_debug(uint32_t& reads, uint32_t& writes,
 // (32-bit-aligned, hoechstens ein Update Verzug).
 bool guest_output_level(uint8_t port, uint8_t pin, bool& level);
 
+// Roh-Schattenzustand eines LPC-GPIO-Ports (Diagnose). data/dir sind die vom
+// Gast zuletzt geschriebenen 12-bit-Register (Bit n = Pin n).
+void guest_gpio_raw(uint8_t port, uint32_t& data, uint32_t& dir);
+
 } // namespace peripherals

@@ -54,8 +54,11 @@ volatile uint32_t  g_last_write_ms = 0;
 
 // Auto-Flush der DEBUG.TXT: baut die RAM-Disk periodisch neu auf (frische
 // DEBUG.TXT aus der Debug-Bridge) und laesst den Host neu einlesen, sobald neue
-// Gast-Debug-Bytes vorliegen. 0 = aus. Per CLI 'dbg auto <sek|off>' steuerbar.
-uint32_t g_dbg_autoflush_ms  = 5000;
+// Gast-Debug-Bytes vorliegen. Default 0 = AUS: ein periodischer Medienwechsel
+// laesst das Laufwerk am Host staendig neu einbinden ("Remount-Churn"), was das
+// Bearbeiten der CONFIG.INI stoert. Der Nutzer aktiviert es bei Bedarf per
+// 'dbg auto <sek>'; manuelles 'dbg save' aktualisiert DEBUG.TXT jederzeit.
+uint32_t g_dbg_autoflush_ms  = 0;
 uint32_t g_last_dbg_flush_ms = 0;
 uint32_t g_last_dbg_total    = 0;
 

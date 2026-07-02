@@ -2189,4 +2189,10 @@ bool guest_output_level(uint8_t port, uint8_t pin, bool& level) {
     return true;
 }
 
+void guest_gpio_raw(uint8_t port, uint32_t& data, uint32_t& dir) {
+    if (port >= 4u) { data = 0; dir = 0; return; }
+    data = g_gpio[port].data;
+    dir  = g_gpio[port].dir;
+}
+
 } // namespace peripherals
