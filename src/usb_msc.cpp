@@ -58,6 +58,26 @@ volatile uint32_t  g_last_write_ms = 0;
 uint32_t g_last_volume_hash = 0;
 bool     g_have_volume_hash = false;
 
+// Inhalts-Hashes der zuletzt VERARBEITETEN Nutzdateien (nicht des ganzen
+// Volumes). Der Host schreibt eine Datei oft in mehreren Bursts mit Pausen
+// (> WRITE_IDLE_TIMEOUT_MS); jeder Zwischenstand hat einen anderen volume_hash
+// und wuerde sonst on_volume_ready() (inkl. Gast-Stop/-Neustart) erneut
+// ausloesen -> unregelmaessiges Blinken + Revert einer per CLI gesetzten
+// Pinmap. Durch den separaten Inhalts-Hash von CONFIG.INI bzw. der HEX wird nur
+// dann wirklich verarbeitet (und der Gast nur dann neu gestartet), wenn sich der
+// DATEI-Inhalt geaendert hat.
+uint32_t g_last_config_hash = 0;
+bool     g_have_config_hash = false;
+uint32_t g_last_hex_hash    = 0;
+bool     g_have_hex_hash    = false;
+
+// FNV-1a ueber einen Byte-Bereich (fuer die Datei-Inhalts-Dedup).
+uint32_t content_hash(const uint8_t* p, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; ++i) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
 // Naechster freier FAT12-Cluster fuer device-seitig injizierte Dateien
 // (HELP.HTM, CONFIG.INI, FAULT.TXT). Wird von format_blank auf 2 zurueckgesetzt
 // und von fat_write_file pro Datei weitergezaehlt, sodass mehrere Dateien
@@ -626,6 +646,22 @@ void build_fault_volume(const char* text, uint32_t len) {
     g_have_volume_hash = true;
 }
 
+// Merkt den Inhalts-Hash der aktuell in der RAM-Disk liegenden CONFIG.INI als
+// "verarbeitet". Wird nach init() und refresh_config_volume() aufgerufen, damit
+// on_volume_ready() die (device-seitig generierte, unveraenderte) CONFIG.INI
+// nicht erneut parst/persistiert — ein Re-Parse wuerde config::save() (Flash-
+// Schreibzugriff) ausloesen und dazu den laufenden Gast pausieren.
+void mark_config_processed() {
+    uint16_t cl; uint32_t sz;
+    static char tmp[8192];
+    if (find_dir_entry("CONFIG.INI", cl, sz) && sz > 0 && sz < sizeof tmp) {
+        uint32_t n = read_cluster_chain(cl, sz, reinterpret_cast<uint8_t*>(tmp),
+                                        sizeof tmp);
+        g_last_config_hash = content_hash(reinterpret_cast<uint8_t*>(tmp), n);
+        g_have_config_hash = true;
+    }
+}
+
 // Trigger nach Eject vom Hauptloop aufgerufen.
 void on_volume_ready() {
     uint16_t cl; uint32_t sz;
@@ -634,29 +670,66 @@ void on_volume_ready() {
     // Manche Hosts schreiben nach dem Eject beim Re-Mount erneut FAT-/Meta-
     // daten -> g_dirty + Dirty-Timeout -> on_volume_ready() erneut, OBWOHL sich
     // der Inhalt nicht geaendert hat. Ist der Hash identisch zum zuletzt
-    // verarbeiteten, hier fruehzeitig raus — VOR dem FlashPauseGuard, damit ein
-    // laufender Gast in diesem Fall NICHT unnoetig gestoppt/neu gestartet wird.
+    // verarbeiteten, hier fruehzeitig raus — VOR jedem Gast-Stop.
     const uint32_t vh = volume_hash();
     if (g_have_volume_hash && vh == g_last_volume_hash) {
         return;
     }
 
+    // --- Nutzdateien LESEN (nur aus g_disk; KEIN Flash, KEIN Gast-Stop) ------
+    // Erst danach wird anhand der Inhalts-Hashes entschieden, ob ueberhaupt ein
+    // Flash-Schreibzugriff (und damit ein Gast-Stop) noetig ist. So stoppt ein
+    // reiner Host-Metadaten-Write (gleiche Dateien) den laufenden Gast NICHT.
+    static char cfg_buf[8192];
+    uint32_t cfg_len  = 0;
+    bool     have_cfg = false;
+    if (find_dir_entry("CONFIG.INI", cl, sz) && sz > 0 && sz < sizeof cfg_buf) {
+        cfg_len  = read_cluster_chain(cl, sz, reinterpret_cast<uint8_t*>(cfg_buf),
+                                      sizeof cfg_buf);
+        have_cfg = true;
+    }
+
+    static uint8_t hex_buf[64 * 1024 + 1024];
+    uint32_t hex_len  = 0;
+    bool     have_hex = false;
+    char     hex_name[16] = {0};
+    {
+        uint16_t hcl; uint32_t hsz;
+        if (find_hex_entry(hcl, hsz, hex_name) && hsz > 0) {
+            hex_len  = read_cluster_chain(hcl, hsz, hex_buf, sizeof hex_buf);
+            have_hex = true;
+        }
+    }
+
+    // --- Aenderungen anhand der Datei-Inhalts-Hashes bestimmen ---------------
+    const uint32_t cfg_hash = have_cfg ? content_hash(reinterpret_cast<uint8_t*>(cfg_buf), cfg_len) : 0u;
+    const uint32_t hex_hash = have_hex ? content_hash(hex_buf, hex_len) : 0u;
+    const bool cfg_changed = have_cfg && !(g_have_config_hash && cfg_hash == g_last_config_hash);
+    const bool hex_changed = have_hex && !(g_have_hex_hash    && hex_hash == g_last_hex_hash);
+
+    if (!cfg_changed && !hex_changed) {
+        // Nur Host-Metadaten/FAT geaendert, keine Nutzdatei -> Gast NICHT
+        // anfassen (kein Stop/Neustart). Volume-Hash aktualisieren und raus.
+        g_last_volume_hash = volume_hash();
+        g_have_volume_hash = true;
+        return;
+    }
+
     g_erase_request = false;
 
-    // Lauft ein Gast nativ auf Core1, vor den Flash-Schreibzugriffen pausieren
-    // (sonst crasht Core1 waehrend des XIP-Stalls). Der Guard setzt den Gast am
-    // Funktionsende fort: bei neuer BOOT.HEX startet er die NEUE Firmware, bei
-    // reiner CONFIG.INI die bisherige weiter. Lief kein Gast, ist es ein No-op.
+    // Ab hier ist ein Flash-Schreibzugriff noetig. Laeuft ein Gast nativ auf
+    // Core1, vor den Flash-Schreibzugriffen pausieren (sonst crasht Core1
+    // waehrend des XIP-Stalls). Der Guard setzt den Gast am Funktionsende fort;
+    // ein Neustart auf NEUE Firmware erfolgt nur, wenn die HEX sich geaendert
+    // hat (g_boot_pending unten). Lief kein Gast, ist es ein No-op.
     emulator::FlashPauseGuard flash_pause;
 
-    // CONFIG.INI zuerst (damit Pinmap vor dem Boot wirkt). Puffer grosszuegig
-    // (>= generierte Groesse ~3.7 KB + Nutzer-Zusaetze); statisch, da
-    // on_volume_ready nicht reentrant ist (nur poll() auf Core0).
-    if (find_dir_entry("CONFIG.INI", cl, sz) && sz > 0 && sz < 8192) {
-        static char buf[8192];
-        uint32_t n = read_cluster_chain(cl, sz, reinterpret_cast<uint8_t*>(buf),
-                                        sizeof buf);
-        parse_config(buf, n);
+    // CONFIG.INI nur bei geaendertem Inhalt neu parsen/persistieren (sonst
+    // wuerde ein Re-Parse einer stale CONFIG.INI eine per CLI gesetzte Pinmap
+    // ueberschreiben). parse_config kann g_erase_request setzen (flash_erase=on).
+    if (cfg_changed) {
+        g_stats.parsed_lines = 0;
+        parse_config(cfg_buf, cfg_len);
         // Persistieren, damit die Einstellungen den nächsten Power-Cycle
         // überleben (config::load() liest sie beim Boot wieder ein).
         config::save();
@@ -673,24 +746,28 @@ void on_volume_ready() {
         } else {
             uart_bridge::stop();
         }
+        g_last_config_hash = cfg_hash;
+        g_have_config_hash = true;
         std::printf("[MSC] CONFIG.INI: %lu Bytes, %u Zeilen\n",
-                    static_cast<unsigned long>(n),
+                    static_cast<unsigned long>(cfg_len),
                     static_cast<unsigned>(g_stats.parsed_lines));
     }
 
     // Optionales vollstaendiges Loeschen des Firmware-Slots (flash_erase=on).
     if (g_erase_request) {
         storage::firmware_erase();
+        g_have_hex_hash = false;   // erzwingt Neu-Flash der HEX
         std::printf("[MSC] flash_erase=on -> Firmware-Slot geloescht\n");
     }
 
-    // BOOT.HEX -> in firmware-Slot persistieren (additiv/mergend; zum
-    // vollstaendigen Ersetzen flash_erase=on in CONFIG.INI verwenden).
-    // Akzeptiert auch jede andere *.HEX-Datei (Originalname zulaessig).
-    char hex_name[16];
-    if (find_hex_entry(cl, sz, hex_name) && sz > 0) {
-        static uint8_t hex_buf[64 * 1024 + 1024];
-        uint32_t n = read_cluster_chain(cl, sz, hex_buf, sizeof hex_buf);
+    // BOOT.HEX -> in firmware-Slot persistieren, aber NUR wenn sich der HEX-
+    // Inhalt geaendert hat. So loest ein wiederholtes on_volume_ready() mit
+    // identischer HEX (Host-Metadaten, Re-Mount) KEINEN Gast-Neustart aus —
+    // das war die Ursache des unregelmaessigen Blinkens. Akzeptiert auch jede
+    // andere *.HEX-Datei (Originalname zulaessig).
+    const bool hex_needs_flash =
+        have_hex && (hex_changed || (g_erase_request && !g_have_hex_hash));
+    if (hex_needs_flash) {
         // Stream-Parser mit Writer auf storage::firmware_write.
         struct Ctx {
             uint32_t total;
@@ -710,7 +787,7 @@ void on_volume_ready() {
         };
         hex::Parser p(writer, 0, 64u * 1024u);
         bool any_err = false;
-        for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t i = 0; i < hex_len; ++i) {
             hex::Result r = p.feed(static_cast<char>(hex_buf[i]));
             if (r == hex::Result::EndOfFile) break;
             if (r != hex::Result::Ok && r != hex::Result::InProgress) {
@@ -722,7 +799,9 @@ void on_volume_ready() {
         } else {
             storage::firmware_finalize(ctx.total);
             ++g_stats.boot_requests;
-            g_boot_pending.store(true);
+            g_boot_pending.store(true);   // nur bei geaenderter HEX -> Neustart
+            g_last_hex_hash = hex_hash;
+            g_have_hex_hash = true;
             std::printf("[MSC] %s %lu B → flash\n", hex_name,
                         static_cast<unsigned long>(ctx.total));
         }
@@ -753,6 +832,10 @@ void refresh_config_volume() {
     build_info_files();
     g_dirty.store(false);
     g_volume_processed.store(true);
+    // Die frisch generierte CONFIG.INI (spiegelt den Live-Zustand) als bereits
+    // verarbeitet registrieren -> ein spaeteres on_volume_ready() (durch Host-
+    // Metadaten) parst sie nicht erneut und pausiert den Gast nicht.
+    mark_config_processed();
     g_last_volume_hash = volume_hash();
     g_have_volume_hash = true;
 }
@@ -770,6 +853,7 @@ void init() {
     // loest KEIN erneutes Parsen der (ggf. stale) CONFIG.INI aus -> per CLI
     // vorgenommene Aenderungen bleiben erhalten. Erst echte Host-Schreibzugriffe
     // (neue BOOT.HEX / editierte CONFIG.INI) aendern den Hash und werden verarbeitet.
+    mark_config_processed();
     g_last_volume_hash = volume_hash();
     g_have_volume_hash = true;
 }
