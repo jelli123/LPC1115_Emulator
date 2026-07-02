@@ -856,6 +856,22 @@ void refresh_config_volume() {
     g_have_volume_hash = true;
 }
 
+void flush_debug_volume() {
+    // Wie refresh_config_volume(), aber zusaetzlich Medienwechsel: build_info_files
+    // erzeugt DEBUG.TXT frisch aus dem Debug-Bridge-Ringpuffer, trigger_media_change
+    // laesst das Laufwerk kurz "verschwinden" -> der Host verwirft seinen Cache und
+    // liest die aktuelle DEBUG.TXT beim Wiedereinbinden. Kein Flash/Gast-Stop
+    // (nur RAM-Disk), der Gast blinkt/debuggt ununterbrochen weiter.
+    format_blank();
+    build_info_files();
+    g_dirty.store(false);
+    g_volume_processed.store(true);
+    mark_config_processed();
+    g_last_volume_hash = volume_hash();
+    g_have_volume_hash = true;
+    trigger_media_change();
+}
+
 void init() {
     std::memset(&g_stats, 0, sizeof g_stats);
     // Persistente Wiederherstellung waere moeglich (storage::msc_load_volume).

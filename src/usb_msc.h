@@ -46,6 +46,12 @@ void poll();
 // gesetzte Zuordnung NICHT aus einer veralteten CONFIG.INI zuruecksetzt.
 void refresh_config_volume();
 
+// Baut die RAM-Disk neu auf (inkl. frischer DEBUG.TXT aus der Debug-Bridge) und
+// zwingt den Host per Medienwechsel zum Neu-Einlesen. Fuer 'dbg save' — macht
+// die bis dahin gesammelte Gast-Debug-Ausgabe als DEBUG.TXT sichtbar (der Host
+// cached Dateiinhalte sonst; ohne Medienwechsel bliebe die Boot-Version stehen).
+void flush_debug_volume();
+
 struct Stats {
     uint32_t reads;
     uint32_t writes;

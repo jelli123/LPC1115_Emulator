@@ -135,7 +135,7 @@ void cmd_help() {
         "  version                    Build-Info",
         "  stats / status             Emulatorstatus & Zaehler",
         "  dbg [clear]                Gast-Debug-Ausgabe zeigen/loeschen",
-        "  reset                      Emulator-Core neu starten",
+        "  dbg save                   Debug-Ausgabe als DEBUG.TXT aufs Laufwerk",        "  reset                      Emulator-Core neu starten",
         "",
         "  upload                     Intel-Hex-Stream starten (alias: flash hex)",
         "  xmodem                     Intel-Hex per XMODEM-CRC/1K empfangen",
@@ -308,6 +308,14 @@ void handle_command(char* line) {
         if (n >= 2 && std::strcmp(tokens[1], "clear") == 0) {
             debug_bridge::clear();
             std::puts("dbg: geleert");
+            return;
+        }
+        if (n >= 2 && std::strcmp(tokens[1], "save") == 0) {
+            // Aktuellen Debug-Puffer als DEBUG.TXT aufs MSC-Laufwerk schreiben
+            // und den Host zum Neu-Einlesen zwingen (Medienwechsel).
+            usb_msc::flush_debug_volume();
+            std::printf("dbg: DEBUG.TXT aktualisiert (%lu Bytes) - Laufwerk neu einlesen\n",
+                        static_cast<unsigned long>(debug_bridge::total_bytes()));
             return;
         }
         // Gast-Debug-Ausgabe (ueber die Debug-Bridge gesammelt) dumpen.
