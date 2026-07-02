@@ -2060,20 +2060,37 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
         uint32_t local    = port_off % GPIO_PORT_STRIDE;
         if (port < 4) {
             if (local < GPIO_DATA_END) {
-                // Maskierter DATA-Write: schreibt nur Pins, deren Mask-Bit gesetzt ist.
-                uint32_t mask  = (local >> 2) & 0xFFFu;
-                uint32_t shift = (addr & 3u) * 8u;
-                uint32_t lane  = (static_cast<uint32_t>(val) << shift);
-                uint32_t old   = g_gpio[port].data;
-                g_gpio[port].data = (old & ~(mask << 0)) |
-                                    ((lane & (mask << 0)) /* lower bits */) |
-                                    (old & ~mask);
-                // Vereinfachung: für maskierten Schreibzugriff nur die in `mask`
-                // gesetzten Bits aus `val` übernehmen.
-                g_gpio[port].data = (old & ~mask) | (lane & mask);
-                ++g_stats.gpio_writes;
-                gpio_apply_port(static_cast<uint8_t>(port), old,
-                                g_gpio[port].data, g_gpio[port].dir);
+                // Maskierter DATA-Write (LPC "masked access", UM10398 12.4.1):
+                // Adressbits[11:2] sind die 12-bit Pin-Maske; nur Pins mit
+                // gesetztem Maskenbit werden aus dem geschriebenen Wert
+                // uebernommen. Der Zugriff kommt BYTEWEISE (STR = 4x
+                // mmio_write8). Die Maske gilt PRO BYTE: fuer Byte n zaehlen die
+                // Maskenbits [n*8 .. n*8+7] und die Wert-Bits an denselben
+                // Positionen.
+                //
+                // FRUEHER wurde die volle 12-bit-Maske auf JEDES Byte angewendet
+                // (data = (old & ~mask) | (val<<shift & mask)). Bei einem 32-bit
+                // masked-access-Store loeschten dann die hoeherwertigen Null-
+                // Bytes das soeben gesetzte Pin-Bit sofort wieder: z. B.
+                // digitalWrite(PIO0_7,1) -> Byte0 setzt bit7, Byte1 (=0) macht
+                // (old&~0x80)|(0&0x80) und LOESCHT bit7. Ergebnis: Ausgaenge
+                // toggelten nie (Pin haing praktisch dauerhaft low; nur das
+                // winzige Fenster zwischen Byte0- und Byte1-Write war je high).
+                // Das betraf ALLE ueber masked access getriebenen Ausgaenge.
+                uint32_t full_mask = (local >> 2) & 0xFFFu;   // 12-bit Pin-Maske
+                uint32_t byte_n    = addr & 3u;
+                uint32_t byte_mask = (full_mask >> (byte_n * 8u)) & 0xFFu;
+                if (byte_mask != 0u) {
+                    uint32_t shift = byte_n * 8u;
+                    uint32_t old   = g_gpio[port].data;
+                    uint32_t cur_b = (old >> shift) & 0xFFu;
+                    uint32_t new_b = (cur_b & ~byte_mask) |
+                                     (static_cast<uint32_t>(val) & byte_mask);
+                    g_gpio[port].data = (old & ~(0xFFu << shift)) | (new_b << shift);
+                    ++g_stats.gpio_writes;
+                    gpio_apply_port(static_cast<uint8_t>(port), old,
+                                    g_gpio[port].data, g_gpio[port].dir);
+                }
                 return true;
             }
             if (local >= GPIO_DIR_OFFSET && local < GPIO_DIR_OFFSET + 4) {
