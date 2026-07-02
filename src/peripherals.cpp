@@ -218,6 +218,10 @@ struct SysTick {
     uint32_t cvr;      // 24-bit Current
     uint64_t last_us;  // Zeitpunkt des letzten advance
     double   frac;     // Rest-Tick-Bruchteil
+    // Diagnose:
+    uint32_t trap_reads;   // Anzahl getrappter SysTick-Reads
+    uint32_t trap_writes;  // Anzahl getrappter SysTick-Writes
+    uint64_t irq_ticks;    // Anzahl injizierter SysTick-Exceptions
 };
 SysTick g_systick{};
 
@@ -262,12 +266,14 @@ void systick_advance() {
     if (underflow) {
         g_systick.csr |= SYST_CSR_COUNTFLAG;
         if (g_systick.csr & SYST_CSR_TICKINT) {
+            ++g_systick.irq_ticks;
             irq_inject::pend_systick();
         }
     }
 }
 
 uint32_t systick_read32(uint32_t addr) {
+    ++g_systick.trap_reads;
     switch (addr & 0xFFu) {
         case 0x10:                          // SYST_CSR
         {
@@ -284,6 +290,7 @@ uint32_t systick_read32(uint32_t addr) {
 }
 
 void systick_write32(uint32_t addr, uint32_t value) {
+    ++g_systick.trap_writes;
     switch (addr & 0xFFu) {
         case 0x10:                          // SYST_CSR
             systick_advance();
@@ -2110,5 +2117,16 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
 }
 
 Stats stats() { return g_stats; }
+
+void systick_debug(uint32_t& reads, uint32_t& writes,
+                   uint32_t& csr, uint32_t& rvr, uint32_t& cvr,
+                   uint64_t& ticks) {
+    reads  = g_systick.trap_reads;
+    writes = g_systick.trap_writes;
+    csr    = g_systick.csr;
+    rvr    = g_systick.rvr;
+    cvr    = g_systick.cvr;
+    ticks  = g_systick.irq_ticks;
+}
 
 } // namespace peripherals

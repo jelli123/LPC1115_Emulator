@@ -182,6 +182,15 @@ void cmd_status() {
     std::printf("CPU-target=%lu Hz  GDB=%s\n",
                 static_cast<unsigned long>(peripherals::current_cpu_hz()),
                 gdb_stub::active() ? "on" : "off");
+    // SysTick-Diagnose (klaert, ob der Gast-SysTick getrappt + korrekt gesetzt wird).
+    uint32_t st_r, st_w, st_csr, st_rvr, st_cvr;
+    uint64_t st_ticks;
+    peripherals::systick_debug(st_r, st_w, st_csr, st_rvr, st_cvr, st_ticks);
+    std::printf("SysTick: trapR=%lu trapW=%lu CSR=0x%lx RVR=0x%lx CVR=0x%lx ticks=%llu\n",
+                static_cast<unsigned long>(st_r), static_cast<unsigned long>(st_w),
+                static_cast<unsigned long>(st_csr), static_cast<unsigned long>(st_rvr),
+                static_cast<unsigned long>(st_cvr),
+                static_cast<unsigned long long>(st_ticks));
 }
 
 bool parse_int(const char* s, long min_v, long max_v, long& out) {

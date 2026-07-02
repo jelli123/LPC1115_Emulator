@@ -57,4 +57,11 @@ struct Stats {
 };
 Stats stats();
 
+// SysTick-Diagnose: Trap-Zaehler (Reads/Writes auf 0xE000E010-01F) + aktuelle
+// emulierte Registerwerte. Zeigt, ob der unprivilegierte Gast-SysTick-Zugriff
+// ueberhaupt getrappt wird und ob CTRL (ENABLE|TICKINT) korrekt gesetzt ist.
+void systick_debug(uint32_t& reads, uint32_t& writes,
+                   uint32_t& csr, uint32_t& rvr, uint32_t& cvr,
+                   uint64_t& ticks);
+
 } // namespace peripherals
