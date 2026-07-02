@@ -1,5 +1,6 @@
 #include "led.h"
 #include "emulator.h"
+#include "peripherals.h"
 
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
@@ -28,7 +29,17 @@ void poll() {
     auto st = emulator::state();
     switch (st) {
         case emulator::State::Running:
-            set(true);
+            // Onboard-LED spiegelt die Gast-Blink-LED PIO0.7 (LPCxpresso-
+            // Konvention), damit ein Blink-Programm sichtbar auf der einzigen
+            // Bordschnittstelle blinkt. Treibt der Gast PIO0.7 nicht als
+            // Ausgang, bleibt es beim reinen "laeuft"-Dauerlicht.
+            {
+                bool lvl = false;
+                if (peripherals::guest_output_level(0, 7, lvl))
+                    set(lvl);
+                else
+                    set(true);
+            }
             break;
 
         case emulator::State::Faulted: {

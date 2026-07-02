@@ -2129,4 +2129,11 @@ void systick_debug(uint32_t& reads, uint32_t& writes,
     ticks  = g_systick.irq_ticks;
 }
 
+bool guest_output_level(uint8_t port, uint8_t pin, bool& level) {
+    if (port >= 4u || pin >= 12u) return false;
+    if (((g_gpio[port].dir >> pin) & 1u) == 0u) return false;   // nicht als Ausgang
+    level = ((g_gpio[port].data >> pin) & 1u) != 0u;
+    return true;
+}
+
 } // namespace peripherals
