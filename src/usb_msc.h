@@ -39,6 +39,13 @@ bool consume_pending_boot_request();
 // wird; persistiert Dirty-Sektoren in Storage.
 void poll();
 
+// Baut die RAM-Disk (HELP.HTM + CONFIG.INI) aus dem aktuellen Live-Config-
+// Zustand neu auf. Nach einer CLI-Konfig-Aenderung (z. B. 'pinmap set')
+// aufzurufen, damit die CONFIG.INI den Live-Zustand widerspiegelt und ein
+// spaeteres on_volume_ready() (durch Host-Metadaten ausgeloest) die gerade
+// gesetzte Zuordnung NICHT aus einer veralteten CONFIG.INI zuruecksetzt.
+void refresh_config_volume();
+
 struct Stats {
     uint32_t reads;
     uint32_t writes;

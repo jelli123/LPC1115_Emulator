@@ -33,6 +33,22 @@ bool config_set(const char* key, const char* value);
 bool config_commit();                        // schreibt RAM-Snapshot in nächsten Sektor
 void config_dump(void (*emit)(const char* line));
 
+// Persistenz-Diagnose. Zeigt, ob beim letzten config_load() ein gueltiger
+// Config-Slot im Flash gefunden wurde, plus Flash-Groesse/Region-Offset.
+// Nutzen: einen Flash-Groessen-Mismatch (Board-Header nimmt z. B. 4 MB an,
+// der reale Baustein hat 2 MB) erkennen. Dann liegt die Config-Region jenseits
+// des realen Flash -> Schreibzugriffe verpuffen; config_get liefert in der
+// Sitzung noch aus dem RAM-Snapshot, aber NICHTS ueberlebt einen Power-Cycle.
+struct ConfigPersistInfo {
+    uint32_t flash_size_kib;   // angenommene Flash-Groesse (PICO_FLASH_SIZE_BYTES)
+    uint32_t region_offset;    // Flash-Offset der Config-Region
+    uint32_t slot_sectors;     // Anzahl Wear-Leveling-Sektoren
+    bool     loaded_valid;     // beim letzten config_load() gueltiger Slot gefunden?
+    uint32_t sequence;         // aktuelle Sequenznummer
+    uint32_t key_count;        // aktuelle Anzahl Key/Value-Eintraege im RAM
+};
+ConfigPersistInfo config_persist_info();
+
 // Firmware-Slot
 bool firmware_erase();
 bool firmware_write(std::size_t offset, const void* data, std::size_t len);

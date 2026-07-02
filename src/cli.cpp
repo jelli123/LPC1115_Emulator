@@ -59,6 +59,19 @@ void apply_live_config_key(const char* key, const char* val) {
         config::set_autodesc(val[0] == '1' || std::strcmp(val, "on") == 0);
 }
 
+// Persistiert eine soeben geaenderte Pinmap in den Flash-Config-Slot und baut
+// die RAM-Disk-CONFIG.INI neu auf. Ohne das (a) ueberlebte die Zuordnung keinen
+// Power-Cycle und (b) wuerde ein spaeteres MSC-Event die Aenderung aus der
+// veralteten CONFIG.INI wieder zuruecksetzen. FlashPauseGuard pausiert einen
+// laufenden Gast fuer den Flash-Schreibzugriff (und setzt ihn danach fort).
+void persist_pinmap_change() {
+    bool saved;
+    { emulator::FlashPauseGuard _fp; saved = config::save(); }
+    usb_msc::refresh_config_volume();
+    std::puts(saved ? "ok (gespeichert)"
+                    : "ok (live) — Flash-Speichern fehlgeschlagen (siehe 'stats')");
+}
+
 // --- XMODEM-Empfang in den HEX-Parser ---
 struct XmodemHexCtx {
     hex::Parser* parser;
@@ -191,6 +204,13 @@ void cmd_status() {
                 static_cast<unsigned long>(st_csr), static_cast<unsigned long>(st_rvr),
                 static_cast<unsigned long>(st_cvr),
                 static_cast<unsigned long long>(st_ticks));
+    // Config-Persistenz (Bug-Diagnose): seq/keys + ob beim Boot aus Flash geladen.
+    const auto ci = storage::config_persist_info();
+    std::printf("Config: Flash=%luKiB seq=%lu keys=%lu %s\n",
+                static_cast<unsigned long>(ci.flash_size_kib),
+                static_cast<unsigned long>(ci.sequence),
+                static_cast<unsigned long>(ci.key_count),
+                ci.loaded_valid ? "(persistent)" : "(nur RAM/Defaults)");
 }
 
 bool parse_int(const char* s, long min_v, long max_v, long& out) {
@@ -291,7 +311,19 @@ void handle_command(char* line) {
         std::puts(storage::firmware_erase() ? "erased" : "err");
         return;
     }
-    if (std::strcmp(tokens[0], "run") == 0)   { emulator::load_and_start(); return; }
+    if (std::strcmp(tokens[0], "run") == 0 ||
+        std::strcmp(tokens[0], "start") == 0) {
+        // Ist der Gast kooperativ gehaltet ('stop'/'halt'), fortsetzen statt neu
+        // zu laden — sonst meldet load_and_start() "bereits gestartet" (State
+        // bleibt beim Halt Running). Sonst regulaer laden + starten.
+        if (target_halt::is_halted()) {
+            target_halt::request_resume();
+            std::puts("fortgesetzt");
+        } else {
+            emulator::load_and_start();
+        }
+        return;
+    }
     if (std::strcmp(tokens[0], "halt") == 0 ||
         std::strcmp(tokens[0], "stop") == 0) {
         if (emulator::state() == emulator::State::Running) {
@@ -427,8 +459,10 @@ void handle_command(char* line) {
                 !parse_int(tokens[3], -1, 47, rp)) {
                 std::puts("err: pinmap set <port_pin> <rp-gpio>"); return;
             }
-            std::puts(config::set_pin_map(static_cast<uint8_t>(lpc), static_cast<int>(rp))
-                      ? "ok" : "err");
+            if (!config::set_pin_map(static_cast<uint8_t>(lpc), static_cast<int>(rp))) {
+                std::puts("err"); return;
+            }
+            persist_pinmap_change();
             return;
         }
         if (std::strcmp(tokens[1], "reset") == 0) {
@@ -445,8 +479,10 @@ void handle_command(char* line) {
                 !parse_int(tokens[3], -1, 47, rp)) {
                 std::puts("err: pin set <port_pin|idx> <rp-gpio>"); return;
             }
-            std::puts(config::set_pin_map(static_cast<uint8_t>(lpc), static_cast<int>(rp))
-                      ? "ok" : "err");
+            if (!config::set_pin_map(static_cast<uint8_t>(lpc), static_cast<int>(rp))) {
+                std::puts("err"); return;
+            }
+            persist_pinmap_change();
             return;
         }
         if (std::strcmp(tokens[1], "show") == 0) {

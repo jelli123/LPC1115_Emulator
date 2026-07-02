@@ -741,6 +741,22 @@ void on_volume_ready() {
 
 } // namespace
 
+void refresh_config_volume() {
+    // Definiert im oeffentlichen Namespace, ruft aber die internen Volume-
+    // Helfer (format_blank/build_info_files/volume_hash, g_dirty ...) — diese
+    // liegen im anonymen Namespace derselben Uebersetzungseinheit und sind hier
+    // sichtbar. Baut die RAM-Disk aus dem aktuellen Live-Config-Zustand neu auf
+    // und aktualisiert den Dedup-Hash, damit ein spaeteres on_volume_ready()
+    // (durch Host-Metadaten ausgeloest) die gerade per CLI gesetzte Zuordnung
+    // NICHT aus einer veralteten CONFIG.INI zuruecksetzt.
+    format_blank();
+    build_info_files();
+    g_dirty.store(false);
+    g_volume_processed.store(true);
+    g_last_volume_hash = volume_hash();
+    g_have_volume_hash = true;
+}
+
 void init() {
     std::memset(&g_stats, 0, sizeof g_stats);
     // Persistente Wiederherstellung waere moeglich (storage::msc_load_volume).

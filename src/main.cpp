@@ -41,6 +41,21 @@ int main() {
     setup_fault_handlers();
     storage::init();
     config::load();
+    {
+        // Persistenz-Diagnose: zeigt, ob eine gueltige Config aus dem Flash
+        // geladen wurde (seq/keys) und wo die Config-Region liegt. Faellt ein
+        // gespeicherter Wert nach einem Power-Cycle auf "LEER->Defaults" zurueck,
+        // deutet das auf einen Flash-Groessen-Mismatch (Board-Header vs. reale
+        // Bausteingroesse) hin — die Region liegt dann jenseits des Flash.
+        const auto ci = storage::config_persist_info();
+        std::printf("[CFG] Flash=%luKiB Region@0x%06lx(%lu Sekt.) %s seq=%lu keys=%lu\n",
+                    static_cast<unsigned long>(ci.flash_size_kib),
+                    static_cast<unsigned long>(ci.region_offset),
+                    static_cast<unsigned long>(ci.slot_sectors),
+                    ci.loaded_valid ? "geladen" : "LEER->Defaults",
+                    static_cast<unsigned long>(ci.sequence),
+                    static_cast<unsigned long>(ci.key_count));
+    }
     peripherals::init();
     pio_glue::init();
     gdb_stub::init();

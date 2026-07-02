@@ -73,6 +73,7 @@ KV       kv_table[MAX_KV];
 uint32_t kv_count       = 0;
 uint32_t config_sequence = 0;
 uint32_t config_active_idx = 0; // welcher Sektor zuletzt benutzt wurde
+bool     config_loaded_valid = false; // beim letzten config_load() gueltiger Slot?
 
 uint32_t firmware_sequence = 0;
 uint32_t firmware_length   = 0;
@@ -187,12 +188,14 @@ bool config_load() {
         kv_count = 0;
         config_sequence = 0;
         config_active_idx = CONFIG_SLOT_SECTORS - 1; // nächster wird 0
+        config_loaded_valid = false;
         return false;
     }
     parse_config_payload(reinterpret_cast<const uint8_t*>(best + 1),
                          best->payload_len);
     config_sequence   = best_seq;
     config_active_idx = best_idx;
+    config_loaded_valid = true;
     return true;
 }
 
@@ -264,6 +267,17 @@ void config_dump(void (*emit)(const char*)) {
                       kv_table[i].key, kv_table[i].value);
         emit(line);
     }
+}
+
+ConfigPersistInfo config_persist_info() {
+    ConfigPersistInfo ci{};
+    ci.flash_size_kib = static_cast<uint32_t>(flash_size_bytes / 1024u);
+    ci.region_offset  = static_cast<uint32_t>(config_region_offset);
+    ci.slot_sectors   = static_cast<uint32_t>(CONFIG_SLOT_SECTORS);
+    ci.loaded_valid   = config_loaded_valid;
+    ci.sequence       = config_sequence;
+    ci.key_count      = kv_count;
+    return ci;
 }
 
 // --- Firmware-Slot ---------------------------------------------------------
