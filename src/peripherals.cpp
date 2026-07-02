@@ -5,6 +5,7 @@
 #include "lpc_irqs.h"
 #include "emulator.h"
 #include "pio_glue.h"
+#include "debug_bridge.h"
 
 #include <cstring>
 #include <cstdio>
@@ -2148,6 +2149,17 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
     if (vnvic::is_nvic_addr(addr)) {
         ++g_stats.nvic_writes;
         vnvic::write8(addr, val);
+        return true;
+    }
+
+    // Guest->Host Debug-Bridge: der Gast schreibt Zeichen byteweise auf
+    // DEBUG_BRIDGE_PORT (+0x00 = DATA). Wird hier in den Ringpuffer gelegt und
+    // ueber CLI 'dbg' / DEBUG.TXT sichtbar. Andere Offsets im 16-Byte-Fenster
+    // werden still akzeptiert (Reserve fuer kuenftige Steuerregister).
+    if (addr >= debug_bridge::DEBUG_BRIDGE_PORT &&
+        addr <  debug_bridge::DEBUG_BRIDGE_PORT + 0x10u) {
+        if (addr == debug_bridge::DEBUG_BRIDGE_PORT)
+            debug_bridge::put_byte(val);
         return true;
     }
 

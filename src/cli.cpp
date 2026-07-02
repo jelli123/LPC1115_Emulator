@@ -13,6 +13,7 @@
 #include "uart_bridge.h"
 #include "led.h"
 #include "xmodem.h"
+#include "debug_bridge.h"
 
 extern "C" void usb_stdio_task(void);
 #include <cstdio>
@@ -133,6 +134,7 @@ void cmd_help() {
         "  help                       diese Hilfe",
         "  version                    Build-Info",
         "  stats / status             Emulatorstatus & Zaehler",
+        "  dbg [clear]                Gast-Debug-Ausgabe zeigen/loeschen",
         "  reset                      Emulator-Core neu starten",
         "",
         "  upload                     Intel-Hex-Stream starten (alias: flash hex)",
@@ -147,8 +149,7 @@ void cmd_help() {
         "  cfg list                   alle KV-Paare ausgeben",
         "  cfg get <key>              Wert lesen",
         "  cfg set <key> <value>      Wert setzen",
-        "  cfg save                   RAM-Snapshot in Flash schreiben",
-        "  pinmap show                Tabelle LPC-Pin -> RP2350-GPIO",
+        "  cfg save                   RAM-Snapshot in Flash schreiben",        "  pinmap show                Tabelle LPC-Pin -> RP2350-GPIO",
         "  pinmap set <port_pin> <rp> Pin zuweisen (z.B. pinmap set 1_8 17)",
         "  pinmap reset               Default-Tabelle wiederherstellen",
         "",
@@ -303,7 +304,23 @@ void handle_command(char* line) {
         cmd_xmodem();
         return;
     }
-    if (std::strcmp(tokens[0], "info") == 0)  { cmd_info(); return; }
+    if (std::strcmp(tokens[0], "dbg") == 0) {
+        if (n >= 2 && std::strcmp(tokens[1], "clear") == 0) {
+            debug_bridge::clear();
+            std::puts("dbg: geleert");
+            return;
+        }
+        // Gast-Debug-Ausgabe (ueber die Debug-Bridge gesammelt) dumpen.
+        static char buf[4096];
+        uint32_t nb = debug_bridge::snapshot(buf, sizeof buf);
+        std::printf("--- dbg (%lu Bytes, gesamt %lu) ---\n",
+                    static_cast<unsigned long>(nb),
+                    static_cast<unsigned long>(debug_bridge::total_bytes()));
+        if (nb) std::fputs(buf, stdout);
+        if (nb == 0 || buf[nb - 1] != '\n') std::putchar('\n');
+        std::puts("--- ende ---");
+        return;
+    }
     if (std::strcmp(tokens[0], "erase") == 0 ||
         (std::strcmp(tokens[0], "flash") == 0 && n >= 2 &&
          std::strcmp(tokens[1], "erase") == 0)) {

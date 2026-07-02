@@ -7,6 +7,7 @@
 #include "emulator.h"
 #include "fault.h"
 #include "help_html.h"
+#include "debug_bridge.h"
 
 #include "tusb.h"
 #include "pico/stdlib.h"
@@ -627,6 +628,21 @@ void build_info_files() {
     uint32_t len = 0;
     build_config_ini(cfg, sizeof cfg, len);
     fat_write_file("CONFIG.INI", reinterpret_cast<const uint8_t*>(cfg), len);
+
+    // DEBUG.TXT: aktueller Inhalt der Guest->Host Debug-Bridge (Momentaufnahme
+    // zum Zeitpunkt des Volume-Aufbaus). Fuer Live-Ausgabe ist die CLI ('dbg')
+    // besser geeignet; die Datei ist der Offline-/ohne-Serial-Weg.
+    static char dbg[4096];
+    uint32_t dbg_len = debug_bridge::snapshot(dbg, sizeof dbg);
+    if (dbg_len == 0) {
+        static const char empty[] = "(keine Gast-Debug-Ausgabe)\n";
+        fat_write_file("DEBUG.TXT",
+                       reinterpret_cast<const uint8_t*>(empty),
+                       sizeof empty - 1u);
+    } else {
+        fat_write_file("DEBUG.TXT",
+                       reinterpret_cast<const uint8_t*>(dbg), dbg_len);
+    }
 }
 
 // Baut ein frisches Volume, das nur FAULT.TXT enthaelt (mbed-DAPLink-Stil).

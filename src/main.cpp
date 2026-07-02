@@ -13,6 +13,7 @@
 #include "usb_msc.h"
 #include "uart_bridge.h"
 #include "led.h"
+#include "debug_bridge.h"
 
 #include <cstdio>
 
@@ -41,6 +42,7 @@ int main() {
     setup_fault_handlers();
     storage::init();
     config::load();
+    debug_bridge::init();
     {
         // Persistenz-Diagnose: zeigt, ob eine gueltige Config aus dem Flash
         // geladen wurde (seq/keys) und wo die Config-Region liegt. Faellt ein

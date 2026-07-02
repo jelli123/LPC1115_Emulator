@@ -28,6 +28,7 @@
 #include <sblib/eibBCU1.h>
 #include <sblib/digital_pin.h>
 #include <sblib/io_pin_names.h>
+#include "lpc_debug.h"   // Guest->Host Debug-Bridge (nur im Emulator wirksam)
 
 #define BLINK_TIME_1 250 // pause time in milliseconds
 #define BLINK_TIME_2 250 // pause time in milliseconds
@@ -44,6 +45,7 @@ BcuBase* setup()
     pinMode(PIN_INFO, OUTPUT); // PIO2.6 on a Selfbus-ARM controller
     pinMode(PIN_RUN, OUTPUT);  // PIO3.3 on a Selfbus-ARM controller
     pinMode(PIN_PROG, OUTPUT); // PIO2.0 on a Selfbus-ARM controller
+    dbg_puts("setup done\n");
     return (&bcu);
 }
 
@@ -52,6 +54,13 @@ BcuBase* setup()
  */
 void loop_noapp()
 {
+    static unsigned int iter = 0;
+    // Diagnose ueber die Debug-Bridge: Iteration + systemTime VOR/NACH delay.
+    // Zeigt, ob delay() ~250 ms braucht (systemTime steigt sauber) oder ob es
+    // haengt/springt (SysTick-/WFI-Problem) bzw. der Gast neu startet (iter=0).
+    dbg_puts("loop "); dbg_u32(iter++);
+    dbg_puts(" t="); dbg_u32(millis()); dbg_putc('\n');
+
     // toggle output PIO0.7 for the LPCxpresso board LED
     digitalWrite(PIO0_7, !digitalRead(PIO0_7));
 
