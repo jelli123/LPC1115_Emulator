@@ -226,25 +226,6 @@ void cmd_status() {
                 static_cast<unsigned long>(ci.sequence),
                 static_cast<unsigned long>(ci.key_count),
                 ci.loaded_valid ? "(persistent)" : "(nur RAM/Defaults)");
-    // LED-/GPIO-Diagnose: ueber die Zeit gesammeltes Sampling von PIO0.7 (die
-    // gespiegelte Blink-LED) + State-Verteilung. Zeigt, ob der Gast-Pin sauber
-    // toggelt (p07 high≈low) oder haengt (ein Wert ≈ 0 / noout>0). Danach
-    // Zaehler zuruecksetzen, damit zwei aufeinanderfolgende 'stats' das
-    // Verhalten im Zwischenintervall zeigen.
-    uint32_t lp, lrun, lidle, lhalt, lflt, lhi, llo, lno;
-    led::debug_counters(lp, lrun, lidle, lhalt, lflt, lhi, llo, lno);
-    std::printf("LED-poll=%lu State[run=%lu idle=%lu halt=%lu flt=%lu]\n",
-                static_cast<unsigned long>(lp), static_cast<unsigned long>(lrun),
-                static_cast<unsigned long>(lidle), static_cast<unsigned long>(lhalt),
-                static_cast<unsigned long>(lflt));
-    uint32_t g0d, g0dir;
-    peripherals::guest_gpio_raw(0, g0d, g0dir);
-    std::printf("PIO0.7-mirror: high=%lu low=%lu noout=%lu  GPIO0 data=0x%03lx dir=0x%03lx\n",
-                static_cast<unsigned long>(lhi), static_cast<unsigned long>(llo),
-                static_cast<unsigned long>(lno),
-                static_cast<unsigned long>(g0d & 0xFFFu),
-                static_cast<unsigned long>(g0dir & 0xFFFu));
-    led::debug_reset();
 }
 
 bool parse_int(const char* s, long min_v, long max_v, long& out) {
@@ -337,6 +318,7 @@ void handle_command(char* line) {
         cmd_xmodem();
         return;
     }
+    if (std::strcmp(tokens[0], "info") == 0)  { cmd_info(); return; }
     if (std::strcmp(tokens[0], "dbg") == 0) {
         if (n >= 2 && std::strcmp(tokens[1], "clear") == 0) {
             debug_bridge::clear();
