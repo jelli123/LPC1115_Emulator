@@ -52,6 +52,13 @@ bool              g_erase_request = false;
 constexpr uint32_t WRITE_IDLE_TIMEOUT_MS = 2000;
 volatile uint32_t  g_last_write_ms = 0;
 
+// Auto-Flush der DEBUG.TXT: baut die RAM-Disk periodisch neu auf (frische
+// DEBUG.TXT aus der Debug-Bridge) und laesst den Host neu einlesen, sobald neue
+// Gast-Debug-Bytes vorliegen. 0 = aus. Per CLI 'dbg auto <sek|off>' steuerbar.
+uint32_t g_dbg_autoflush_ms  = 5000;
+uint32_t g_last_dbg_flush_ms = 0;
+uint32_t g_last_dbg_total    = 0;
+
 // Hash des zuletzt VERARBEITETEN Volume-Zustands (siehe volume_hash). Verhindert,
 // dass ein inhaltlich unveraenderter Re-Trigger (z. B. Host-Re-Mount nach Eject,
 // der nur FAT-Metadaten neu schreibt) dieselbe BOOT.HEX ein zweites Mal flasht
@@ -854,23 +861,28 @@ void refresh_config_volume() {
     mark_config_processed();
     g_last_volume_hash = volume_hash();
     g_have_volume_hash = true;
+    // KRITISCH: Medienwechsel ausloesen. Ein gemounteter Host hat die ALTE
+    // CONFIG.INI gecached und wuerde sie sonst (a) weiter anzeigen und (b) beim
+    // naechsten Schreibzugriff in die RAM-Disk zurueckschreiben -> das
+    // ueberschriebe die gerade per CLI gesetzte Zuordnung und startete den Gast
+    // neu (unregelmaessiges Blinken). Der Medienwechsel zwingt den Host, die
+    // frische CONFIG.INI neu zu lesen und seinen Cache zu verwerfen -> Anzeige
+    // aktuell UND kein Revert mehr.
+    trigger_media_change();
 }
 
 void flush_debug_volume() {
-    // Wie refresh_config_volume(), aber zusaetzlich Medienwechsel: build_info_files
-    // erzeugt DEBUG.TXT frisch aus dem Debug-Bridge-Ringpuffer, trigger_media_change
-    // laesst das Laufwerk kurz "verschwinden" -> der Host verwirft seinen Cache und
-    // liest die aktuelle DEBUG.TXT beim Wiedereinbinden. Kein Flash/Gast-Stop
-    // (nur RAM-Disk), der Gast blinkt/debuggt ununterbrochen weiter.
-    format_blank();
-    build_info_files();
-    g_dirty.store(false);
-    g_volume_processed.store(true);
-    mark_config_processed();
-    g_last_volume_hash = volume_hash();
-    g_have_volume_hash = true;
-    trigger_media_change();
+    // DEBUG.TXT (und CONFIG.INI) frisch aufbauen + Host neu einlesen lassen.
+    // Deckungsgleich mit refresh_config_volume() (das jetzt selbst einen
+    // Medienwechsel ausloest); zusaetzlich die Auto-Flush-Tracker nachziehen,
+    // damit ein direkt folgender Auto-Flush nicht sofort erneut ausloest.
+    refresh_config_volume();
+    g_last_dbg_total    = debug_bridge::total_bytes();
+    g_last_dbg_flush_ms = to_ms_since_boot(get_absolute_time());
 }
+
+void set_debug_autoflush_ms(uint32_t ms) { g_dbg_autoflush_ms = ms; }
+uint32_t debug_autoflush_ms()            { return g_dbg_autoflush_ms; }
 
 void init() {
     std::memset(&g_stats, 0, sizeof g_stats);
@@ -925,6 +937,24 @@ void poll() {
             g_dirty.store(false);
             g_volume_processed.store(true);
             on_volume_ready();
+        }
+        return;
+    }
+
+    // Auto-Flush der DEBUG.TXT: sobald der Gast neue Debug-Bytes geschickt hat
+    // und das Intervall verstrichen ist, die RAM-Disk mit frischer DEBUG.TXT neu
+    // aufbauen und den Host neu einlesen lassen. So fuellt sich DEBUG.TXT von
+    // selbst, ohne manuelles 'dbg save'. Gehemmt, solange der Host schreibt
+    // (g_dirty) — dann hat die Host-Verarbeitung Vorrang und ein Medienwechsel
+    // wuerde eine laufende Host-Bearbeitung stoeren.
+    if (g_dbg_autoflush_ms != 0 &&
+        !g_dirty.load(std::memory_order_relaxed)) {
+        uint32_t now   = to_ms_since_boot(get_absolute_time());
+        uint32_t total = debug_bridge::total_bytes();
+        if (total != g_last_dbg_total &&
+            (g_last_dbg_flush_ms == 0 ||
+             (now - g_last_dbg_flush_ms) >= g_dbg_autoflush_ms)) {
+            flush_debug_volume();   // aktualisiert g_last_dbg_total/-flush_ms
         }
     }
 }

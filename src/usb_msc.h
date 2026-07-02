@@ -52,6 +52,12 @@ void refresh_config_volume();
 // cached Dateiinhalte sonst; ohne Medienwechsel bliebe die Boot-Version stehen).
 void flush_debug_volume();
 
+// Auto-Flush-Intervall der DEBUG.TXT (ms; 0 = aus). Nach so vielen ms mit neuen
+// Gast-Debug-Bytes baut poll() die RAM-Disk mit frischer DEBUG.TXT neu auf und
+// laesst den Host neu einlesen. Per CLI 'dbg auto <sek|off>' steuerbar.
+void     set_debug_autoflush_ms(uint32_t ms);
+uint32_t debug_autoflush_ms();
+
 struct Stats {
     uint32_t reads;
     uint32_t writes;

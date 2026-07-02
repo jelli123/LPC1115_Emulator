@@ -66,11 +66,22 @@ void apply_live_config_key(const char* key, const char* val) {
 // veralteten CONFIG.INI wieder zuruecksetzen. FlashPauseGuard pausiert einen
 // laufenden Gast fuer den Flash-Schreibzugriff (und setzt ihn danach fort).
 void persist_pinmap_change() {
+    // Sofort-Feedback VOR dem (kurz blockierenden) Flash-Schreibzugriff. Der
+    // Flash-Commit + evtl. Gast-Neustart + Medienwechsel brauchen einige ms,
+    // waehrend der die USB-CDC-Ausgabe nicht bedient wird -> ohne dieses
+    // Vorab-"ok" wirkte die CLI, als muesse man Enter zweimal druecken.
+    std::puts("ok");
+    std::fflush(stdout);
+    usb_stdio_task();
     bool saved;
     { emulator::FlashPauseGuard _fp; saved = config::save(); }
+    // Baut die RAM-Disk-CONFIG.INI neu auf UND loest einen Medienwechsel aus,
+    // damit der gemountete Host die frische CONFIG.INI liest und seine alte
+    // NICHT zurueckschreibt (was die Aenderung reverten + den Gast neu starten
+    // wuerde).
     usb_msc::refresh_config_volume();
-    std::puts(saved ? "ok (gespeichert)"
-                    : "ok (live) — Flash-Speichern fehlgeschlagen (siehe 'stats')");
+    if (!saved)
+        std::puts("[CFG] Flash-Speichern fehlgeschlagen (siehe 'stats')");
 }
 
 // --- XMODEM-Empfang in den HEX-Parser ---
@@ -135,7 +146,8 @@ void cmd_help() {
         "  version                    Build-Info",
         "  stats / status             Emulatorstatus & Zaehler",
         "  dbg [clear]                Gast-Debug-Ausgabe zeigen/loeschen",
-        "  dbg save                   Debug-Ausgabe als DEBUG.TXT aufs Laufwerk",        "  reset                      Emulator-Core neu starten",
+        "  dbg save                   Debug-Ausgabe als DEBUG.TXT aufs Laufwerk",
+        "  dbg auto <sek|off>         DEBUG.TXT automatisch alle N s aktualisieren",        "  reset                      Emulator-Core neu starten",
         "",
         "  upload                     Intel-Hex-Stream starten (alias: flash hex)",
         "  xmodem                     Intel-Hex per XMODEM-CRC/1K empfangen",
@@ -187,6 +199,8 @@ void cmd_status() {
                 names[static_cast<int>(emulator::state())],
                 static_cast<unsigned long>(emulator::pc()),
                 static_cast<unsigned long long>(emulator::mem_traps()));
+    std::printf("Gast-Starts=%lu\n",
+                static_cast<unsigned long>(emulator::start_count()));
     std::printf("MMIO R=%llu W=%llu  GPIO=%llu  PLL-cfg=%llu  NVIC-W=%llu\n",
                 static_cast<unsigned long long>(s.mmio_reads),
                 static_cast<unsigned long long>(s.mmio_writes),
@@ -316,6 +330,24 @@ void handle_command(char* line) {
             usb_msc::flush_debug_volume();
             std::printf("dbg: DEBUG.TXT aktualisiert (%lu Bytes) - Laufwerk neu einlesen\n",
                         static_cast<unsigned long>(debug_bridge::total_bytes()));
+            return;
+        }
+        if (n >= 2 && std::strcmp(tokens[1], "auto") == 0) {
+            if (n >= 3) {
+                if (std::strcmp(tokens[2], "off") == 0) {
+                    usb_msc::set_debug_autoflush_ms(0);
+                } else {
+                    long s;
+                    if (!parse_int(tokens[2], 0, 3600, s)) {
+                        std::puts("err: dbg auto <sekunden|off>"); return;
+                    }
+                    usb_msc::set_debug_autoflush_ms(static_cast<uint32_t>(s) * 1000u);
+                }
+            }
+            uint32_t ms = usb_msc::debug_autoflush_ms();
+            if (ms == 0) std::puts("dbg auto: aus");
+            else std::printf("dbg auto: alle %lu s\n",
+                             static_cast<unsigned long>(ms / 1000u));
             return;
         }
         // Gast-Debug-Ausgabe (ueber die Debug-Bridge gesammelt) dumpen.
@@ -797,6 +829,10 @@ void run() {
             else                 handle_command(line);
             len = 0;
             std::printf("emu> ");
+            // Ausgabe des Kommandos sofort ueber USB rausschieben, damit die
+            // Antwort nicht erst beim naechsten Tastendruck sichtbar wird.
+            std::fflush(stdout);
+            usb_stdio_task();
             continue;
         }
         if (c == 0x7F /* DEL */ || c == 0x08 /* BS */) {

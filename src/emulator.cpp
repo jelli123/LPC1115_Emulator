@@ -24,6 +24,11 @@ std::atomic<emulator::State> g_state{emulator::State::Idle};
 std::atomic<bool>            g_request_stop{false};
 std::atomic<uint32_t>        g_pc{0};
 
+// Zaehlt jeden Gast-Start (Firmware-Kopie + Launch in core1_main). Diagnose:
+// steigt der Wert waehrend des Betriebs, wird der Gast wiederholt neu gestartet
+// (z. B. durch MSC-Re-Processing) -> erklaert LED-Glitches/Blink-Aussetzer.
+std::atomic<uint32_t>        g_start_count{0};
+
 // Vom Gast (Core1) angeforderter Soft-Reset (NVIC_SystemReset/WDT). Wird vom
 // Core0-Loop konsumiert, der den eigentlichen Core1-Reset ausfuehrt — ein
 // multicore_reset_core1() VON Core1 aus wuerde sich selbst abschiessen und nie
@@ -324,6 +329,7 @@ void core1_main() {
             __asm volatile ("wfe");
         }
         g_request_stop.store(false, std::memory_order_release);
+        g_start_count.fetch_add(1, std::memory_order_relaxed);   // Diagnose: Gast-Starts
 
         // Firmware in RP2350-SRAM kopieren. Quelle ist storage::firmware_data()
         // — ein Pointer in den memory-mapped XIP-Bereich.
@@ -572,6 +578,7 @@ void resume_for_flash(bool was_running) {
 State    state()    { return g_state.load(); }
 uint32_t pc()       { return g_pc.load(); }
 uint64_t mem_traps(){ return faultsys::stats().mem_traps; }
+uint32_t start_count(){ return g_start_count.load(std::memory_order_relaxed); }
 
 uint32_t load_base() {
     return reinterpret_cast<uint32_t>(g_firmware_image);

@@ -82,4 +82,8 @@ State    state();
 uint64_t mem_traps();
 uint32_t pc();
 
+// Anzahl der Gast-Starts seit Boot (Diagnose: steigt der Wert im Betrieb, wird
+// der Gast wiederholt neu gestartet -> Blink-/LED-Aussetzer).
+uint32_t start_count();
+
 } // namespace emulator
