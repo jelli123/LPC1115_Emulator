@@ -20,6 +20,7 @@
 #include "hardware/structs/powman.h"
 #include "hardware/structs/clocks.h"
 #include "hardware/structs/scb.h"
+#include "hardware/structs/systick.h"
 #include "hardware/regs/powman.h"
 #include "pico/stdlib.h"
 
@@ -201,16 +202,23 @@ void gpio_apply_port(uint8_t port, uint32_t /*old_data*/, uint32_t new_data, uin
 uint32_t        g_systick_load = 0, g_systick_val = 0, g_systick_ctrl = 0;
 
 // =========================================================================
-// SysTick-Emulation (0xE000E010-0xE000E01F). Notwendig, weil SysTick auf dem
-// Cortex-M33 privilegiert-only ist: der unprivilegierte Gast koennte es nativ
-// weder konfigurieren noch korrekt lesen. Die MPU (mmu.cpp) laesst den Block
-// 0xE000E000-0xE000E01F trappen; hier wird SysTick zeitbasiert nachgebildet und
-// die SysTick-Exception (Slot 15) via irq_inject::pend_systick() injiziert.
+// SysTick (0xE000E010-0xE000E01F). Der unprivilegierte Gast kann SysTick auf
+// dem Cortex-M33 nicht selbst bedienen (SCS ist privilegiert-only) -> die MPU
+// (mmu.cpp) laesst den Block 0xE000E000-0xE000E01F trappen. Zwei Ebenen:
 //
-// Zeitbasis: reale Wall-Clock (time_us_64) skaliert mit g_current_hz (der vom
-// Gast programmierten LPC-Soll-Frequenz), analog ct_advance/wdt_advance. Damit
-// tickt SysTick mit der von der Gast-Firmware erwarteten Rate (z. B. 1 ms bei
-// RVR = f/1000), unabhaengig vom realen 150-MHz-RP2350-Takt.
+//  1) Register-Schatten (g_systick): liefert dem Gast beim (getrappten) Lesen
+//     konsistente CSR/RVR/CVR-Werte, zeitbasiert weitergezaehlt (systick_advance,
+//     Wall-Clock time_us_64 skaliert mit g_current_hz).
+//  2) ECHTER Core1-SysTick (systick_hw_sync): Da Core1s VTOR auf die Gast-
+//     Vektortabelle zeigt und Slot 15 (SysTick) dem Gast gehoert, konfigurieren
+//     wir den realen Core1-SysTick passend zum Gast-Wunsch. Er feuert dann den
+//     Gast-SysTick_Handler NATIV (Handler-Mode) -> systemTime tickt in Echtzeit,
+//     ein natives WFI im Gast wird geweckt, und ICSR.VECTACTIVE ist im Handler
+//     korrekt. Dadurch entfaellt die fruehere PendSV-Injektion des SysTick-
+//     Handlers (die nur bei Gast-MMIO-Aktivitaet lief und WFI nie weckte).
+//
+// Skalierung: der Gast rechnet in g_current_hz (LPC-Soll-Takt), der reale Core1
+// laeuft mit clk_sys -> Reload hochskalieren (systick_hw_sync).
 extern uint32_t g_current_hz;   // weiter unten definiert (SYSCON-Takt-Schatten)
 struct SysTick {
     uint32_t csr;      // [0]=ENABLE [1]=TICKINT [2]=CLKSOURCE [16]=COUNTFLAG
@@ -221,7 +229,7 @@ struct SysTick {
     // Diagnose:
     uint32_t trap_reads;   // Anzahl getrappter SysTick-Reads
     uint32_t trap_writes;  // Anzahl getrappter SysTick-Writes
-    uint64_t irq_ticks;    // Anzahl injizierter SysTick-Exceptions
+    uint64_t irq_ticks;    // Anzahl emulierter SysTick-Unterlaeufe
 };
 SysTick g_systick{};
 
@@ -229,10 +237,10 @@ constexpr uint32_t SYST_CSR_ENABLE    = 1u << 0;
 constexpr uint32_t SYST_CSR_TICKINT   = 1u << 1;
 constexpr uint32_t SYST_CSR_COUNTFLAG = 1u << 16;
 
-// Treibt den SysTick-Zaehler entsprechend der verstrichenen Zeit weiter und
-// injiziert bei jedem Reload-Unterlauf (CVR laeuft durch 0) die SysTick-
-// Exception, falls TICKINT gesetzt ist. Wird aus poll_timed_sources() und aus
-// dem SysTick-MMIO-Trap aufgerufen.
+// Treibt den SysTick-SCHATTEN entsprechend der verstrichenen Zeit weiter (nur
+// fuer konsistente Gast-Lesewerte). Die tatsaechliche SysTick-Exception liefert
+// der reale Core1-SysTick nativ (systick_hw_sync) — hier wird daher NICHT mehr
+// injiziert. Wird aus poll_timed_sources() und dem SysTick-MMIO-Read aufgerufen.
 void systick_advance() {
     uint64_t now = time_us_64();
     if (!(g_systick.csr & SYST_CSR_ENABLE) || g_systick.rvr == 0) {
@@ -264,12 +272,37 @@ void systick_advance() {
     }
     g_systick.cvr = cur & 0xFF'FFFFu;
     if (underflow) {
+        // Nur der Schatten-COUNTFLAG; die eigentliche SysTick-Exception liefert
+        // der reale Core1-SysTick nativ (systick_hw_sync). KEINE Injektion mehr.
         g_systick.csr |= SYST_CSR_COUNTFLAG;
-        if (g_systick.csr & SYST_CSR_TICKINT) {
-            ++g_systick.irq_ticks;
-            irq_inject::pend_systick();
-        }
+        if (g_systick.csr & SYST_CSR_TICKINT) ++g_systick.irq_ticks;
     }
+}
+
+// Konfiguriert den ECHTEN Core1-SysTick passend zum emulierten Zustand. Nur auf
+// Core1 sinnvoll (dort laeuft der Gast, dessen VTOR auf die Gast-Vektortabelle
+// zeigt -> der reale SysTick feuert Slot 15 = Gast-SysTick_Handler nativ).
+// Skalierung: Gast rechnet in g_current_hz, real laeuft Core1 mit clk_sys ->
+// Reload hochskalieren, damit der reale Tick im selben Echtzeit-Intervall
+// feuert wie vom Gast beabsichtigt. Reload ist 24-bit -> clampen.
+void systick_hw_sync() {
+    if (get_core_num() != 1u) return;   // SysTick ist per-Core; nur Core1 relevant
+    if (!(g_systick.csr & SYST_CSR_ENABLE) || g_systick.rvr == 0u) {
+        systick_hw->csr = 0u;           // realen SysTick anhalten
+        return;
+    }
+    uint32_t guest_hz = g_current_hz ? g_current_hz : 12'000'000u;
+    uint32_t real_hz  = clock_get_hz(clk_sys);
+    if (real_hz == 0u) real_hz = 150'000'000u;
+    uint64_t period      = static_cast<uint64_t>(g_systick.rvr & 0xFF'FFFFu) + 1u;
+    uint64_t real_reload = period * static_cast<uint64_t>(real_hz) / guest_hz;
+    if (real_reload == 0u)            real_reload = 1u;
+    if (real_reload > 0x100'0000ull) real_reload = 0x100'0000ull;   // 24-bit + 1
+    systick_hw->rvr = static_cast<uint32_t>(real_reload - 1u);
+    systick_hw->cvr = 0u;               // Zaehler + COUNTFLAG zuruecksetzen
+    uint32_t ctrl = (1u << 2) | (1u << 0);          // CLKSOURCE=Prozessor | ENABLE
+    if (g_systick.csr & SYST_CSR_TICKINT) ctrl |= (1u << 1);   // TICKINT
+    systick_hw->csr = ctrl;
 }
 
 uint32_t systick_read32(uint32_t addr) {
@@ -306,6 +339,9 @@ void systick_write32(uint32_t addr, uint32_t value) {
             break;
         default: break;                     // ICTR (RO) / ACTLR: ignorieren
     }
+    // Realen Core1-SysTick an den neuen Gast-Zustand angleichen -> er feuert den
+    // Gast-SysTick_Handler nativ (systemTime, WFI-Wakeup, korrektes VECTACTIVE).
+    systick_hw_sync();
 }
 
 // Byteweiser SysTick-Write-Sammler: buendelt die 4 Bytes eines STR zu einem
@@ -486,6 +522,10 @@ void retarget_rp2350_clock(uint32_t target_hz) {
 
     g_current_hz = target_hz;
     ++g_stats.pll_reconfigs;
+    // Realen Core1-SysTick auf den neuen Soll-Takt umskalieren (Reload haengt von
+    // g_current_hz ab). Wichtig, falls der Gast SysTick VOR der PLL-Konfiguration
+    // aufsetzt und der Takt sich danach aendert.
+    systick_hw_sync();
     std::printf("[CLK] LPC-Soll-Takt %lu kHz uebernommen "
                 "(emulierte Zeitbasis; RP2350-Takt unveraendert)\n",
                 static_cast<unsigned long>((target_hz + 500u) / 1000u));
@@ -1622,6 +1662,7 @@ void reset() {
     g_systick = {};
     g_systick.last_us = time_us_64();
     g_systick_collector = {0, {0,0,0,0}, 0};
+    systick_hw_sync();   // realen Core1-SysTick anhalten (falls auf Core1)
     g_syspllctrl   = 0;
     g_syspllclksel = 0;
     g_mainclksel   = 0;

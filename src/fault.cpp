@@ -200,6 +200,10 @@ void print_exc_diag(const char* tag, const uint32_t* f, const uint32_t* r4_r11) 
 // weiter, die Diagnose bleibt lesbar. Recovery ueber CLI ('reset'/'run') oder
 // erneutes Flashen. Laeuft auf Core1 und kehrt nie zurueck (Core1 parkt).
 [[noreturn]] void enter_fatal_halt() {
+    // Realen Core1-SysTick abschalten: er wuerde sonst weiter den Gast-
+    // SysTick_Handler (Slot 15 der Gast-VTOR) feuern, obwohl der Gast defekt
+    // ist und hier geparkt wird.
+    SysTick->CTRL = 0;
     emulator::notify_guest_faulted();
     femit("[FAULT] Gast angehalten (State=Faulted) — 'reset' oder neue "
                 "Firmware zum Fortfahren.\n");
@@ -344,6 +348,19 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
         const uint32_t reg = acc.address & ~3u;
         if (acc.is_load) {
             uint32_t v = *reinterpret_cast<volatile uint32_t*>(reg);
+            // ICSR (0xE000ED04): VECTACTIVE (Bits[8:0]) MUSS die Gast-Sicht
+            // zeigen, nicht die des Fault-Handlers. Die SCS ist auf dem M33
+            // privilegiert-only, daher faultet der unprivilegierte Gast-Read
+            // hierher — das reale ICSR meldet aber VECTACTIVE = die Nummer
+            // DIESER Fault-Exception (MemManage/BusFault != 0). Ungefiltert
+            // liefert isInsideInterrupt() dann faelschlich TRUE, und Firmware
+            // wie die sblib nimmt in delay() den delayMicroseconds-Busy-Poll
+            // (jeder SysTick-VAL-Read ein Trap) statt des effizienten WFI-/
+            // systemTime-Pfads. Wir ersetzen VECTACTIVE durch die IPSR des
+            // gestackten Gast-xPSR: im Thread-Mode 0 (isInsideInterrupt=FALSE),
+            // in einem nativ laufenden Gast-Handler dessen Exception-Nummer.
+            if (reg == 0xE000'ED04u)
+                v = (v & ~0x1FFu) | (frame->xpsr & 0x1FFu);
             uint32_t* dst = reg_ptr(frame, r4_r11, &guest_sp, acc.rt);
             if (dst) *dst = v;
             frame->pc += acc.instr_size;
