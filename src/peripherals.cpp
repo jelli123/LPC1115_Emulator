@@ -231,6 +231,7 @@ struct SysTick {
     uint32_t trap_reads;   // Anzahl getrappter SysTick-Reads
     uint32_t trap_writes;  // Anzahl getrappter SysTick-Writes
     uint64_t irq_ticks;    // Anzahl emulierter SysTick-Unterlaeufe
+    uint32_t guest_ticks_pending; // vom Host-Shim noch auszufuehrende Gast-Handler-Aufrufe
 };
 SysTick g_systick{};
 
@@ -260,50 +261,87 @@ void systick_advance() {
 
     uint32_t period = (g_systick.rvr & 0xFF'FFFFu) + 1u;   // RELOAD+1 Ticks/Zyklus
     uint32_t cur = g_systick.cvr & 0xFF'FFFFu;
-    bool underflow = false;
-    // cur zaehlt abwaerts; jeder Durchlauf durch 0 = ein SysTick-Ereignis.
-    uint64_t rem = ticks;
-    if (rem > cur) {
-        underflow = true;
-        rem -= (cur + 1u);                 // bis inkl. Nulldurchgang
-        rem %= period;                     // volle Zyklen ueberspringen
-        cur = period - 1u - static_cast<uint32_t>(rem);
+    uint32_t underflows = 0;
+    // cur zaehlt abwaerts; jeder Durchlauf durch 0 = ein SysTick-Ereignis. Es
+    // koennen mehrere Perioden in einem dt liegen -> alle zaehlen (Nachholen).
+    if (ticks > cur) {
+        uint64_t after = ticks - (cur + 1u);       // Ticks nach dem 1. Nulldurchgang
+        underflows = 1u + static_cast<uint32_t>(after / period);
+        uint32_t rem = static_cast<uint32_t>(after % period);
+        cur = period - 1u - rem;
     } else {
-        cur -= static_cast<uint32_t>(rem);
+        cur -= static_cast<uint32_t>(ticks);
     }
     g_systick.cvr = cur & 0xFF'FFFFu;
-    if (underflow) {
-        // Nur der Schatten-COUNTFLAG; die eigentliche SysTick-Exception liefert
-        // der reale Core1-SysTick nativ (systick_hw_sync). KEINE Injektion mehr.
+    if (underflows) {
+        // Schatten-COUNTFLAG setzen. Die tatsaechlichen Gast-SysTick_Handler-
+        // Aufrufe liefert der Host-Shim (emulator.cpp isr_systick_shim) anhand
+        // von guest_ticks_pending — so bleibt systemTime korrekt, auch wenn der
+        // reale SysTick fuer Sub-ms-Timer schneller feuert als die Gast-Periode.
         g_systick.csr |= SYST_CSR_COUNTFLAG;
-        if (g_systick.csr & SYST_CSR_TICKINT) ++g_systick.irq_ticks;
+        g_systick.irq_ticks += underflows;
+        if (g_systick.csr & SYST_CSR_TICKINT)
+            g_systick.guest_ticks_pending += underflows;
     }
 }
 
-// Konfiguriert den ECHTEN Core1-SysTick passend zum emulierten Zustand. Nur auf
-// Core1 sinnvoll (dort laeuft der Gast, dessen VTOR auf die Gast-Vektortabelle
-// zeigt -> der reale SysTick feuert Slot 15 = Gast-SysTick_Handler nativ).
-// Skalierung: Gast rechnet in g_current_hz, real laeuft Core1 mit clk_sys ->
-// Reload hochskalieren, damit der reale Tick im selben Echtzeit-Intervall
-// feuert wie vom Gast beabsichtigt. Reload ist 24-bit -> clampen.
-void systick_hw_sync() {
+// Vorwaertsdeklaration: absolute Zeit (time_us_64-Domain) des naechsten
+// faelligen CT-Match-INTERRUPTS, ~0 wenn keiner ansteht. Definition nach
+// ct_advance (braucht CtModel/g_ct). Treibt die adaptive SysTick-Reload-Wahl.
+uint64_t next_ct_irq_deadline_us(uint64_t now);
+
+// Programmiert den ECHTEN Core1-SysTick als HOST-Zeitbasis ("HW-Alarm"). Slot 15
+// zeigt auf unseren isr_systick_shim (emulator.cpp). Nur auf Core1 (SysTick ist
+// per-Core; Core1s VTOR = Gast-Tabelle). Ein nativer RP2350-Timer-Alarm-IRQ
+// koennte hier NICHT genutzt werden: seine IRQ-Nummer wuerde in einen LPC-IRQ-
+// Slot der Gast-Vektortabelle zeigen. Der M33-SysTick ist der einzige Core1-
+// Hardware-Timer, dessen Vektor der Host besitzt.
+//
+// Reload ist ADAPTIV = Minimum aus:
+//   - Host-Obergrenze 1 ms (garantiert regelmaessiges Advance / PWM-Update),
+//   - Gast-SysTick-Periode (falls der Gast SysTick aktiviert hat),
+//   - Zeit bis zum naechsten faelligen CT-Match-Interrupt (bis in den us-Bereich)
+// nach unten auf ~30 us begrenzt (bounded IRQ-/Injektions-Overhead). Damit
+// bekommen auch Sub-ms-Timer-Matches einen rechtzeitigen Wakeup aus __WFI(),
+// ohne eine starre Hochfrequenz-ISR. Der reale SysTick laeuft, wenn der Gast
+// SysTick+TICKINT nutzt ODER ein CT-Match-Interrupt aussteht; sonst gestoppt
+// (reines MMIO-Polling treibt das Advance dann selbst).
+void systick_program_hw() {
     if (get_core_num() != 1u) return;   // SysTick ist per-Core; nur Core1 relevant
-    if (!(g_systick.csr & SYST_CSR_ENABLE) || g_systick.rvr == 0u) {
-        systick_hw->csr = 0u;           // realen SysTick anhalten
+    const uint64_t now = time_us_64();
+    const bool guest_en  = (g_systick.csr & SYST_CSR_ENABLE) && (g_systick.rvr != 0u);
+    const bool guest_irq = guest_en && (g_systick.csr & SYST_CSR_TICKINT);
+    const uint64_t ct_deadline = next_ct_irq_deadline_us(now);
+    const bool ct_pending = (ct_deadline != ~uint64_t(0));
+
+    if (!guest_irq && !ct_pending) {
+        systick_hw->csr = 0u;           // nichts braucht eine Host-Taktquelle
         return;
     }
-    uint32_t guest_hz = g_current_hz ? g_current_hz : 12'000'000u;
     uint32_t real_hz  = clock_get_hz(clk_sys);
     if (real_hz == 0u) real_hz = 150'000'000u;
-    uint64_t period      = static_cast<uint64_t>(g_systick.rvr & 0xFF'FFFFu) + 1u;
-    uint64_t real_reload = period * static_cast<uint64_t>(real_hz) / guest_hz;
-    if (real_reload == 0u)            real_reload = 1u;
-    if (real_reload > 0x100'0000ull) real_reload = 0x100'0000ull;   // 24-bit + 1
-    systick_hw->rvr = static_cast<uint32_t>(real_reload - 1u);
+    uint32_t guest_hz = g_current_hz ? g_current_hz : 12'000'000u;
+
+    // Host-Obergrenze: mindestens jede 1 ms ein Advance.
+    uint64_t reload = static_cast<uint64_t>(real_hz) / 1000u;
+    if (guest_en) {
+        uint64_t guest_cycles =
+            (static_cast<uint64_t>(g_systick.rvr & 0xFF'FFFFu) + 1u)
+            * static_cast<uint64_t>(real_hz) / guest_hz;
+        if (guest_cycles < reload) reload = guest_cycles;
+    }
+    if (ct_pending) {
+        uint64_t d_us     = ct_deadline - now;
+        uint64_t d_cycles = d_us * static_cast<uint64_t>(real_hz) / 1'000'000u;
+        if (d_cycles < reload) reload = d_cycles;
+    }
+    const uint64_t floor_cycles = static_cast<uint64_t>(real_hz) * 30u / 1'000'000u; // ~30 us
+    if (reload < floor_cycles)     reload = floor_cycles;
+    if (reload < 1u)               reload = 1u;
+    if (reload > 0x0100'0000ull)   reload = 0x0100'0000ull;   // 24-bit RVR + 1
+    systick_hw->rvr = static_cast<uint32_t>(reload - 1u);
     systick_hw->cvr = 0u;               // Zaehler + COUNTFLAG zuruecksetzen
-    uint32_t ctrl = (1u << 2) | (1u << 0);          // CLKSOURCE=Prozessor | ENABLE
-    if (g_systick.csr & SYST_CSR_TICKINT) ctrl |= (1u << 1);   // TICKINT
-    systick_hw->csr = ctrl;
+    systick_hw->csr = (1u << 2) | (1u << 1) | (1u << 0);   // CLKSOURCE|TICKINT|ENABLE
 }
 
 uint32_t systick_read32(uint32_t addr) {
@@ -340,9 +378,8 @@ void systick_write32(uint32_t addr, uint32_t value) {
             break;
         default: break;                     // ICTR (RO) / ACTLR: ignorieren
     }
-    // Realen Core1-SysTick an den neuen Gast-Zustand angleichen -> er feuert den
-    // Gast-SysTick_Handler nativ (systemTime, WFI-Wakeup, korrektes VECTACTIVE).
-    systick_hw_sync();
+    // Realen Core1-SysTick (Host-Zeitbasis) an den neuen Gast-Zustand angleichen.
+    systick_program_hw();
 }
 
 // Byteweiser SysTick-Write-Sammler: buendelt die 4 Bytes eines STR zu einem
@@ -526,7 +563,7 @@ void retarget_rp2350_clock(uint32_t target_hz) {
     // Realen Core1-SysTick auf den neuen Soll-Takt umskalieren (Reload haengt von
     // g_current_hz ab). Wichtig, falls der Gast SysTick VOR der PLL-Konfiguration
     // aufsetzt und der Takt sich danach aendert.
-    systick_hw_sync();
+    systick_program_hw();
     std::printf("[CLK] LPC-Soll-Takt %lu kHz uebernommen "
                 "(emulierte Zeitbasis; RP2350-Takt unveraendert)\n",
                 static_cast<unsigned long>((target_hz + 500u) / 1000u));
@@ -883,6 +920,33 @@ void ct_advance(CtModel& c) {
     ct_update_pwm(c);
 }
 
+// Ermittelt die absolute Zeit (time_us_64-Domain) des naechsten faelligen
+// Match-INTERRUPTS ueber alle aktiven CT-Timer, ~0 wenn keiner ansteht. Nur
+// Matches mit gesetztem MCR-Interrupt-Bit zaehlen (die einen Wakeup aus __WFI()
+// erfordern). Grundlage der adaptiven SysTick-Reload-Berechnung (Sub-ms-Matches).
+uint64_t next_ct_irq_deadline_us(uint64_t now) {
+    uint64_t best = ~uint64_t(0);
+    uint32_t hz = g_current_hz ? g_current_hz : 12'000'000u;
+    for (auto& c : g_ct) {
+        if (!c.enabled) continue;
+        uint64_t mask   = c.is32 ? 0xFFFF'FFFFull : 0xFFFFull;
+        uint64_t period = mask + 1u;
+        double tick_us  = static_cast<double>(c.pre + 1u) * 1'000'000.0
+                          / static_cast<double>(hz);       // us pro TC-Inkrement
+        if (tick_us <= 0.0) continue;
+        for (int m = 0; m < 4; ++m) {
+            uint32_t mcr_m = (c.mcr >> (m * 3)) & 0x7u;
+            if (!(mcr_m & 0x1u)) continue;                 // nur Interrupt-Matches
+            uint64_t delta = (static_cast<uint64_t>(c.mr[m]) - c.tc) & mask;
+            if (delta == 0u) delta = period;               // gerade getroffen -> ganzer Zyklus
+            double   d_us     = static_cast<double>(delta) * tick_us;
+            uint64_t deadline = now + static_cast<uint64_t>(d_us + 0.5);
+            if (deadline < best) best = deadline;
+        }
+    }
+    return best;
+}
+
 // Flankenerkennung am Capture-Eingang: liest den echten RP2350-Pin, erkennt
 // die per CCR scharfgeschalteten Flanken, schreibt den aktuellen TC nach CR0,
 // setzt IR-Bit 4 und pendet den Timer-IRQ (falls CAP0I gesetzt). Wird mit der
@@ -1037,6 +1101,11 @@ void ct_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
         default: break;
     }
     ct_update_pwm(c);   // MRm-/PWMC-Schreibzugriff kann den PWM-Pegel ändern
+    // Timer-Konfiguration geaendert (Enable/MCR/MR ...) -> Host-SysTick-"Alarm"
+    // neu berechnen, damit ein (ggf. Sub-ms-)Match-Interrupt rechtzeitig einen
+    // Wakeup bekommt, auch wenn der Gast danach in __WFI() idlet (und selbst
+    // wenn der Gast den SysTick gar nicht nutzt).
+    systick_program_hw();
 }
 
 // =========================================================================
@@ -1663,7 +1732,7 @@ void reset() {
     g_systick = {};
     g_systick.last_us = time_us_64();
     g_systick_collector = {0, {0,0,0,0}, 0};
-    systick_hw_sync();   // realen Core1-SysTick anhalten (falls auf Core1)
+    systick_program_hw();   // realen Core1-SysTick (Host-Zeitbasis) neu setzen (falls Core1)
     g_syspllctrl   = 0;
     g_syspllclksel = 0;
     g_mainclksel   = 0;
@@ -2204,6 +2273,19 @@ bool guest_output_level(uint8_t port, uint8_t pin, bool& level) {
     if (((g_gpio[port].dir >> pin) & 1u) == 0u) return false;   // nicht als Ausgang
     level = ((g_gpio[port].data >> pin) & 1u) != 0u;
     return true;
+}
+
+// Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-
+// SysTick auf den naechsten Deadline (adaptiver "HW-Alarm").
+void systick_hw_rearm() { systick_program_hw(); }
+
+// Vom Host-SysTick-Shim konsumiert: Anzahl seit dem letzten Aufruf faelliger
+// Gast-SysTick-Perioden (die der Shim durch entsprechend viele Aufrufe des
+// Gast-Handlers nachholt). Zeroing beim Lesen.
+uint32_t systick_take_guest_ticks() {
+    uint32_t n = g_systick.guest_ticks_pending;
+    g_systick.guest_ticks_pending = 0;
+    return n;
 }
 
 } // namespace peripherals

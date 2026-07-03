@@ -29,6 +29,11 @@ std::atomic<uint32_t>        g_pc{0};
 // (z. B. durch MSC-Re-Processing) -> erklaert LED-Glitches/Blink-Aussetzer.
 std::atomic<uint32_t>        g_start_count{0};
 
+// Adresse des relozierten Gast-SysTick-Handlers (VTOR[15], mit Thumb-Bit). Der
+// reale Core1-SysTick feuert stattdessen isr_systick_shim, der die zeitbasierten
+// LPC-Modelle treibt und dann diesen Gast-Handler aufruft. 0 = keiner.
+std::atomic<uint32_t>        g_guest_systick_handler{0};
+
 // Vom Gast (Core1) angeforderter Soft-Reset (NVIC_SystemReset/WDT). Wird vom
 // Core0-Loop konsumiert, der den eigentlichen Core1-Reset ausfuehrt — ein
 // multicore_reset_core1() VON Core1 aus wuerde sich selbst abschiessen und nie
@@ -132,6 +137,51 @@ void isr_svc() {
         "bl    svc_dispatch_c      \n"
         "pop   {r4, pc}            \n"   // EXC_RETURN -> zurueck zum Gast
     );
+}
+
+// SysTick-Host-Shim (Core1, laeuft im Handler-Mode als SysTick-Exception).
+// Der reale Core1-SysTick (systick_hw_sync in peripherals.cpp) zeigt ueber
+// VTOR[15] hierher statt direkt auf den Gast-Handler. Zweck: die zeitbasierten
+// LPC-Modelle (CT16/CT32-Timer, WWDT) periodisch (jede SysTick-Periode, i.d.R.
+// 1 ms) voranzutreiben. Sonst wuerden deren Match-Interrupts NUR bei einem
+// Gast-MMIO-Zugriff erkannt (ct_advance laeuft dort lazy) — ein interrupt-
+// getriebenes Programm, das in __WFI() idlet (z. B. example-int-blink: Timer-
+// Match toggelt die LED im IRQ), bekaeme so nach dem ersten nie einen weiteren
+// Timer-IRQ. poll_timed_sources() erkennt faellige Matches und pendet den
+// zugehoerigen LPC-IRQ im vNVIC (+ PendSV). Danach wird der eigentliche Gast-
+// SysTick-Handler (z. B. sblib systemTime++) als normale Subroutine gerufen —
+// ein CMSIS-Handler ist eine gewoehnliche C-Funktion, das ist zulaessig. Beim
+// Exception-Return dieses Shims wird ein evtl. gependeter LPC-IRQ per PendSV
+// (tail-chained) in den Gast injiziert.
+extern "C" void isr_systick_shim() {
+    // Host-Zeitbasis-Tick (reale Core1-SysTick-Exception, Handler-Mode). Feuert
+    // ADAPTIV (bis in den Sub-ms-Bereich) am naechsten faelligen Timer-Match,
+    // sonst spaetestens jede 1 ms. Treibt die zeitbasierten LPC-Modelle und
+    // weckt den Gast aus __WFI().
+    peripherals::poll_timed_sources();      // CT16/CT32/WWDT + SysTick-Schatten
+    peripherals::sample_pin_interrupts();
+
+    // Gast-SysTick_Handler nur so oft aufrufen, wie echte Gast-Perioden
+    // verstrichen sind. So bleibt systemTime korrekt, auch wenn der reale
+    // SysTick fuer einen Sub-ms-Timer schneller tickt als die Gast-Periode
+    // (dann sind 0 Perioden faellig -> kein systemTime++).
+    uint32_t due = peripherals::systick_take_guest_ticks();
+    if (due) {
+        uint32_t h = g_guest_systick_handler.load(std::memory_order_relaxed);
+        if ((h & ~1u) != 0u) {
+            auto fn = reinterpret_cast<void(*)()>(h);
+            if (due > 8u) due = 8u;         // Nachhol-Deckel (nach langem Stall)
+            for (uint32_t i = 0; i < due; ++i) fn();
+        }
+    }
+
+    // Faellige LPC-IRQs (Timer-Match etc.) in den Gast injizieren (PendSV tail-
+    // chained beim Exception-Return dieses Shims).
+    if (vnvic::irq_pending())
+        SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+
+    // Naechsten Host-Tick am kommenden Deadline neu programmieren (adaptiv).
+    peripherals::systick_hw_rearm();
 }
 
 // Naked Trampolin: wechselt auf PSP/unprivileged Thread Mode und springt mit
@@ -387,6 +437,13 @@ void core1_main() {
             // SysTick (Slot 15) bleibt beim Gast, da es eine echte M33-
             // Peripherie ist und der Gast seinen eigenen Tick-Handler braucht.
             dst[14] = reinterpret_cast<uint32_t>(&isr_pendsv);
+
+            // SysTick (Slot 15): Host-Shim davorschalten. Der relozierte Gast-
+            // Handler wird gemerkt; der reale Core1-SysTick feuert isr_systick_shim,
+            // der die LPC-Timer treibt und dann den Gast-Handler aufruft. Ohne das
+            // liefe ein WFI-idlender Interrupt-Blink nur einmal (Timer stand still).
+            g_guest_systick_handler.store(dst[15], std::memory_order_relaxed);
+            dst[15] = reinterpret_cast<uint32_t>(&isr_systick_shim);
 
             // Opt-in-Patches, die Gast-Instruktionen auf SVC-Traps umlenken
             // (gemeinsamer Dispatcher isr_svc, Vektor-Slot 11):
@@ -663,6 +720,10 @@ void activate_bootloader_handover() {
     dst[5]  = reinterpret_cast<uint32_t>(&isr_busfault);
     dst[6]  = reinterpret_cast<uint32_t>(&isr_usagefault);
     dst[14] = reinterpret_cast<uint32_t>(&isr_pendsv);
+    // SysTick (Slot 15): Host-Shim wie im Loader (treibt LPC-Timer + ruft den
+    // Applikations-SysTick-Handler). Der relozierte App-Handler wird gemerkt.
+    g_guest_systick_handler.store(dst[15], std::memory_order_relaxed);
+    dst[15] = reinterpret_cast<uint32_t>(&isr_systick_shim);
     // SVC-Dispatcher nur, wenn ein opt-in-Patch (WFI/PRIMASK) aktiv ist.
     // Hinweis: In der zweistufigen Variante bleibt der App-Bereich pristine
     // (nicht gepatcht), damit die Bootloader-CRC passt — die WFI/PRIMASK-

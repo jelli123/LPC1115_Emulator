@@ -21,6 +21,7 @@
 
 #include <sblib/eibBCU1.h>
 #include <sblib/io_pin_names.h>
+#include "lpc_debug.h"   // Guest->Host Debug-Bridge (nur im Emulator wirksam)
 
 #define BLINK_LED PIN_INFO ///> Info LED of the 4TE-ARM Controller
 
@@ -31,6 +32,11 @@ BCU1 bcu = BCU1();
  */
 extern "C" void TIMER32_0_IRQHandler()
 {
+    // Diagnose ueber die Debug-Bridge: zaehlt, wie oft der Timer-IRQ feuert.
+    // Steigt der Zaehler regelmaessig, laeuft der periodische Timer-Interrupt.
+    static unsigned int ticks = 0;
+    dbg_puts("tmr "); dbg_u32(ticks++); dbg_putc('\n');
+
     // Toggle the Info LED
     digitalWrite(BLINK_LED, !digitalRead(BLINK_LED));
 
@@ -63,6 +69,7 @@ BcuBase* setup()
 
     timer32_0.start();
 
+    dbg_puts("int setup done\n");
     return (&bcu);
 }
 

@@ -64,6 +64,13 @@ void systick_debug(uint32_t& reads, uint32_t& writes,
                    uint32_t& csr, uint32_t& rvr, uint32_t& cvr,
                    uint64_t& ticks);
 
+// Host-SysTick-"Alarm" (adaptiver Core1-SysTick als Zeitbasis). Vom Host-Shim
+// (emulator.cpp isr_systick_shim) genutzt:
+//   systick_hw_rearm()        - realen SysTick auf naechsten Deadline programmieren
+//   systick_take_guest_ticks() - faellige Gast-SysTick-Perioden abholen (Handler-Nachhol)
+void     systick_hw_rearm();
+uint32_t systick_take_guest_ticks();
+
 // Liefert true, wenn der LPC-Pin (port 0..3, pin 0..11) vom Gast als AUSGANG
 // konfiguriert ist; dann steht in 'level' der zuletzt geschriebene Pegel (aus
 // dem GPIO-Schatten g_gpio). Fuer Core0 (LED-Poll), um die Onboard-LED die
