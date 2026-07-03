@@ -180,6 +180,18 @@ extern "C" void pendsv_inject_c() {
     }
 
     inject_frame(handler);
+
+    // Mehrere LPC-IRQs koennen GLEICHZEITIG pending sein (z. B. mehrere CT-Timer
+    // matchen im selben Host-Tick). Wir injizieren nur EINEN Frame pro PendSV-
+    // Lauf; die uebrigen wuerden sonst bis zum naechsten Ausloeser (Alarm-Tick/
+    // MMIO-Trap) haengen — und stuenden gar, wenn der Gast kein SysTick nutzt und
+    // keine weiteren Matches anstehen. Daher PendSV erneut takten, sobald noch
+    // ein pending+enabled IRQ vorliegt: PendSV (niedrigste Prio) feuert dann
+    // NACH Rueckkehr des gerade injizierten Handlers und liefert den naechsten.
+    // take_next_irq() hat den aktuellen bereits geclaimt -> keine Doppel-
+    // injektion, die Kette terminiert, wenn alle ausgeliefert sind.
+    if (vnvic::irq_pending())
+        SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
 }
 
 } // namespace irq_inject

@@ -313,8 +313,14 @@ void systick_program_hw() {
     const bool guest_irq = guest_en && (g_systick.csr & SYST_CSR_TICKINT);
     const uint64_t ct_deadline = next_ct_irq_deadline_us(now);
     const bool ct_pending = (ct_deadline != ~uint64_t(0));
+    // Sicherheitsnetz: sind bereits LPC-IRQs pending (z. B. mehrere Timer haben
+    // gleichzeitig gematcht, aber pro PendSV-Lauf wird nur einer injiziert), muss
+    // der Host-Tick weiterlaufen, bis alle ausgeliefert sind — auch wenn der Gast
+    // kein SysTick nutzt und kein weiterer Match ansteht. Sonst blieben die
+    // uebrigen IRQs bis zum naechsten Ausloeser liegen.
+    const bool irq_waiting = vnvic::irq_pending();
 
-    if (!guest_irq && !ct_pending) {
+    if (!guest_irq && !ct_pending && !irq_waiting) {
         systick_hw->csr = 0u;           // nichts braucht eine Host-Taktquelle
         return;
     }
@@ -335,6 +341,8 @@ void systick_program_hw() {
         uint64_t d_cycles = d_us * static_cast<uint64_t>(real_hz) / 1'000'000u;
         if (d_cycles < reload) reload = d_cycles;
     }
+    // Warten IRQs auf Auslieferung, schnellstmoeglich erneut feuern (Floor).
+    if (irq_waiting) reload = 0u;
     const uint64_t floor_cycles = static_cast<uint64_t>(real_hz) * 30u / 1'000'000u; // ~30 us
     if (reload < floor_cycles)     reload = floor_cycles;
     if (reload < 1u)               reload = 1u;
