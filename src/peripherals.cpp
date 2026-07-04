@@ -9,6 +9,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <atomic>
 
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
@@ -176,13 +177,49 @@ void apply_gpio_to_hw(uint8_t lpc_pin, bool out, bool level);
 int g_uart0_tx_gpio = -1;
 int g_uart0_rx_gpio = -1;
 
-// RP2350 uart0-faehige Pads (Bank0). Muster wiederholt sich alle 16 GPIOs:
-//   TX: gpio%16 == 0  || gpio%16 == 12   (GP0/12/16/28 ...)
-//   RX: gpio%16 == 1  || gpio%16 == 13   (GP1/13/17/29 ...)
-// Ein Hardware-UART kann NUR auf diese Pins; die PIO-UART-Bridge dagegen auf
-// jeden Pin (deshalb dort keine solche Einschraenkung).
-bool is_uart0_tx_pin(int g) { return g >= 0 && ((g % 16) == 0 || (g % 16) == 12); }
-bool is_uart0_rx_pin(int g) { return g >= 0 && ((g % 16) == 1 || (g % 16) == 13); }
+// RP2350 UART-faehige Pads (Bank0), verifiziert gegen das Datenblatt (RP2350
+// DS, GPIO-Funktionstabelle Bank 0). Jeder Pin hat eine PRIMAERE UART-Funktion
+// auf F2 (das waehlt GPIO_FUNC_UART) und viele zusaetzlich eine ALTERNATIVE auf
+// F11 (GPIO_FUNC_UART_AUX). Tabelle deckt beide ab -> maximale Pin-Freiheit fuer
+// Hardwareentwuerfe. GP28/GP29 (am Silizium uart0 F2) BEWUSST weggelassen: beim
+// Pico 2 (RP2350A) nicht sinnvoll nutzbar (GP29 nicht herausgefuehrt, GP28 ADC);
+// fuer eigene RP2350B-Hardware ggf. ergaenzen.
+//   inst: 0=uart0, 1=uart1.   func: 0=F2 (GPIO_FUNC_UART), 1=F11 (…_AUX).
+struct UartPad { uint8_t gpio; bool tx; uint8_t inst; bool aux; };
+constexpr UartPad UART_PADS[] = {
+    // uart0 primaer (F2)
+    {0,true,0,false},  {12,true,0,false}, {16,true,0,false},
+    {1,false,0,false}, {13,false,0,false},{17,false,0,false},
+    // uart1 primaer (F2)
+    {4,true,1,false},  {8,true,1,false},  {20,true,1,false}, {24,true,1,false},
+    {5,false,1,false}, {9,false,1,false}, {21,false,1,false},{25,false,1,false},
+    // uart0 alternativ (F11)
+    {2,true,0,true},   {14,true,0,true},  {18,true,0,true},
+    {3,false,0,true},  {15,false,0,true}, {19,false,0,true},
+    // uart1 alternativ (F11)
+    {6,true,1,true},   {10,true,1,true},  {22,true,1,true},  {26,true,1,true},
+    {7,false,1,true},  {11,false,1,true}, {23,false,1,true}, {27,false,1,true},
+};
+
+const UartPad* lookup_uart_pad(int gpio, bool want_tx) {
+    for (const auto& p : UART_PADS)
+        if (p.gpio == gpio && p.tx == want_tx) return &p;
+    return nullptr;
+}
+
+// Loest ein TX/RX-Pad-Paar zu (Peripheral, GPIO-Funktion) auf. Beide Pins
+// muessen zum SELBEN uart-Peripheral gehoeren. Liefert false bei ungueltiger/
+// gemischter Kombination.
+bool resolve_uart_pins(int tx, int rx, uart_inst_t*& inst,
+                       gpio_function_t& tx_func, gpio_function_t& rx_func) {
+    const UartPad* pt = lookup_uart_pad(tx, /*tx=*/true);
+    const UartPad* pr = lookup_uart_pad(rx, /*tx=*/false);
+    if (!pt || !pr || pt->inst != pr->inst) return false;
+    inst    = pt->inst == 0 ? uart0 : uart1;
+    tx_func = pt->aux ? GPIO_FUNC_UART_AUX : GPIO_FUNC_UART;
+    rx_func = pr->aux ? GPIO_FUNC_UART_AUX : GPIO_FUNC_UART;
+    return true;
+}
 
 // Prüft, ob ein RP2350-GPIO exklusiv von einer Hardware-Bridge belegt ist
 // (ADC, SPI, Timer-Capture/Match). Solche Pins darf das GPIO-Modell nicht
@@ -705,50 +742,98 @@ struct UartModel {
 };
 UartModel g_uart0{};
 
-// Routet die dem LPC-UART0 zugeordneten Pins (Default P1_9=TX, P1_8=RX aus der
-// Pinmap) auf das echte RP2350-uart0-Pad (GPIO_FUNC_UART). Ohne diesen Schritt
-// aktiviert uart_init() zwar das Peripheral, aber KEIN Signal erreicht einen
-// Pin (analog SPI/I2C-Bridge, die ihre Pins ebenfalls per gpio_set_function
-// routen). Nur uart0-faehige Pads sind zulaessig (is_uart0_tx/rx_pin) — ein
-// Hardware-UART kann nicht auf beliebige Pins (anders als die PIO-Bridge).
-// Ungeeignete Zuordnungen werden mit Hinweis uebersprungen; uart0 laeuft dann
-// intern weiter (der Gast blockiert nicht), nur ohne Pin-Ausgabe.
-void uart0_apply_pins() {
-    auto pm = config::pin_map();
-    int tx = -1, rx = -1;
-    uint8_t tx_idx = lpc_pin_idx(1, 9);   // P1_9 = UART0 TX
-    uint8_t rx_idx = lpc_pin_idx(1, 8);   // P1_8 = UART0 RX
-    if (tx_idx < config::LPC_PIN_COUNT) tx = pm.lpc_to_rp[tx_idx];
-    if (rx_idx < config::LPC_PIN_COUNT) rx = pm.lpc_to_rp[rx_idx];
+// --- Virtuelle UART0 <-> USB CDC#2 Kopplung -------------------------------
+// Zwei SPSC-Ringpuffer (lock-frei, je ein Producer/Consumer auf getrennten
+// Cores), damit Gast-UART0 (Core1, MMIO-Trap) und USB-CDC#2 (Core0, TinyUSB)
+// ohne Draht/Pin gekoppelt werden koennen (config uart0_cdc):
+//   TX-Ring: Core1 (THR-Write) -> Core0 (uart0_cdc_tx_pop -> CDC#2 write)
+//   RX-Ring: Core0 (CDC#2 read -> uart0_cdc_rx_push) -> Core1 (RBR-Read)
+// Umgeht die HW-uart0-Pin-Beschraenkung (nur GP0/1/12/13/16/17/28/29) und die
+// pinabhaengige IOCON-Funktionsselektion komplett.
+constexpr uint32_t UART0_RING = 256;   // Zweierpotenz
+struct SpscRing {
+    uint8_t                buf[UART0_RING];
+    std::atomic<uint32_t>  head{0};     // Producer schreibt
+    std::atomic<uint32_t>  tail{0};     // Consumer liest
+};
+SpscRing g_uart0_tx;   // Gast -> PC
+SpscRing g_uart0_rx;   // PC -> Gast
 
-    // TX
-    if (tx != g_uart0_tx_gpio) {
-        if (is_uart0_tx_pin(tx)) {
-            gpio_set_function(static_cast<uint>(tx), GPIO_FUNC_UART);
-            g_uart0_tx_gpio = tx;
-            std::printf("[UART0] TX -> GP%d (uart0)\n", tx);
-        } else if (tx >= 0) {
-            std::printf("[UART0] WARN: GP%d ist kein uart0-TX-Pad "
-                        "(zulaessig: GP0/12/16/28) - kein Routing\n", tx);
-            g_uart0_tx_gpio = -1;
-        }
+bool ring_push(SpscRing& r, uint8_t b) {
+    uint32_t h = r.head.load(std::memory_order_relaxed);
+    uint32_t n = (h + 1u) & (UART0_RING - 1u);
+    if (n == (r.tail.load(std::memory_order_acquire) & (UART0_RING - 1u)))
+        return false;                   // voll -> Byte verwerfen
+    r.buf[h & (UART0_RING - 1u)] = b;
+    r.head.store(h + 1u, std::memory_order_release);
+    return true;
+}
+bool ring_pop(SpscRing& r, uint8_t& b) {
+    uint32_t t = r.tail.load(std::memory_order_relaxed);
+    if ((t & (UART0_RING - 1u)) == (r.head.load(std::memory_order_acquire) & (UART0_RING - 1u)))
+        return false;                   // leer
+    b = r.buf[t & (UART0_RING - 1u)];
+    r.tail.store(t + 1u, std::memory_order_release);
+    return true;
+}
+bool ring_empty(const SpscRing& r) {
+    return (r.head.load(std::memory_order_acquire) & (UART0_RING - 1u)) ==
+           (r.tail.load(std::memory_order_acquire) & (UART0_RING - 1u));
+}
+
+// Routet den LPC-UART0 auf echte RP2350-UART-Pads (config uart0_tx/uart0_rx).
+// Waehlt anhand der Pads das RP-Peripheral (uart0 ODER uart1) und setzt beide
+// Pins auf GPIO_FUNC_UART (analog SPI/I2C-Bridge). Ohne dieses Routing aktiviert
+// uart_init() nur das Peripheral, aber KEIN Signal erreicht einen Pin. Nur
+// gueltige, zum SELBEN Peripheral gehoerende TX/RX-Paare werden geroutet; sonst
+// Warnung + kein Routing (der Gast blockiert nicht). Reagiert idempotent auf
+// spaetere Config-Aenderungen.
+void uart0_apply_pins() {
+    int tx = config::uart0_tx_gpio();
+    int rx = config::uart0_rx_gpio();
+
+    // Nichts konfiguriert -> evtl. altes Routing zuruecknehmen.
+    if (tx < 0 && rx < 0) {
+        g_uart0_tx_gpio = -1;
+        g_uart0_rx_gpio = -1;
+        return;
     }
-    // RX
-    if (rx != g_uart0_rx_gpio) {
-        if (is_uart0_rx_pin(rx)) {
-            gpio_set_function(static_cast<uint>(rx), GPIO_FUNC_UART);
-            g_uart0_rx_gpio = rx;
-            std::printf("[UART0] RX -> GP%d (uart0)\n", rx);
-        } else if (rx >= 0) {
-            std::printf("[UART0] WARN: GP%d ist kein uart0-RX-Pad "
-                        "(zulaessig: GP1/13/17/29) - kein Routing\n", rx);
-            g_uart0_rx_gpio = -1;
-        }
+    if (tx == g_uart0_tx_gpio && rx == g_uart0_rx_gpio) return;  // unveraendert
+
+    uart_inst_t* inst = nullptr;
+    gpio_function_t tx_func, rx_func;
+    if (!resolve_uart_pins(tx, rx, inst, tx_func, rx_func)) {
+        std::printf("[UART0] WARN: GP%d/GP%d ist kein gueltiges RP-UART-Paar "
+                    "(uart0 TX 0/12/16 RX 1/13/17; uart1 TX 4/8/20/24 RX 5/9/21/25; "
+                    "+ Alt-Funktion GP2/3/6/7/10/11/14/15/18/19/22/23/26/27) "
+                    "- kein Routing\n", tx, rx);
+        g_uart0_tx_gpio = -1;
+        g_uart0_rx_gpio = -1;
+        return;
     }
+    // Peripheral-Wechsel: g_uart0.hw wird von uart0_ensure_hw uebernommen.
+    g_uart0.hw = inst;
+    gpio_set_function(static_cast<uint>(tx), tx_func);
+    gpio_set_function(static_cast<uint>(rx), rx_func);
+    g_uart0_tx_gpio = tx;
+    g_uart0_rx_gpio = rx;
+    std::printf("[UART0] TX->GP%d RX->GP%d (%s)\n", tx, rx,
+                (inst == uart0) ? "uart0" : "uart1");
 }
 
 void uart0_ensure_hw(uint32_t f_cpu) {
-    if (!g_uart0.hw) g_uart0.hw = uart0;
+    // Virtueller CDC-Modus: kein HW-uart0/Pin-Routing — TX/RX laufen ueber die
+    // Ringe zu CDC#2. Nur den "konfiguriert"-Status fuehren (fuer LSR/Baud).
+    if (config::uart0_cdc_enabled()) {
+        g_uart0.init_done = true;
+        return;
+    }
+    // Pins ZUERST routen: waehlt g_uart0.hw (uart0/uart1) anhand der Config-Pads.
+    // Vorher init_done ggf. zuruecksetzen, falls sich das Peripheral aendert.
+    uart_inst_t* prev = g_uart0.hw;
+    uart0_apply_pins();
+    if (!g_uart0.hw) g_uart0.hw = uart0;   // Fallback (kein/ungueltiges Routing)
+    if (g_uart0.hw != prev) g_uart0.init_done = false;
     if (g_uart0.divisor == 0) return;
     uint32_t baud = f_cpu / (16u * g_uart0.divisor);
     if (baud == 0) baud = 9600;
@@ -758,17 +843,29 @@ void uart0_ensure_hw(uint32_t f_cpu) {
     } else {
         uart_set_baudrate(g_uart0.hw, baud);
     }
-    // Pins auf das echte uart0-Pad routen (idempotent; reagiert auf pinmap set).
-    uart0_apply_pins();
 }
 
 uint8_t uart0_read_reg(uint32_t addr) {
     bool dlab = (g_uart0.lcr & 0x80u) != 0;
+    const bool cdc = config::uart0_cdc_enabled();
     switch (addr) {
         case UART0_RBR:
             if (dlab) return static_cast<uint8_t>(g_uart0.divisor & 0xFFu);
-            if (g_uart0.hw && uart_is_readable(g_uart0.hw))
-                return static_cast<uint8_t>(uart_getc(g_uart0.hw));
+            if (cdc) {
+                uint8_t b = 0; ring_pop(g_uart0_rx, b);
+                // Level-getriggerter RBR-IRQ: sind noch Bytes da + IRQ aktiv,
+                // sofort erneut penden (laeuft auf Core1) -> naechstes Byte ohne
+                // 1-ms-Wartezeit. Kette endet, wenn der Ring leer ist.
+                if ((g_uart0.ier & 0x01u) && !ring_empty(g_uart0_rx))
+                    irq_inject::pend(lpc_irq::UART0);
+                return b;
+            }
+            if (g_uart0.hw && uart_is_readable(g_uart0.hw)) {
+                uint8_t b = static_cast<uint8_t>(uart_getc(g_uart0.hw));
+                if ((g_uart0.ier & 0x01u) && uart_is_readable(g_uart0.hw))
+                    irq_inject::pend(lpc_irq::UART0);
+                return b;
+            }
             return 0;
         case UART0_IER:
             if (dlab) return static_cast<uint8_t>((g_uart0.divisor >> 8) & 0xFFu);
@@ -777,8 +874,12 @@ uint8_t uart0_read_reg(uint32_t addr) {
         case UART0_LCR: return g_uart0.lcr;
         case UART0_MCR: return g_uart0.mcr;
         case UART0_LSR: {
-            uint8_t s = 0x60;
-            if (g_uart0.hw && uart_is_readable(g_uart0.hw)) s |= 0x01u;
+            uint8_t s = 0x60;   // THRE|TEMT: Sender stets bereit
+            if (cdc) {
+                if (!ring_empty(g_uart0_rx)) s |= 0x01u;   // DR: RX-Daten vom PC
+            } else if (g_uart0.hw && uart_is_readable(g_uart0.hw)) {
+                s |= 0x01u;
+            }
             return s;
         }
         default: return 0;
@@ -793,6 +894,10 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
                 g_uart0.divisor = static_cast<uint16_t>(
                     (g_uart0.divisor & 0xFF00u) | val);
                 uart0_ensure_hw(g_current_hz);
+            } else if (config::uart0_cdc_enabled()) {
+                // Virtuell: Byte in den TX-Ring -> Core0 schiebt es nach CDC#2.
+                ring_push(g_uart0_tx, val);
+                if (g_uart0.ier & 0x02u) irq_inject::pend(lpc_irq::UART0);
             } else if (g_uart0.hw) {
                 uart_putc_raw(g_uart0.hw, static_cast<char>(val));
                 if (g_uart0.ier & 0x02u) irq_inject::pend(lpc_irq::UART0);
@@ -2020,6 +2125,17 @@ void poll_timed_sources() {
     for (auto& c : g_ct) { ct_advance(c); ct_sample_capture(c); }
     wdt_advance();
     systick_advance();
+    // UART0-RX-Interrupt (initialer Trigger): liegen Empfangsdaten vor und hat
+    // der Gast den RBR-IRQ aktiviert (IER Bit0), UART0-IRQ penden. Laeuft auf
+    // Core1 (via SysTick-Shim/WFI-Loop). Nach dem ersten Byte haelt sich die
+    // Auslieferung ueber das Re-Pend im RBR-Read selbst am Laufen (dort ohne
+    // ~1-ms-Latenz). Deckt CDC-Kopplung (Ring) UND HW-uart0 ab.
+    if (g_uart0.ier & 0x01u) {
+        bool have = config::uart0_cdc_enabled()
+                        ? !ring_empty(g_uart0_rx)
+                        : (g_uart0.hw && uart_is_readable(g_uart0.hw));
+        if (have) irq_inject::pend(lpc_irq::UART0);
+    }
 }
 
 bool capture_armed() {
@@ -2345,6 +2461,12 @@ bool guest_output_level(uint8_t port, uint8_t pin, bool& level) {
     level = ((g_gpio[port].data >> pin) & 1u) != 0u;
     return true;
 }
+
+// Core0-Seite der virtuellen UART0<->CDC#2-Kopplung (nur im uart0_cdc-Modus):
+//   uart0_cdc_tx_pop  - naechstes Gast-TX-Byte fuer CDC#2 (false = leer)
+//   uart0_cdc_rx_push - ein von CDC#2 empfangenes Byte an den Gast-RX
+bool uart0_cdc_tx_pop(uint8_t& b) { return ring_pop(g_uart0_tx, b); }
+void uart0_cdc_rx_push(uint8_t b) { ring_push(g_uart0_rx, b); }
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-
 // SysTick auf den naechsten Deadline (adaptiver "HW-Alarm").

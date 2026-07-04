@@ -1,6 +1,7 @@
 #include "uart_bridge.h"
 
 #include "config.h"
+#include "peripherals.h"
 #include "tusb.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
@@ -296,6 +297,30 @@ void debug_counts(uint32_t& cdc_rx, uint32_t& pio_tx,
     pio_tx = g_cnt_pio_tx;
     pio_rx = g_cnt_pio_rx;
     cdc_tx = g_cnt_cdc_tx;
+}
+
+void uart0_cdc_poll() {
+    // Core0-Seite der virtuellen LPC-UART0 <-> CDC#2 Kopplung (config uart0_cdc).
+    // Nur aktiv, wenn gewaehlt; laeuft UNABHAENGIG von der PIO-Bridge (die dann
+    // CDC#2 nicht nutzen darf). Kein connected()-Gate (DTR-unabhaengig).
+    if (!config::uart0_cdc_enabled()) return;
+
+    // Gast-TX (aus dem Ring) -> CDC#2 an den PC.
+    uint8_t txbuf[64];
+    uint32_t tn = 0;
+    while (tn < sizeof txbuf && peripherals::uart0_cdc_tx_pop(txbuf[tn])) ++tn;
+    if (tn > 0) {
+        tud_cdc_n_write(CDC_ITF, txbuf, tn);
+        tud_cdc_n_write_flush(CDC_ITF);
+    }
+
+    // PC (CDC#2) -> Gast-RX-Ring.
+    if (tud_cdc_n_available(CDC_ITF)) {
+        uint8_t rxbuf[64];
+        uint32_t rn = tud_cdc_n_read(CDC_ITF, rxbuf, sizeof rxbuf);
+        for (uint32_t i = 0; i < rn; ++i)
+            peripherals::uart0_cdc_rx_push(rxbuf[i]);
+    }
 }
 
 } // namespace uart_bridge

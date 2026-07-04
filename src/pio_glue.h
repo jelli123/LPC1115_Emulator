@@ -63,4 +63,11 @@ bool tx_emit(int handle, uint32_t delay_counts, uint32_t width_counts);
 // Gibt die State-Machine wieder frei.
 void tx_teardown(int handle);
 
+// PIO-Ressourcennutzung ueber ALLE PIO-Bloecke (RP2350: pio0/1/2). Zaehlt
+// belegte/freie State-Machines und Instruktions-Slots (das sind die knappen
+// PIO-Ressourcen). Fuer die 'stats'-Anzeige. Nur oeffentliche SDK-API
+// (pio_sm_is_claimed, pio_can_add_program_at_offset).
+void usage(uint32_t& sm_used, uint32_t& sm_total,
+           uint32_t& instr_used, uint32_t& instr_total);
+
 } // namespace pio_glue

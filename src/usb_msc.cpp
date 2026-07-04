@@ -365,6 +365,13 @@ void parse_config(const char* buf, uint32_t len) {
             config::set_uart_bridge_tx_pin(static_cast<int>(std::atol(eq)));
         } else if (std::strcmp(line, "uart_bridge_rx") == 0) {
             config::set_uart_bridge_rx_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "uart0_cdc") == 0) {
+            config::set_uart0_cdc_enabled(std::strcmp(eq, "on") == 0 ||
+                                          std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "uart0_tx") == 0) {
+            config::set_uart0_tx_gpio(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "uart0_rx") == 0) {
+            config::set_uart0_rx_gpio(static_cast<int>(std::atol(eq)));
         } else if (std::strcmp(line, "i2c_bridge_en") == 0) {
             config::set_i2c_bridge_enabled(std::strcmp(eq, "on") == 0 ||
                                            std::strcmp(eq, "1")  == 0);
@@ -565,14 +572,26 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     A("# autodesc: gueltigen Boot-Descriptor beim Laden automatisch erzeugen.\n");
     A("autodesc=%s\n\n", config::autodesc() ? "on" : "off");
 
-    A("# --- UART-Bridge (LPC-UART0 <-> RP2350 uart0, CDC#2) ------------\n");
-    A("# uart_bridge_en/tx/rx: physische Bruecke der LPC-UART auf GPIOs.\n");
+    A("# --- Serielle Schnittstellen -----------------------------------\n");
+    A("# uart_bridge: eigenstaendige USB-Serial-Bruecke auf CDC#2 (PIO, JEDER GPIO).\n");
+    A("# uart_bridge_en/tx/rx: CDC#2 <-> PIO-UART-Pins (NICHT der Gast-UART0!).\n");
     if (config::uart_bridge_enabled()) {
         A("uart_bridge_en=on\n");
         A("uart_bridge_tx=%d\n", config::uart_bridge_tx_pin());
         A("uart_bridge_rx=%d\n", config::uart_bridge_rx_pin());
     } else {
         A("#uart_bridge_en=on\n#uart_bridge_tx=4\n#uart_bridge_rx=5\n");
+    }
+    A("# uart0_cdc: LPC-UART0 des Gasts virtuell direkt an CDC#2 (kein Draht/Pin).\n");
+    A("# Schliesst uart_bridge auf CDC#2 aus. Ideal fuer printf/Serial des Gasts.\n");
+    A("uart0_cdc=%s\n", config::uart0_cdc_enabled() ? "on" : "off");
+    A("# uart0_tx/uart0_rx: LPC-UART0 auf echte RP-UART-Pads (Hardwareentwurf).\n");
+    A("# uart0 TX GP0/12/16 RX GP1/13/17 | uart1 TX GP4/8/20/24 RX GP5/9/21/25. -1=aus.\n");
+    if (config::uart0_tx_gpio() >= 0 || config::uart0_rx_gpio() >= 0) {
+        A("uart0_tx=%d\n", config::uart0_tx_gpio());
+        A("uart0_rx=%d\n", config::uart0_rx_gpio());
+    } else {
+        A("#uart0_tx=0\n#uart0_rx=1\n");
     }
     A("\n");
 

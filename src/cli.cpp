@@ -177,9 +177,12 @@ void cmd_help() {
         "  swd stop                   SWD-Target deaktivieren",
         "  pio capture <pin> <count>  Edge-Capture-Trace (Zyklen)",
         "",
-        "  uart start <tx> <rx>       UART-Bridge starten (PIO, CDC#2)",
-        "  uart stop                  UART-Bridge stoppen",
-        "  uart status                TX/RX-Pins, Baudrate, aktiv?",
+        "  cdc start <tx> <rx>        USB-Serial-Konverter (CDC#2 <-> PIO-UART)",
+        "  cdc stop                   CDC-Serial-Konverter stoppen",
+        "  cdc status                 Pins, Baudrate, Datenfluss",
+        "  uart pins <tx> <rx>|off    LPC-UART0 auf RP-UART-Pads routen",
+        "  uart cdc on|off            LPC-UART0 virtuell an CDC#2 koppeln",
+        "  uart status                LPC-UART0-Routing anzeigen",
         "",
         "  i2c on <inst> <sda> <scl> [hz]  I2C-Bridge auf RP2350-HW (Neustart noetig)",
         "  i2c off                    I2C-Bridge deaktivieren",
@@ -228,6 +231,14 @@ void cmd_status() {
                 static_cast<unsigned long>(ci.sequence),
                 static_cast<unsigned long>(ci.key_count),
                 ci.loaded_valid ? "(persistent)" : "(nur RAM/Defaults)");
+    // PIO-Ressourcen (State-Machines + Instruktions-Slots) ueber alle Bloecke.
+    // Zeigt, wieviel die CDC-Bridge / Timer-Capture-/Match-PIO belegen.
+    uint32_t sm_u, sm_t, in_u, in_t;
+    pio_glue::usage(sm_u, sm_t, in_u, in_t);
+    std::printf("PIO used: SM %lu, Instr %lu | free: SM %lu, Instr %lu\n",
+                static_cast<unsigned long>(sm_u), static_cast<unsigned long>(in_u),
+                static_cast<unsigned long>(sm_t - sm_u),
+                static_cast<unsigned long>(in_t - in_u));
 }
 
 bool parse_int(const char* s, long min_v, long max_v, long& out) {
@@ -703,14 +714,17 @@ void handle_command(char* line) {
         }
     }
 
-    // --- UART-Bridge (CDC#2 ↔ PIO-UART) ---
-    if (std::strcmp(tokens[0], "uart") == 0 && n >= 2) {
+    // --- CDC-Serial-Konverter (eigenstaendige USB-Serial-Bruecke, CDC#2 <-> PIO-UART) ---
+    // Voellig unabhaengig vom Gast: macht den RP2350 zu einem USB<->UART-Adapter
+    // auf frei waehlbaren Pins (PIO). 'uart' betrifft dagegen NUR den LPC-UART0
+    // des Gasts. Legacy: 'uart start/stop' wird unten als Alias weitergeleitet.
+    if (std::strcmp(tokens[0], "cdc") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "start") == 0) {
             if (n == 4) {
                 long tx, rx;
                 if (!parse_int(tokens[2], 0, 47, tx) ||
                     !parse_int(tokens[3], 0, 47, rx)) {
-                    std::puts("err: uart start <tx-gpio> <rx-gpio>"); return;
+                    std::puts("err: cdc start <tx-gpio> <rx-gpio>"); return;
                 }
                 uart_bridge::set_tx_pin(static_cast<int>(tx));
                 uart_bridge::set_rx_pin(static_cast<int>(rx));
@@ -725,7 +739,7 @@ void handle_command(char* line) {
             return;
         }
         if (std::strcmp(tokens[1], "status") == 0) {
-            std::printf("uart-bridge=%s TX=GP%d RX=GP%d baud=%lu\n",
+            std::printf("cdc-bridge=%s TX=GP%d RX=GP%d baud=%lu\n",
                         uart_bridge::active() ? "active" : "off",
                         uart_bridge::tx_pin(), uart_bridge::rx_pin(),
                         static_cast<unsigned long>(uart_bridge::baud_rate()));
@@ -736,6 +750,80 @@ void handle_command(char* line) {
                         static_cast<unsigned long>(prx), static_cast<unsigned long>(ctx));
             return;
         }
+        std::puts("err: cdc start <tx> <rx> | cdc stop | cdc status");
+        return;
+    }
+
+    // --- LPC-UART0 des Gasts: HW-Pin-Routing ODER virtuelle CDC#2-Kopplung ---
+    if (std::strcmp(tokens[0], "uart") == 0 && n >= 2) {
+        // Legacy-Alias: 'uart start/stop' -> CDC-Bridge (frueher hier verortet).
+        if (std::strcmp(tokens[1], "start") == 0 || std::strcmp(tokens[1], "stop") == 0) {
+            std::puts("[hinweis] 'uart start/stop' ist jetzt 'cdc start/stop' "
+                      "('uart' = LPC-UART0 des Gasts).");
+            if (std::strcmp(tokens[1], "start") == 0) {
+                if (n == 4) {
+                    long tx, rx;
+                    if (!parse_int(tokens[2], 0, 47, tx) ||
+                        !parse_int(tokens[3], 0, 47, rx)) {
+                        std::puts("err: cdc start <tx-gpio> <rx-gpio>"); return;
+                    }
+                    uart_bridge::set_tx_pin(static_cast<int>(tx));
+                    uart_bridge::set_rx_pin(static_cast<int>(rx));
+                    config::set_uart_bridge_tx_pin(static_cast<int>(tx));
+                    config::set_uart_bridge_rx_pin(static_cast<int>(rx));
+                }
+                std::puts(uart_bridge::start() ? "ok" : "err: Pins nicht gesetzt oder PIO voll");
+            } else {
+                uart_bridge::stop();
+            }
+            return;
+        }
+        // LPC-UART0 virtuell an CDC#2 koppeln (kein Draht/Pin). Schliesst die
+        // CDC-Bridge auf CDC#2 aus (beide koennen CDC#2 nicht gleichzeitig nutzen).
+        if (std::strcmp(tokens[1], "cdc") == 0 && n >= 3) {
+            bool on = (std::strcmp(tokens[2], "on") == 0 || std::strcmp(tokens[2], "1") == 0);
+            if (on) uart_bridge::stop();     // CDC-Bridge gibt CDC#2 frei
+            config::set_uart0_cdc_enabled(on);
+            { emulator::FlashPauseGuard _fp; config::save(); }
+            usb_msc::refresh_config_volume();
+            std::printf("uart0-cdc=%s (LPC-UART0 %s CDC#2)\n",
+                        on ? "on" : "off",
+                        on ? "<->" : "getrennt von");
+            return;
+        }
+        // LPC-UART0 auf echte RP2350-UART-Pads routen (Hardwareentwurf).
+        // 'uart pins <tx> <rx>' (RP-GPIOs) oder 'uart pins off'. TX/RX muessen
+        // zum selben RP-Peripheral gehoeren (uart0 GP0/12/16 + GP1/13/17;
+        // uart1 GP4/8/20/24 + GP5/9/21/25; + Alt-Funktion GP2/3/6/7/10/11/…).
+        if (std::strcmp(tokens[1], "pins") == 0 && n >= 3) {
+            if (std::strcmp(tokens[2], "off") == 0) {
+                config::set_uart0_tx_gpio(-1);
+                config::set_uart0_rx_gpio(-1);
+            } else if (n >= 4) {
+                long tx, rx;
+                if (!parse_int(tokens[2], 0, 47, tx) ||
+                    !parse_int(tokens[3], 0, 47, rx)) {
+                    std::puts("err: uart pins <tx-gpio> <rx-gpio> | off"); return;
+                }
+                config::set_uart0_tx_gpio(static_cast<int>(tx));
+                config::set_uart0_rx_gpio(static_cast<int>(rx));
+            } else {
+                std::puts("err: uart pins <tx-gpio> <rx-gpio> | off"); return;
+            }
+            { emulator::FlashPauseGuard _fp; config::save(); }
+            usb_msc::refresh_config_volume();
+            std::printf("uart0-pins TX=GP%d RX=GP%d (wirkt beim naechsten UART-Zugriff/Start)\n",
+                        config::uart0_tx_gpio(), config::uart0_rx_gpio());
+            return;
+        }
+        if (std::strcmp(tokens[1], "status") == 0) {
+            std::printf("LPC-UART0: HW-Pads TX=GP%d RX=GP%d | CDC#2-virtuell=%s\n",
+                        config::uart0_tx_gpio(), config::uart0_rx_gpio(),
+                        config::uart0_cdc_enabled() ? "on" : "off");
+            return;
+        }
+        std::puts("err: uart pins <tx> <rx>|off | uart cdc on|off | uart status");
+        return;
     }
 
     // --- I2C-Bridge (LPC-I2C-Master → RP2350-Hardware-I2C) ---
@@ -828,6 +916,7 @@ void run() {
         swd_target::poll();
         usb_msc::poll();
         uart_bridge::poll();
+        uart_bridge::uart0_cdc_poll();   // virtuelle LPC-UART0 <-> CDC#2
         if (emulator::guest_reset_pending()) {
             // Vom Gast angeforderter Soft-Reset (NVIC_SystemReset/WDT). Core1
             // hat geparkt; Core0 fuehrt den eigentlichen Core-Reset aus.

@@ -16,6 +16,15 @@ inline constexpr const char* KEY_PIN_PREFIX      = "pin.";             // pin.<l
 inline constexpr const char* KEY_UART_BRIDGE_EN  = "uart_bridge_en";   // "0"/"1"
 inline constexpr const char* KEY_UART_BRIDGE_TX  = "uart_bridge_tx";   // GPIO-Nummer
 inline constexpr const char* KEY_UART_BRIDGE_RX  = "uart_bridge_rx";   // GPIO-Nummer
+// LPC-UART0 virtuell direkt an USB CDC#2 koppeln (statt HW-uart0-Pins). "0"/"1".
+// Wenn aktiv, gehen Gast-UART0-TX-Bytes ohne Draht/Pin an CDC#2 und CDC#2-
+// Eingaben an den Gast-UART0-RX. Schliesst die PIO-UART-Bridge auf CDC#2 aus.
+inline constexpr const char* KEY_UART0_CDC       = "uart0_cdc";        // "0"/"1"
+// LPC-UART0 auf echte RP2350-UART-Pads routen (Hardwareentwurf). GPIO-Nummer,
+// -1 = kein Routing. TX/RX muessen zum SELBEN RP-Peripheral (uart0 ODER uart1)
+// gehoeren: uart0 TX GP0/12/16 RX GP1/13/17; uart1 TX GP4/8/20/24 RX GP5/9/21/25.
+inline constexpr const char* KEY_UART0_TX_GPIO   = "uart0_tx";         // RP-GPIO oder -1
+inline constexpr const char* KEY_UART0_RX_GPIO   = "uart0_rx";         // RP-GPIO oder -1
 inline constexpr const char* KEY_I2C_BRIDGE_EN   = "i2c_bridge_en";    // "0"/"1"
 inline constexpr const char* KEY_I2C_BRIDGE_INST = "i2c_bridge_inst";  // 0=i2c0, 1=i2c1
 inline constexpr const char* KEY_I2C_BRIDGE_SDA  = "i2c_bridge_sda";   // GPIO-Nummer
@@ -74,6 +83,16 @@ int         uart_bridge_tx_pin();
 void        set_uart_bridge_tx_pin(int gpio);
 int         uart_bridge_rx_pin();
 void        set_uart_bridge_rx_pin(int gpio);
+
+// LPC-UART0 <-> USB CDC#2 virtuelle Kopplung (statt HW-uart0-Pins).
+bool        uart0_cdc_enabled();
+void        set_uart0_cdc_enabled(bool v);
+
+// LPC-UART0 auf echte RP2350-UART-Pads (uart0/uart1). -1 = kein HW-Routing.
+int         uart0_tx_gpio();
+void        set_uart0_tx_gpio(int gpio);
+int         uart0_rx_gpio();
+void        set_uart0_rx_gpio(int gpio);
 
 // I²C-Bridge-Konfiguration (LPC-I²C-Master → RP2350-Hardware-I²C)
 bool        i2c_bridge_enabled();

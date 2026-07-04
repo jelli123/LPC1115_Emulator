@@ -297,4 +297,28 @@ void tx_teardown(int handle) {
     t = {};
 }
 
+void usage(uint32_t& sm_used, uint32_t& sm_total,
+           uint32_t& instr_used, uint32_t& instr_total) {
+    sm_used = sm_total = instr_used = instr_total = 0;
+    // Ein 1-Instruktions-Dummy (jmp 0). Passt es an einen Offset NICHT, ist der
+    // Slot belegt -> so zaehlen wir belegte Instruktions-Slots exakt, nur mit
+    // oeffentlicher API (kein Zugriff auf SDK-interne Belegungs-Bitmap).
+    static const uint16_t probe_instr[] = { 0x0000 };  // jmp 0
+    static const pio_program_t probe = {
+        .instructions = probe_instr, .length = 1, .origin = -1,
+        .pio_version = 0, .used_gpio_ranges = 0,
+    };
+    for (uint32_t i = 0; i < NUM_PIOS; ++i) {
+        PIO pio = PIO_INSTANCE(i);
+        for (uint sm = 0; sm < NUM_PIO_STATE_MACHINES; ++sm) {
+            ++sm_total;
+            if (pio_sm_is_claimed(pio, sm)) ++sm_used;
+        }
+        for (uint off = 0; off < 32u; ++off) {
+            ++instr_total;
+            if (!pio_can_add_program_at_offset(pio, &probe, off)) ++instr_used;
+        }
+    }
+}
+
 } // namespace pio_glue

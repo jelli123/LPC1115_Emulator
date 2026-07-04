@@ -36,4 +36,8 @@ uint32_t baud_rate();
 void debug_counts(uint32_t& cdc_rx, uint32_t& pio_tx,
                   uint32_t& pio_rx, uint32_t& cdc_tx);
 
+// Core0-Poll der virtuellen LPC-UART0 <-> CDC#2 Kopplung (config uart0_cdc).
+// Aus dem Hauptloop aufrufen; No-op, wenn uart0_cdc aus ist.
+void uart0_cdc_poll();
+
 } // namespace uart_bridge

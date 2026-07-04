@@ -78,4 +78,9 @@ uint32_t systick_take_guest_ticks();
 // (32-bit-aligned, hoechstens ein Update Verzug).
 bool guest_output_level(uint8_t port, uint8_t pin, bool& level);
 
+// Core0-Seite der virtuellen UART0<->CDC#2-Kopplung (config uart0_cdc). Von der
+// USB-Seite (uart_bridge::uart0_cdc_poll auf Core0) aufgerufen.
+bool uart0_cdc_tx_pop(uint8_t& b);   // Gast-TX-Byte holen (false = leer)
+void uart0_cdc_rx_push(uint8_t b);   // von CDC#2 empfangenes Byte an Gast-RX
+
 } // namespace peripherals

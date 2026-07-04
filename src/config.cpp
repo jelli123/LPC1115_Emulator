@@ -16,6 +16,9 @@ bool     g_autostart   = false;
 bool     g_uart_bridge_en = false;
 int      g_uart_bridge_tx = -1;
 int      g_uart_bridge_rx = -1;
+bool     g_uart0_cdc      = false;
+int      g_uart0_tx_gpio  = -1;
+int      g_uart0_rx_gpio  = -1;
 bool     g_i2c_bridge_en   = false;
 int      g_i2c_bridge_inst = 0;
 int      g_i2c_bridge_sda  = -1;
@@ -111,6 +114,9 @@ void apply_defaults() {
     g_uart_bridge_en = false;
     g_uart_bridge_tx = -1;
     g_uart_bridge_rx = -1;
+    g_uart0_cdc      = false;
+    g_uart0_tx_gpio  = -1;
+    g_uart0_rx_gpio  = -1;
     g_i2c_bridge_en   = false;
     g_i2c_bridge_inst = 0;
     g_i2c_bridge_sda  = -1;
@@ -205,6 +211,18 @@ bool load() {
         uint32_t v;
         if (parse_uint32(buf, v) && v <= static_cast<uint32_t>(MAX_GPIO))
             g_uart_bridge_rx = static_cast<int>(v);
+    }
+    if (storage::config_get(KEY_UART0_CDC, buf, sizeof buf)) {
+        g_uart0_cdc = (buf[0] == '1');
+    }
+    if (storage::config_get(KEY_UART0_TX_GPIO, buf, sizeof buf)) {
+        // -1 (kein Routing) explizit zulassen.
+        int v = static_cast<int>(std::atol(buf));
+        g_uart0_tx_gpio = (v >= -1 && v <= MAX_GPIO) ? v : -1;
+    }
+    if (storage::config_get(KEY_UART0_RX_GPIO, buf, sizeof buf)) {
+        int v = static_cast<int>(std::atol(buf));
+        g_uart0_rx_gpio = (v >= -1 && v <= MAX_GPIO) ? v : -1;
     }
     if (storage::config_get(KEY_I2C_BRIDGE_EN, buf, sizeof buf)) {
         g_i2c_bridge_en = (buf[0] == '1');
@@ -327,6 +345,16 @@ bool save() {
     if (g_uart_bridge_rx >= 0) {
         std::snprintf(buf, sizeof buf, "%d", g_uart_bridge_rx);
         if (!storage::config_set(KEY_UART_BRIDGE_RX, buf)) return false;
+    }
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_uart0_cdc ? 1 : 0));
+    if (!storage::config_set(KEY_UART0_CDC, buf)) return false;
+    if (g_uart0_tx_gpio >= 0) {
+        std::snprintf(buf, sizeof buf, "%d", g_uart0_tx_gpio);
+        if (!storage::config_set(KEY_UART0_TX_GPIO, buf)) return false;
+    }
+    if (g_uart0_rx_gpio >= 0) {
+        std::snprintf(buf, sizeof buf, "%d", g_uart0_rx_gpio);
+        if (!storage::config_set(KEY_UART0_RX_GPIO, buf)) return false;
     }
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_i2c_bridge_en ? 1 : 0));
     if (!storage::config_set(KEY_I2C_BRIDGE_EN, buf)) return false;
@@ -452,6 +480,12 @@ int  uart_bridge_tx_pin()            { return g_uart_bridge_tx; }
 void set_uart_bridge_tx_pin(int gpio){ g_uart_bridge_tx = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
 int  uart_bridge_rx_pin()            { return g_uart_bridge_rx; }
 void set_uart_bridge_rx_pin(int gpio){ g_uart_bridge_rx = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
+bool uart0_cdc_enabled()             { return g_uart0_cdc; }
+void set_uart0_cdc_enabled(bool v)   { g_uart0_cdc = v; }
+int  uart0_tx_gpio()                 { return g_uart0_tx_gpio; }
+void set_uart0_tx_gpio(int gpio)     { g_uart0_tx_gpio = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
+int  uart0_rx_gpio()                 { return g_uart0_rx_gpio; }
+void set_uart0_rx_gpio(int gpio)     { g_uart0_rx_gpio = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
 
 bool i2c_bridge_enabled()            { return g_i2c_bridge_en; }
 void set_i2c_bridge_enabled(bool v)  { g_i2c_bridge_en = v; }
