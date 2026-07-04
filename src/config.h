@@ -63,6 +63,10 @@ const PinMap& pin_map();
 bool         set_pin_map(uint8_t lpc_pin, int rp2350_gpio);
 void         apply_default_pinmap();
 
+// Setzt Pinmap + Timer-Capture/Match auf Default zurueck (fuer autoritatives
+// CONFIG.INI-Parsen: entfernte Eintraege verschwinden statt haengenzubleiben).
+void         reset_pin_mappings();
+
 // UART-Bridge-Konfiguration
 bool        uart_bridge_enabled();
 void        set_uart_bridge_enabled(bool v);

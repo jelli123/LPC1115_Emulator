@@ -161,7 +161,9 @@ void cmd_help() {
         "  cfg list                   alle KV-Paare ausgeben",
         "  cfg get <key>              Wert lesen",
         "  cfg set <key> <value>      Wert setzen",
-        "  cfg save                   RAM-Snapshot in Flash schreiben",        "  pinmap show                Tabelle LPC-Pin -> RP2350-GPIO",
+        "  cfg save                   RAM-Snapshot in Flash schreiben",
+        "  cfg clear                  alle Einstellungen auf Default zuruecksetzen",
+        "  pinmap show                Tabelle LPC-Pin -> RP2350-GPIO",
         "  pinmap set <port_pin> <rp> Pin zuweisen (z.B. pinmap set 1_8 17)",
         "  pinmap reset               Default-Tabelle wiederherstellen",
         "",
@@ -469,6 +471,17 @@ void handle_command(char* line) {
         if (std::strcmp(tokens[1], "save") == 0) {
             emulator::FlashPauseGuard _fp;   // XIP-Schutz; Gast laeuft danach weiter
             std::puts(config::save() ? "saved" : "err");
+            return;
+        }
+        if (std::strcmp(tokens[1], "clear") == 0) {
+            // Kompletter Reset: Config-Slot leeren + Live-Zustand auf Default.
+            // Loest festgefahrene/veraltete Eintraege ("alles durcheinander").
+            emulator::FlashPauseGuard _fp;
+            storage::config_clear();
+            storage::config_commit();     // leerer Config-Slot im Flash
+            config::load();               // laedt leeren Slot -> reine Defaults
+            usb_msc::refresh_config_volume();
+            std::puts("cfg cleared (Defaults gesetzt + gespeichert)");
             return;
         }
     }

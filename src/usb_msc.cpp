@@ -299,6 +299,16 @@ bool cfg_parse_int(const char* s, int& out, const char** endp = nullptr) {
 }
 
 void parse_config(const char* buf, uint32_t len) {
+    // CONFIG.INI ist fuer die Pin-Zuordnungen (Pinmap + Timer-Capture/Match)
+    // AUTORITATIV: vor dem Einlesen auf Default zuruecksetzen, damit ein aus der
+    // Datei ENTFERNTER (oder mit '#' auskommentierter) Eintrag wirklich
+    // verschwindet. Sonst bliebe eine alte Zuordnung (z. B. tmat.2.1) aus dem
+    // vorherigen Zustand haengen. Die vom Geraet generierte CONFIG.INI enthaelt
+    // stets alle aktiven Zuordnungen -> beim Editieren gehen keine verloren.
+    // Skalare Keys (autostart/freq/Bridges) bleiben Merge (eindeutig, kein
+    // Loesch-Problem).
+    config::reset_pin_mappings();
+
     char line[96];
     uint32_t i = 0;
     while (i < len) {

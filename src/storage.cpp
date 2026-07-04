@@ -234,6 +234,23 @@ bool config_set(const char* key, const char* value) {
     return true;
 }
 
+void config_clear() {
+    kv_count = 0;
+}
+
+bool config_unset(const char* key) {
+    if (!key) return false;
+    for (uint32_t i = 0; i < kv_count; ++i) {
+        if (std::strncmp(kv_table[i].key, key, sizeof(kv_table[0].key)) == 0) {
+            // Letzten Eintrag an diese Position ziehen (Reihenfolge irrelevant).
+            if (i != kv_count - 1u) kv_table[i] = kv_table[kv_count - 1u];
+            --kv_count;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool config_commit() {
     alignas(4) uint8_t buf[SECTOR_SIZE];
     std::memset(buf, 0xFF, sizeof buf);

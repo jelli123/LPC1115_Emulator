@@ -33,6 +33,16 @@ bool config_set(const char* key, const char* value);
 bool config_commit();                        // schreibt RAM-Snapshot in nächsten Sektor
 void config_dump(void (*emit)(const char* line));
 
+// Leert den kompletten RAM-Snapshot (kv_count=0). Genutzt von config::save(),
+// das die KV-Tabelle danach vollstaendig neu aufbaut — so verschwinden veraltete
+// Schluessel (z. B. eine geloeschte Pinmap-/tmat-Zuordnung), die sonst als
+// Karteileichen im Flash blieben.
+void config_clear();
+
+// Loescht einen einzelnen Schluessel aus dem RAM-Snapshot (true, wenn gefunden).
+// Wird erst mit config_commit() persistent.
+bool config_unset(const char* key);
+
 // Persistenz-Diagnose. Zeigt, ob beim letzten config_load() ein gueltiger
 // Config-Slot im Flash gefunden wurde, plus Flash-Groesse/Region-Offset.
 // Nutzen: einen Flash-Groessen-Mismatch (Board-Header nimmt z. B. 4 MB an,

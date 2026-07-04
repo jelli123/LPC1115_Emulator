@@ -162,8 +162,12 @@ void load_pin_map_from_storage() {
     char buf[16];
     char key[24];
     for (std::size_t i = 0; i < LPC_PIN_COUNT; ++i) {
-        std::snprintf(key, sizeof key, "%s%u", KEY_PIN_PREFIX,
-                      static_cast<unsigned>(i));
+        // Schluesselformat konsistent mit CONFIG.INI + save(): pin.<port>_<pin>
+        // (z. B. pin.1_8). Frueher wurde hier der reine Pin-INDEX genutzt
+        // (pin.20), was NICHT zur INI-/build_config_ini-Nomenklatur passte und
+        // 'cfg dump' unverstaendlich + inkonsistent zur INI machte.
+        std::snprintf(key, sizeof key, "%s%u_%u", KEY_PIN_PREFIX,
+                      static_cast<unsigned>(i / 12), static_cast<unsigned>(i % 12));
         if (!storage::config_get(key, buf, sizeof buf)) continue;
         uint32_t v;
         if (!parse_uint32(buf, v)) continue;
@@ -303,6 +307,12 @@ bool load() {
 }
 
 bool save() {
+    // Kompletter Neuaufbau des KV-Snapshots: erst leeren, dann NUR die aktuell
+    // gueltigen Werte schreiben. Ohne das blieben veraltete Schluessel (z. B.
+    // eine per assign_pin_unique geloeste Pinmap-Zuordnung oder ein entfernter
+    // tmat-Eintrag) als Karteileichen im Flash -> 'cfg dump' zeigte Duplikate/
+    // Werte, die weder dem Live-Zustand noch der CONFIG.INI entsprachen.
+    storage::config_clear();
     char buf[24];
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_autostart ? 1 : 0));
     if (!storage::config_set(KEY_AUTOSTART, buf)) return false;
@@ -387,12 +397,27 @@ bool save() {
     char key[24];
     for (std::size_t i = 0; i < LPC_PIN_COUNT; ++i) {
         if (g_pin_map.lpc_to_rp[i] < 0) continue;
-        std::snprintf(key, sizeof key, "%s%u", KEY_PIN_PREFIX,
-                      static_cast<unsigned>(i));
+        // Konsistent mit CONFIG.INI: pin.<port>_<pin> (z. B. pin.1_8=1).
+        std::snprintf(key, sizeof key, "%s%u_%u", KEY_PIN_PREFIX,
+                      static_cast<unsigned>(i / 12), static_cast<unsigned>(i % 12));
         std::snprintf(buf, sizeof buf, "%d", g_pin_map.lpc_to_rp[i]);
         if (!storage::config_set(key, buf)) return false;
     }
     return storage::config_commit();
+}
+
+// Setzt NUR die "listenartigen" Pin-Zuordnungen (Pinmap + Timer-Capture/Match)
+// auf ihren Default zurueck. Wird von parse_config (usb_msc) VOR dem Einlesen
+// einer CONFIG.INI aufgerufen, damit die INI fuer diese Familie AUTORITATIV ist:
+// ein entfernter/auskommentierter Eintrag (z. B. tmat.2.1) verschwindet dann
+// wirklich, statt aus dem alten Zustand "haengen zu bleiben". Skalare Keys
+// (autostart/freq/Bridges) sind eindeutig und werden weiterhin gemerged.
+void reset_pin_mappings() {
+    apply_default_pinmap_impl();
+    for (int t = 0; t < 4; ++t) {
+        g_ct_cap[t] = -1;
+        for (int m = 0; m < 4; ++m) g_ct_mat[t][m] = -1;
+    }
 }
 
 bool        autostart()                    { return g_autostart; }
