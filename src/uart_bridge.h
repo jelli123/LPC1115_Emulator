@@ -31,4 +31,9 @@ int  rx_pin();
 // Aktuelle Baudrate (vom Host gesetzt, read-only).
 uint32_t baud_rate();
 
+// Diagnose-Zaehler des Datenflusses CDC#2 -> PIO-TX -> PIO-RX -> CDC#2.
+// Zeigt, an welcher Stelle die Kette bricht (via 'uart status').
+void debug_counts(uint32_t& cdc_rx, uint32_t& pio_tx,
+                  uint32_t& pio_rx, uint32_t& cdc_tx);
+
 } // namespace uart_bridge

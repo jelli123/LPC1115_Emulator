@@ -716,6 +716,11 @@ void handle_command(char* line) {
                         uart_bridge::active() ? "active" : "off",
                         uart_bridge::tx_pin(), uart_bridge::rx_pin(),
                         static_cast<unsigned long>(uart_bridge::baud_rate()));
+            uint32_t crx, ptx, prx, ctx;
+            uart_bridge::debug_counts(crx, ptx, prx, ctx);
+            std::printf("  Fluss: CDC-RX=%lu -> PIO-TX=%lu -> PIO-RX=%lu -> CDC-TX=%lu\n",
+                        static_cast<unsigned long>(crx), static_cast<unsigned long>(ptx),
+                        static_cast<unsigned long>(prx), static_cast<unsigned long>(ctx));
             return;
         }
     }

@@ -171,6 +171,19 @@ constexpr uint8_t lpc_pin_idx(uint8_t port, uint8_t pin) {
 
 void apply_gpio_to_hw(uint8_t lpc_pin, bool out, bool level);
 
+// Aktuell auf GPIO_FUNC_UART geroutete RP2350-Pads fuer den LPC-UART0 (-1 =
+// keins). Werden von uart0_apply_pins gesetzt und von bridge_owns_gpio geprueft.
+int g_uart0_tx_gpio = -1;
+int g_uart0_rx_gpio = -1;
+
+// RP2350 uart0-faehige Pads (Bank0). Muster wiederholt sich alle 16 GPIOs:
+//   TX: gpio%16 == 0  || gpio%16 == 12   (GP0/12/16/28 ...)
+//   RX: gpio%16 == 1  || gpio%16 == 13   (GP1/13/17/29 ...)
+// Ein Hardware-UART kann NUR auf diese Pins; die PIO-UART-Bridge dagegen auf
+// jeden Pin (deshalb dort keine solche Einschraenkung).
+bool is_uart0_tx_pin(int g) { return g >= 0 && ((g % 16) == 0 || (g % 16) == 12); }
+bool is_uart0_rx_pin(int g) { return g >= 0 && ((g % 16) == 1 || (g % 16) == 13); }
+
 // Prüft, ob ein RP2350-GPIO exklusiv von einer Hardware-Bridge belegt ist
 // (ADC, SPI, Timer-Capture/Match). Solche Pins darf das GPIO-Modell nicht
 // als digitalen Aus-/Eingang übersteuern, sonst kollidiert es mit der Bridge.
@@ -190,6 +203,10 @@ bool bridge_owns_gpio(int g) {
         for (int m = 0; m < 4; ++m)
             if (g == config::ct_match_pin(t, m)) return true;
     }
+    // LPC-UART0-Pins: sobald der Gast uart0 initialisiert hat, gehoeren die auf
+    // GPIO_FUNC_UART gerouteten Pads dem Hardware-uart0 (uart0_apply_pins) -> das
+    // GPIO-Modell darf sie nicht als digitale I/O uebersteuern.
+    if (g == g_uart0_tx_gpio || g == g_uart0_rx_gpio) return true;
     return false;
 }
 
@@ -688,6 +705,48 @@ struct UartModel {
 };
 UartModel g_uart0{};
 
+// Routet die dem LPC-UART0 zugeordneten Pins (Default P1_9=TX, P1_8=RX aus der
+// Pinmap) auf das echte RP2350-uart0-Pad (GPIO_FUNC_UART). Ohne diesen Schritt
+// aktiviert uart_init() zwar das Peripheral, aber KEIN Signal erreicht einen
+// Pin (analog SPI/I2C-Bridge, die ihre Pins ebenfalls per gpio_set_function
+// routen). Nur uart0-faehige Pads sind zulaessig (is_uart0_tx/rx_pin) — ein
+// Hardware-UART kann nicht auf beliebige Pins (anders als die PIO-Bridge).
+// Ungeeignete Zuordnungen werden mit Hinweis uebersprungen; uart0 laeuft dann
+// intern weiter (der Gast blockiert nicht), nur ohne Pin-Ausgabe.
+void uart0_apply_pins() {
+    auto pm = config::pin_map();
+    int tx = -1, rx = -1;
+    uint8_t tx_idx = lpc_pin_idx(1, 9);   // P1_9 = UART0 TX
+    uint8_t rx_idx = lpc_pin_idx(1, 8);   // P1_8 = UART0 RX
+    if (tx_idx < config::LPC_PIN_COUNT) tx = pm.lpc_to_rp[tx_idx];
+    if (rx_idx < config::LPC_PIN_COUNT) rx = pm.lpc_to_rp[rx_idx];
+
+    // TX
+    if (tx != g_uart0_tx_gpio) {
+        if (is_uart0_tx_pin(tx)) {
+            gpio_set_function(static_cast<uint>(tx), GPIO_FUNC_UART);
+            g_uart0_tx_gpio = tx;
+            std::printf("[UART0] TX -> GP%d (uart0)\n", tx);
+        } else if (tx >= 0) {
+            std::printf("[UART0] WARN: GP%d ist kein uart0-TX-Pad "
+                        "(zulaessig: GP0/12/16/28) - kein Routing\n", tx);
+            g_uart0_tx_gpio = -1;
+        }
+    }
+    // RX
+    if (rx != g_uart0_rx_gpio) {
+        if (is_uart0_rx_pin(rx)) {
+            gpio_set_function(static_cast<uint>(rx), GPIO_FUNC_UART);
+            g_uart0_rx_gpio = rx;
+            std::printf("[UART0] RX -> GP%d (uart0)\n", rx);
+        } else if (rx >= 0) {
+            std::printf("[UART0] WARN: GP%d ist kein uart0-RX-Pad "
+                        "(zulaessig: GP1/13/17/29) - kein Routing\n", rx);
+            g_uart0_rx_gpio = -1;
+        }
+    }
+}
+
 void uart0_ensure_hw(uint32_t f_cpu) {
     if (!g_uart0.hw) g_uart0.hw = uart0;
     if (g_uart0.divisor == 0) return;
@@ -699,6 +758,8 @@ void uart0_ensure_hw(uint32_t f_cpu) {
     } else {
         uart_set_baudrate(g_uart0.hw, baud);
     }
+    // Pins auf das echte uart0-Pad routen (idempotent; reagiert auf pinmap set).
+    uart0_apply_pins();
 }
 
 uint8_t uart0_read_reg(uint32_t addr) {
@@ -1752,6 +1813,8 @@ void reset() {
     g_pll_reconfig_pending = false;
     g_stats = {};
     g_uart0 = {};
+    g_uart0_tx_gpio = -1;   // UART0-Pin-Routing bei Guest-(Neu)start zuruecksetzen
+    g_uart0_rx_gpio = -1;
     for (auto& c : g_ct) c = {};
     g_ct[0].is32 = false; g_ct[0].irq_num = lpc_irq::CT16B0;
     g_ct[1].is32 = false; g_ct[1].irq_num = lpc_irq::CT16B1;

@@ -89,6 +89,13 @@ int      g_offset_rx = -1;
 uint8_t  g_rx_buf[64];
 uint     g_rx_buf_len = 0;
 
+// Diagnose-Zaehler (via 'uart status' sichtbar). Zeigen, an welcher Stelle der
+// Datenfluss CDC#2 -> PIO-TX -> (Draht) -> PIO-RX -> CDC#2 bricht.
+uint32_t g_cnt_cdc_rx = 0;   // Bytes vom PC (CDC#2) gelesen
+uint32_t g_cnt_pio_tx = 0;   // Bytes in die PIO-TX-FIFO geschrieben
+uint32_t g_cnt_pio_rx = 0;   // Bytes aus der PIO-RX-FIFO gelesen
+uint32_t g_cnt_cdc_tx = 0;   // Bytes an den PC (CDC#2) geschrieben
+
 // Clock-Divider berechnen: 8 PIO-Zyklen pro Bit
 float calc_clkdiv(uint32_t baud) {
     if (baud == 0) baud = 115200;
@@ -123,7 +130,12 @@ void configure_rx(PIO pio, uint sm, int offset, uint pin, uint32_t baud) {
 
     sm_config_set_in_pins(&c, pin);
     sm_config_set_jmp_pin(&c, pin);
-    sm_config_set_in_shift(&c, true, true, 8); // shift right, autopush at 8 bits
+    // autopush AUS: das RX-Programm pusht selbst explizit (push block) nach 8
+    // gesampelten Bits. Mit zusaetzlichem Autopush (threshold 8) wuerde JEDES
+    // Byte ausserdem ein redundantes 0x00-Wort erzeugen (autopush leert die ISR,
+    // das folgende push schiebt eine 0 nach) -> der Host saehe "Zeichen, NUL,
+    // Zeichen, NUL, ...". Ein einziger expliziter push liefert genau ein Byte.
+    sm_config_set_in_shift(&c, true, false, 8); // shift right, KEIN autopush
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
     sm_config_set_clkdiv(&c, calc_clkdiv(baud));
 
@@ -246,14 +258,19 @@ void poll() {
     if (!g_active) return;
 
     // --- CDC#2 RX → PIO UART TX ---
-    if (tud_cdc_n_connected(CDC_ITF) && tud_cdc_n_available(CDC_ITF)) {
+    // KEIN tud_cdc_n_connected()-Gate: manche Terminalprogramme setzen DTR
+    // nicht, wodurch connected() dauerhaft false meldet und die Bridge stumm
+    // bliebe. tud_cdc_n_available() reicht — liegen Daten vor, verarbeiten wir sie.
+    if (tud_cdc_n_available(CDC_ITF)) {
         uint8_t buf[64];
         uint32_t count = tud_cdc_n_read(CDC_ITF, buf, sizeof buf);
         for (uint32_t i = 0; i < count; ++i) {
             // Warten, falls TX-FIFO voll (sollte selten sein bei normalen Baudraten)
             while (pio_sm_is_tx_fifo_full(g_pio, g_sm_tx)) tight_loop_contents();
             pio_sm_put(g_pio, g_sm_tx, static_cast<uint32_t>(buf[i]));
+            ++g_cnt_pio_tx;
         }
+        g_cnt_cdc_rx += count;
     }
 
     // --- PIO UART RX → CDC#2 TX ---
@@ -263,10 +280,22 @@ void poll() {
         uint32_t raw = pio_sm_get(g_pio, g_sm_rx);
         g_rx_buf[g_rx_buf_len++] = static_cast<uint8_t>(raw >> 24);
     }
-    if (g_rx_buf_len > 0 && tud_cdc_n_connected(CDC_ITF)) {
+    if (g_rx_buf_len > 0) {
+        g_cnt_pio_rx += g_rx_buf_len;
+        // Unbedingt schreiben (kein connected-Gate): TinyUSB puffert bzw. verwirft
+        // bei fehlendem Host selbst, der Datenfluss bleibt so aber sichtbar.
         tud_cdc_n_write(CDC_ITF, g_rx_buf, g_rx_buf_len);
         tud_cdc_n_write_flush(CDC_ITF);
+        g_cnt_cdc_tx += g_rx_buf_len;
     }
+}
+
+void debug_counts(uint32_t& cdc_rx, uint32_t& pio_tx,
+                  uint32_t& pio_rx, uint32_t& cdc_tx) {
+    cdc_rx = g_cnt_cdc_rx;
+    pio_tx = g_cnt_pio_tx;
+    pio_rx = g_cnt_pio_rx;
+    cdc_tx = g_cnt_cdc_tx;
 }
 
 } // namespace uart_bridge
