@@ -86,4 +86,10 @@ uint32_t pc();
 // der Gast wiederholt neu gestartet -> Blink-/LED-Aussetzer).
 uint32_t start_count();
 
+// Letzte Gast-PC-Samples (via SysTick-Shim). Fuellt bis zu 'max' Werte in 'out'
+// (LPC-Offset, falls im Image; sonst rohe Adresse), neueste zuerst. Rueckgabe =
+// Anzahl. Zeigt, wo ein "Running, mmio-traps eingefroren"-Gast in einer reinen
+// CPU-Schleife dreht (im .map/.lst der Firmware nachschlagbar).
+uint32_t pc_samples(uint32_t* out, uint32_t max);
+
 } // namespace emulator

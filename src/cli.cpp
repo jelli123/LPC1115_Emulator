@@ -207,6 +207,18 @@ void cmd_status() {
                 static_cast<unsigned long long>(emulator::mem_traps()));
     std::printf("Gast-Starts=%lu\n",
                 static_cast<unsigned long>(emulator::start_count()));
+    // Gast-PC-Samples (SysTick-Shim). Zeigt, wo ein "Running, mmio-traps
+    // eingefroren"-Gast in einer reinen CPU-Schleife dreht (LPC-Offset).
+    {
+        uint32_t pcs[8];
+        uint32_t n = emulator::pc_samples(pcs, 8);
+        if (n) {
+            std::printf("Gast-PC-Samples (LPC-Offset, neueste zuerst):");
+            for (uint32_t i = 0; i < n; ++i)
+                std::printf(" 0x%05lx", static_cast<unsigned long>(pcs[i]));
+            std::putchar('\n');
+        }
+    }
     std::printf("MMIO R=%llu W=%llu  GPIO=%llu  PLL-cfg=%llu  NVIC-W=%llu\n",
                 static_cast<unsigned long long>(s.mmio_reads),
                 static_cast<unsigned long long>(s.mmio_writes),

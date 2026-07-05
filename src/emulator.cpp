@@ -34,6 +34,15 @@ std::atomic<uint32_t>        g_start_count{0};
 // LPC-Modelle treibt und dann diesen Gast-Handler aufruft. 0 = keiner.
 std::atomic<uint32_t>        g_guest_systick_handler{0};
 
+// PC-Sampler (Diagnose): der reale Core1-SysTick unterbricht den Gast periodisch;
+// im Handler-Mode liegt der unterbrochene Gast-PC im gestackten PSP-Frame
+// (Offset 6). Wir merken die letzten Samples als LPC-Offset (PC - load_base).
+// Zeigt, WO ein "State=Running, mmio-traps eingefroren"-Gast in einer reinen
+// CPU-Schleife (ohne MMIO/WFI) dreht -> im .map/.lst der Firmware nachschlagbar.
+constexpr uint32_t PC_SAMPLES = 8;
+std::atomic<uint32_t>        g_pc_samples[PC_SAMPLES]{};
+std::atomic<uint32_t>        g_pc_sample_pos{0};
+
 // Vom Gast (Core1) angeforderter Soft-Reset (NVIC_SystemReset/WDT). Wird vom
 // Core0-Loop konsumiert, der den eigentlichen Core1-Reset ausfuehrt — ein
 // multicore_reset_core1() VON Core1 aus wuerde sich selbst abschiessen und nie
@@ -154,6 +163,23 @@ void isr_svc() {
 // Exception-Return dieses Shims wird ein evtl. gependeter LPC-IRQ per PendSV
 // (tail-chained) in den Gast injiziert.
 extern "C" void isr_systick_shim() {
+    // PC-Sampler: der unterbrochene Gast lief in Thread-Mode auf PSP; die HW hat
+    // dort {r0,r1,r2,r3,r12,lr,pc,xpsr} gestackt -> psp[6] = Gast-PC. Als
+    // LPC-Offset (PC - load_base) merken. Nur gueltige Thread-Frames (Gast lief,
+    // nicht der Shim selbst verschachtelt). Erlaubt Post-Mortem eines CPU-Loops.
+    {
+        uint32_t psp; __asm volatile ("mrs %0, psp" : "=r"(psp));
+        auto* f = reinterpret_cast<uint32_t*>(psp);
+        if (f) {
+            uint32_t pc = f[6];
+            uint32_t lb = emulator::load_base();
+            uint32_t off = (pc >= lb && pc < lb + emulator::LPC_LOAD_MAX_SIZE)
+                               ? (pc - lb) : pc;   // im Image: LPC-Offset, sonst roh
+            uint32_t pos = g_pc_sample_pos.fetch_add(1, std::memory_order_relaxed);
+            g_pc_samples[pos % PC_SAMPLES].store(off, std::memory_order_relaxed);
+        }
+    }
+
     // Host-Zeitbasis-Tick (reale Core1-SysTick-Exception, Handler-Mode). Feuert
     // ADAPTIV (bis in den Sub-ms-Bereich) am naechsten faelligen Timer-Match,
     // sonst spaetestens jede 1 ms. Treibt die zeitbasierten LPC-Modelle und
@@ -636,6 +662,19 @@ State    state()    { return g_state.load(); }
 uint32_t pc()       { return g_pc.load(); }
 uint64_t mem_traps(){ return faultsys::stats().mem_traps; }
 uint32_t start_count(){ return g_start_count.load(std::memory_order_relaxed); }
+
+uint32_t pc_samples(uint32_t* out, uint32_t max) {
+    if (!out || max == 0) return 0;
+    uint32_t pos = g_pc_sample_pos.load(std::memory_order_relaxed);
+    uint32_t n = (pos < PC_SAMPLES) ? pos : PC_SAMPLES;
+    if (n > max) n = max;
+    // Neueste zuerst: pos zeigt auf den naechsten Schreibindex.
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t idx = (pos - 1u - i) % PC_SAMPLES;
+        out[i] = g_pc_samples[idx].load(std::memory_order_relaxed);
+    }
+    return n;
+}
 
 uint32_t load_base() {
     return reinterpret_cast<uint32_t>(g_firmware_image);
