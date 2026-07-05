@@ -83,4 +83,14 @@ bool guest_output_level(uint8_t port, uint8_t pin, bool& level);
 bool uart0_cdc_tx_pop(uint8_t& b);   // Gast-TX-Byte holen (false = leer)
 void uart0_cdc_rx_push(uint8_t b);   // von CDC#2 empfangenes Byte an Gast-RX
 
+// UART0-Diagnose (via 'uart status'). Zeigt, WO der RX-Interrupt-Pfad bricht:
+//   ier        - aktueller IER-Schatten (Bit0=RBR-IRQ, Bit1=THRE-IRQ). 0 = Gast
+//                hat serial.begin() noch nicht erreicht.
+//   nvic_en    - UART0 (IRQ21) im vNVIC enabled (Gast rief NVIC_EnableIRQ).
+//   rx_irq_pends - wie oft UART0-RX-IRQ gepended wurde (Datenzustellung angestossen).
+//   rbr_reads  - wie oft der Gast das RBR gelesen hat (=Handler holt Bytes ab).
+//   tx_writes  - wie oft der Gast ins THR geschrieben hat (=Handler sendet).
+void uart0_debug(uint8_t& ier, bool& nvic_en, uint32_t& rx_irq_pends,
+                 uint32_t& rbr_reads, uint32_t& tx_writes);
+
 } // namespace peripherals

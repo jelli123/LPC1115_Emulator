@@ -742,6 +742,13 @@ struct UartModel {
 };
 UartModel g_uart0{};
 
+// UART0-RX-Diagnosezaehler (via 'uart status' sichtbar). Grenzen ein, WO der
+// interruptgetriebene sblib-Empfang bricht: kommt der RX-IRQ (rx_irq_pends),
+// liest der Gast das RBR (rbr_reads), sendet er (tx_writes)?
+uint32_t g_uart0_rx_irq_pends = 0;
+uint32_t g_uart0_rbr_reads    = 0;
+uint32_t g_uart0_tx_writes    = 0;
+
 // --- Virtuelle UART0 <-> USB CDC#2 Kopplung -------------------------------
 // Zwei SPSC-Ringpuffer (lock-frei, je ein Producer/Consumer auf getrennten
 // Cores), damit Gast-UART0 (Core1, MMIO-Trap) und USB-CDC#2 (Core0, TinyUSB)
@@ -852,16 +859,20 @@ uint8_t uart0_read_reg(uint32_t addr) {
         case UART0_RBR:
             if (dlab) return static_cast<uint8_t>(g_uart0.divisor & 0xFFu);
             if (cdc) {
-                uint8_t b = 0; ring_pop(g_uart0_rx, b);
+                uint8_t b = 0;
+                if (ring_pop(g_uart0_rx, b)) ++g_uart0_rbr_reads;
                 // Level-getriggerter RBR-IRQ: sind noch Bytes da + IRQ aktiv,
                 // sofort erneut penden (laeuft auf Core1) -> naechstes Byte ohne
                 // 1-ms-Wartezeit. Kette endet, wenn der Ring leer ist.
-                if ((g_uart0.ier & 0x01u) && !ring_empty(g_uart0_rx))
+                if ((g_uart0.ier & 0x01u) && !ring_empty(g_uart0_rx)) {
+                    ++g_uart0_rx_irq_pends;
                     irq_inject::pend(lpc_irq::UART0);
+                }
                 return b;
             }
             if (g_uart0.hw && uart_is_readable(g_uart0.hw)) {
                 uint8_t b = static_cast<uint8_t>(uart_getc(g_uart0.hw));
+                ++g_uart0_rbr_reads;
                 if ((g_uart0.ier & 0x01u) && uart_is_readable(g_uart0.hw))
                     irq_inject::pend(lpc_irq::UART0);
                 return b;
@@ -897,9 +908,11 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
             } else if (config::uart0_cdc_enabled()) {
                 // Virtuell: Byte in den TX-Ring -> Core0 schiebt es nach CDC#2.
                 ring_push(g_uart0_tx, val);
+                ++g_uart0_tx_writes;
                 if (g_uart0.ier & 0x02u) irq_inject::pend(lpc_irq::UART0);
             } else if (g_uart0.hw) {
                 uart_putc_raw(g_uart0.hw, static_cast<char>(val));
+                ++g_uart0_tx_writes;
                 if (g_uart0.ier & 0x02u) irq_inject::pend(lpc_irq::UART0);
             }
             break;
@@ -2134,7 +2147,7 @@ void poll_timed_sources() {
         bool have = config::uart0_cdc_enabled()
                         ? !ring_empty(g_uart0_rx)
                         : (g_uart0.hw && uart_is_readable(g_uart0.hw));
-        if (have) irq_inject::pend(lpc_irq::UART0);
+        if (have) { ++g_uart0_rx_irq_pends; irq_inject::pend(lpc_irq::UART0); }
     }
 }
 
@@ -2467,6 +2480,15 @@ bool guest_output_level(uint8_t port, uint8_t pin, bool& level) {
 //   uart0_cdc_rx_push - ein von CDC#2 empfangenes Byte an den Gast-RX
 bool uart0_cdc_tx_pop(uint8_t& b) { return ring_pop(g_uart0_tx, b); }
 void uart0_cdc_rx_push(uint8_t b) { ring_push(g_uart0_rx, b); }
+
+void uart0_debug(uint8_t& ier, bool& nvic_en, uint32_t& rx_irq_pends,
+                 uint32_t& rbr_reads, uint32_t& tx_writes) {
+    ier          = g_uart0.ier;
+    nvic_en      = (vnvic::snapshot().iser & (1u << lpc_irq::UART0)) != 0u;
+    rx_irq_pends = g_uart0_rx_irq_pends;
+    rbr_reads    = g_uart0_rbr_reads;
+    tx_writes    = g_uart0_tx_writes;
+}
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-
 // SysTick auf den naechsten Deadline (adaptiver "HW-Alarm").

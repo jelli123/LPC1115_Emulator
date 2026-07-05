@@ -833,6 +833,16 @@ void handle_command(char* line) {
                             static_cast<unsigned long>(p2g),
                             static_cast<unsigned long>(g2p),
                             usb_desc_cdc_serial() >= 0 ? "aktiv" : "AUS (serial_enable=0!)");
+                uint8_t ier; bool nvic_en;
+                uint32_t rx_pends, rbr_reads, tx_writes;
+                peripherals::uart0_debug(ier, nvic_en, rx_pends, rbr_reads, tx_writes);
+                std::printf("  Gast-UART: IER=0x%02x (RBR-IRQ=%s) NVIC-UART0=%s | "
+                            "RX-IRQ-pends=%lu RBR-reads=%lu THR-writes=%lu\n",
+                            ier, (ier & 0x01u) ? "an" : "AUS",
+                            nvic_en ? "an" : "AUS",
+                            static_cast<unsigned long>(rx_pends),
+                            static_cast<unsigned long>(rbr_reads),
+                            static_cast<unsigned long>(tx_writes));
             }
             return;
         }
