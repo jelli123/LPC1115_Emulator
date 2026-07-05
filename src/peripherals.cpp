@@ -977,6 +977,13 @@ struct CtModel {
 };
 CtModel g_ct[4];
 
+// Diagnose fuer den ct_advance-Hang: wie oft der Underflow-Schutz (last_us>now)
+// gegriffen hat + groesster je berechneter Tick-Wert. Via 'uart status'/CLI
+// sichtbar. underflow_guards>0 beweist eine time_us_64-Diskontinuitaet (z. B.
+// nach Gast-PLL-Reconfig) als Ursache des fruatlichen Endlos-Loops.
+uint32_t g_ct_underflow_guards = 0;
+uint64_t g_ct_max_ticks        = 0;
+
 // EMR-External-Match: EM0..3 = Bits 0..3, EMC0..3 = je 2 Bit ab Bit 4.
 // EMC: 0=nichts, 1=Pin löschen(0), 2=Pin setzen(1), 3=Pin toggeln.
 void ct_apply_external_match(CtModel& c, int m) {
@@ -1092,6 +1099,12 @@ uint32_t ct_base_for(uint32_t i) {
 void ct_advance(CtModel& c) {
     if (!c.enabled) { c.last_us = time_us_64(); ct_update_pwm(c); return; }
     uint64_t now = time_us_64();
+    // Underflow-Schutz: Ist last_us (aus welchem Grund auch immer) groesser als
+    // now, wuerde now - last_us zu ~2^63 unterlaufen -> ticks astronomisch ->
+    // die for-Schleife unten haengt praktisch endlos (im SysTick-Shim -> ganzer
+    // Emulator-Core1 steht). Beobachtet beim FT12-KNX-Timer (CT16B1). Statt zu
+    // haengen: als Glitch behandeln, resynchronisieren.
+    if (c.last_us > now) { c.last_us = now; ++g_ct_underflow_guards; ct_update_pwm(c); return; }
     uint64_t dt  = now - c.last_us;
     uint64_t hz    = g_current_hz ? static_cast<uint64_t>(g_current_hz) : 1u;
     uint64_t denom = 1'000'000ull * static_cast<uint64_t>(c.pre + 1u);
@@ -1104,8 +1117,18 @@ void ct_advance(CtModel& c) {
     // bleibt so erhalten und summiert sich ueber mehrere Aufrufe zu ganzen Ticks.
     if (!ticks) { ct_update_pwm(c); return; }   // last_us unveraendert -> Rest bleibt
     c.last_us += (ticks * denom) / hz;          // nur konsumierte Zeit verbrauchen
+    if (ticks > g_ct_max_ticks) g_ct_max_ticks = ticks;   // Diagnose
     uint32_t mask = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
-    for (uint64_t i = 0; i < ticks; ++i) {
+    // Defensiv-Deckel: Mehr als eine volle Zaehlperiode zu simulieren offenbart
+    // KEINE neuen (unterschiedlichen) Match-Ereignisse — Matches wiederholen sich
+    // und die IRQ wird im vNVIC ohnehin zu einem Pending-Bit zusammengefasst. Der
+    // Deckel haelt die Schleife (und damit den SysTick-Shim) beschraenkt, selbst
+    // bei einem grossen dt (lange Shim-Pause / Takt-Retarget) — statt Milliarden
+    // Iterationen. Im Normalbetrieb (dt ~1 ms) greift er nie.
+    const uint64_t cap = static_cast<uint64_t>(mask) + 1u;   // eine natuerliche Periode
+    uint64_t sim = ticks < cap ? ticks : cap;
+    uint64_t skipped = ticks - sim;
+    for (uint64_t i = 0; i < sim; ++i) {
         c.tc = (c.tc + 1u) & mask;
         for (int m = 0; m < 4; ++m) {
             if (c.tc == c.mr[m]) {
@@ -1117,6 +1140,7 @@ void ct_advance(CtModel& c) {
             }
         }
     }
+    if (skipped) c.tc = static_cast<uint32_t>((c.tc + skipped) & mask);  // uebersprungene Perioden
     ct_update_pwm(c);
 }
 
@@ -2511,6 +2535,11 @@ void uart0_debug(uint8_t& ier, bool& nvic_en, uint32_t& rx_irq_pends,
 void last_mmio(uint32_t& addr, bool& is_write) {
     addr     = g_last_mmio_addr;
     is_write = g_last_mmio_write;
+}
+
+void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks) {
+    underflow_guards = g_ct_underflow_guards;
+    max_ticks        = g_ct_max_ticks;
 }
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-

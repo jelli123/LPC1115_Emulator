@@ -23,6 +23,17 @@
 
 APP_VERSION("SBft12  ", "0", "03")  // Don't forget to also change the build-variable sw_version
 
+// --- Debug-Bridge (nur im LPC1115-Emulator wirksam) ------------------------
+// Byte-Write auf 0x4FFF0000 wird vom Emulator-Host gesammelt und via CLI 'dbg'
+// bzw. DEBUG.TXT auf dem USB-Laufwerk ausgegeben. Auf echter LPC-Hardware
+// schreibt es ins Leere (Adresse unbestueckt) -> portabel. Inline gehalten,
+// damit KEIN zusaetzlicher Include-Pfad noetig ist.
+static inline void dbg_puts(const char* s)
+{
+    volatile unsigned char* port = (volatile unsigned char*)0x4FFF0000u;
+    while (*s) { *port = (unsigned char)*s++; }
+}
+
 BcuFt12 bcuFt12 = BcuFt12();  //!< Bus coupling unit Maskversion 0x0012 of the ft12 module
 
 /** ft12 bit timeout converted in milliseconds */
@@ -193,6 +204,7 @@ void sendFixedFrame(byte* frame, const FtFunctionCode& funcCode)
  */
 BcuBase* setup()
 {
+    dbg_puts("FT12 setup: start\n");
     // led init and test
     pinMode(LED_KNX_RX, OUTPUT);    // KNX-Rx LED
     digitalWrite(LED_KNX_RX, LED_ON);
@@ -203,13 +215,26 @@ BcuBase* setup()
     digitalWrite(LED_KNX_RX, LED_OFF);
     delay(LED_TEST_MS);
     digitalWrite(LED_SERIAL_RX, LED_OFF);
+    dbg_puts("FT12 setup: LED-Test ok (delays liefen)\n");
 
+    dbg_puts("FT12 setup: -> bcuFt12.begin()\n");
     bcuFt12.begin(); // bcu.userRam->status is set in BcuFt12::begin()
+    dbg_puts("FT12 setup: bcuFt12.begin() ok\n");
+
     bcuFt12.setOwnAddress(FT_OWN_KNX_ADDRESS);
+    dbg_puts("FT12 setup: setOwnAddress ok\n");
+
     serial.setTxPin(PIN_FT_SERIAL_TX);
+    dbg_puts("FT12 setup: setTxPin ok\n");
+
     pinMode(PIN_FT_SERIAL_RX, SERIAL_RXD | PULL_UP | HYSTERESIS);
+    dbg_puts("FT12 setup: RX-pinMode ok -> serial.begin()\n");
+
     serial.begin(FT_BAUDRATE, SERIAL_8E1);
+    dbg_puts("FT12 setup: serial.begin() ok\n");
+
     reset();
+    dbg_puts("FT12 setup: reset() ok -> setup fertig\n");
     return (&bcuFt12);
 }
 

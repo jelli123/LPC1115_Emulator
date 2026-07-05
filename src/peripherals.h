@@ -98,4 +98,10 @@ void uart0_debug(uint8_t& ier, bool& nvic_en, uint32_t& rx_irq_pends,
 // Abfragen nicht, steht der Gast in einer Nicht-MMIO-Schleife an dieser Stelle.
 void last_mmio(uint32_t& addr, bool& is_write);
 
+// Diagnose des CT-Timer-Advance: Anzahl gegriffener Underflow-Schutzfaelle
+// (last_us>now, z. B. nach time_us_64-Diskontinuitaet durch Gast-PLL-Reconfig)
+// + groesster je berechneter Tick-Wert. underflow_guards>0 erklaert einen
+// fruehreren ct_advance-Endlos-Loop.
+void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks);
+
 } // namespace peripherals

@@ -229,6 +229,13 @@ void cmd_status() {
                     (sh_enter != sh_exit) ? "  [HAENGT IM SHIM!]"
                     : (sh_age > 100u)     ? "  [Shim feuert nicht mehr!]" : "");
     }
+    {
+        uint32_t ct_ug; uint64_t ct_mt;
+        peripherals::ct_advance_debug(ct_ug, ct_mt);
+        std::printf("CT-Advance: underflow-guards=%lu max-ticks=%llu\n",
+                    static_cast<unsigned long>(ct_ug),
+                    static_cast<unsigned long long>(ct_mt));
+    }
     std::printf("MMIO R=%llu W=%llu  GPIO=%llu  PLL-cfg=%llu  NVIC-W=%llu\n",
                 static_cast<unsigned long long>(s.mmio_reads),
                 static_cast<unsigned long long>(s.mmio_writes),
