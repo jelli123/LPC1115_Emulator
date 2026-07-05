@@ -92,12 +92,20 @@ int      g_offset_rx = -1;
 uint8_t  g_rx_buf[64];
 uint     g_rx_buf_len = 0;
 
-// Diagnose-Zaehler (via 'uart status' sichtbar). Zeigen, an welcher Stelle der
+// Diagnose-Zaehler (via 'cdc status' sichtbar). Zeigen, an welcher Stelle der
 // Datenfluss CDC#2 -> PIO-TX -> (Draht) -> PIO-RX -> CDC#2 bricht.
 uint32_t g_cnt_cdc_rx = 0;   // Bytes vom PC (CDC#2) gelesen
 uint32_t g_cnt_pio_tx = 0;   // Bytes in die PIO-TX-FIFO geschrieben
 uint32_t g_cnt_pio_rx = 0;   // Bytes aus der PIO-RX-FIFO gelesen
 uint32_t g_cnt_cdc_tx = 0;   // Bytes an den PC (CDC#2) geschrieben
+
+// Diagnose-Zaehler der VIRTUELLEN LPC-UART0 <-> Serial-CDC Kopplung (uart0_cdc).
+// via 'uart status' sichtbar -> zeigt, ob knxd den Gast erreicht (PC->Gast) und
+// ob der Gast antwortet (Gast->PC). Beide 0 trotz aktiver knxd-Verbindung =
+// falscher COM-Port / serial_enable aus; PC->Gast>0 aber Gast->PC=0 = Gast
+// empfaengt, antwortet aber nicht (FT1.2-Reset nicht beantwortet).
+uint32_t g_cnt_u0_pc_to_guest = 0;   // Bytes PC (CDC) -> Gast-RX-Ring
+uint32_t g_cnt_u0_guest_to_pc = 0;   // Bytes Gast-TX-Ring -> PC (CDC)
 
 // Clock-Divider berechnen: 8 PIO-Zyklen pro Bit
 float calc_clkdiv(uint32_t baud) {
@@ -304,6 +312,11 @@ void debug_counts(uint32_t& cdc_rx, uint32_t& pio_tx,
     cdc_tx = g_cnt_cdc_tx;
 }
 
+void uart0_cdc_counts(uint32_t& pc_to_guest, uint32_t& guest_to_pc) {
+    pc_to_guest = g_cnt_u0_pc_to_guest;
+    guest_to_pc = g_cnt_u0_guest_to_pc;
+}
+
 void uart0_cdc_poll() {
     // Core0-Seite der virtuellen LPC-UART0 <-> CDC-Serial Kopplung (config uart0_cdc).
     // Nur aktiv, wenn gewaehlt; laeuft UNABHAENGIG von der PIO-Bridge (die dann
@@ -320,6 +333,7 @@ void uart0_cdc_poll() {
     if (tn > 0) {
         tud_cdc_n_write(itf, txbuf, tn);
         tud_cdc_n_write_flush(itf);
+        g_cnt_u0_guest_to_pc += tn;
     }
 
     // PC (CDC) -> Gast-RX-Ring.
@@ -328,6 +342,7 @@ void uart0_cdc_poll() {
         uint32_t rn = tud_cdc_n_read(itf, rxbuf, sizeof rxbuf);
         for (uint32_t i = 0; i < rn; ++i)
             peripherals::uart0_cdc_rx_push(rxbuf[i]);
+        g_cnt_u0_pc_to_guest += rn;
     }
 }
 

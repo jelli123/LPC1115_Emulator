@@ -40,4 +40,9 @@ void debug_counts(uint32_t& cdc_rx, uint32_t& pio_tx,
 // Aus dem Hauptloop aufrufen; No-op, wenn uart0_cdc aus ist.
 void uart0_cdc_poll();
 
+// Diagnose-Zaehler der virtuellen LPC-UART0 <-> Serial-CDC Kopplung (uart0_cdc),
+// via 'uart status' sichtbar. pc_to_guest = von knxd empfangene Bytes,
+// guest_to_pc = vom Gast (FT12) gesendete Bytes.
+void uart0_cdc_counts(uint32_t& pc_to_guest, uint32_t& guest_to_pc);
+
 } // namespace uart_bridge

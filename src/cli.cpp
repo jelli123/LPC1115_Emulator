@@ -826,6 +826,14 @@ void handle_command(char* line) {
             std::printf("LPC-UART0: HW-Pads TX=GP%d RX=GP%d | Serial-CDC-virtuell=%s\n",
                         config::uart0_tx_gpio(), config::uart0_rx_gpio(),
                         config::uart0_cdc_enabled() ? "on" : "off");
+            if (config::uart0_cdc_enabled()) {
+                uint32_t p2g, g2p;
+                uart_bridge::uart0_cdc_counts(p2g, g2p);
+                std::printf("  Fluss: PC->Gast=%lu Bytes  Gast->PC=%lu Bytes  (Serial-CDC=%s)\n",
+                            static_cast<unsigned long>(p2g),
+                            static_cast<unsigned long>(g2p),
+                            usb_desc_cdc_serial() >= 0 ? "aktiv" : "AUS (serial_enable=0!)");
+            }
             return;
         }
         std::puts("err: uart pins <tx> <rx>|off | uart cdc on|off | uart status");
