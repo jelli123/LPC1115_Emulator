@@ -1096,51 +1096,75 @@ uint32_t ct_base_for(uint32_t i) {
     return b[i];
 }
 
+// Treibt den CT-Timer um die seit dem letzten Aufruf verstrichene Zeit weiter.
+//
+// ANALYTISCH (O(4 Kanaele), KEINE Schleife ueber die Tick-Zahl). Grund: die
+// fruehere tick-fuer-tick-Schleife war INSTABIL, sobald die Schleifen-Rechenzeit
+// die simulierte Zeit erreichte: jeder Aufruf verrichtete mehr Arbeit -> der
+// naechste Aufruf sah mehr verstrichene Zeit -> noch mehr Arbeit ... bis der
+// SysTick-Shim praktisch nur noch in ct_advance stand (FT12-KNX-Timer CT16B1
+// mit Prescaler 0 = 48000 Iterationen/ms -> Runaway, Gast verhungert). Die
+// analytische Form berechnet Treffer/Endstand direkt und ist unabhaengig von dt
+// immer billig.
 void ct_advance(CtModel& c) {
     if (!c.enabled) { c.last_us = time_us_64(); ct_update_pwm(c); return; }
     uint64_t now = time_us_64();
-    // Underflow-Schutz: Ist last_us (aus welchem Grund auch immer) groesser als
-    // now, wuerde now - last_us zu ~2^63 unterlaufen -> ticks astronomisch ->
-    // die for-Schleife unten haengt praktisch endlos (im SysTick-Shim -> ganzer
-    // Emulator-Core1 steht). Beobachtet beim FT12-KNX-Timer (CT16B1). Statt zu
-    // haengen: als Glitch behandeln, resynchronisieren.
+    // Underflow-Schutz: last_us>now (Zeit-Diskontinuitaet) -> als Glitch resyncen.
     if (c.last_us > now) { c.last_us = now; ++g_ct_underflow_guards; ct_update_pwm(c); return; }
-    uint64_t dt  = now - c.last_us;
+    uint64_t dt    = now - c.last_us;
     uint64_t hz    = g_current_hz ? static_cast<uint64_t>(g_current_hz) : 1u;
     uint64_t denom = 1'000'000ull * static_cast<uint64_t>(c.pre + 1u);
     uint64_t ticks = (dt * hz) / denom;
-    // WICHTIG: last_us NUR um die tatsaechlich konsumierte Zeit vorstellen, NICHT
-    // bedingungslos auf 'now'. Sonst geht bei jedem Aufruf mit ticks==0 die
-    // Sub-Tick-Restzeit verloren -> bei grossem Prescaler + schnellem Pollen
-    // (z. B. sblib KNX-Bus `while(getMatchChannelLevel(pwm))` in Bus::begin())
-    // wuerde der Zaehler NIE vorruecken -> Endlosschleife im Gast. Der Rest
-    // bleibt so erhalten und summiert sich ueber mehrere Aufrufe zu ganzen Ticks.
-    if (!ticks) { ct_update_pwm(c); return; }   // last_us unveraendert -> Rest bleibt
-    c.last_us += (ticks * denom) / hz;          // nur konsumierte Zeit verbrauchen
+    // last_us NUR um die konsumierte (ganzzahlige) Tick-Zeit vorstellen, damit
+    // die Sub-Tick-Restzeit erhalten bleibt (sonst bei schnellem Pollen mit
+    // grossem Prescaler kein Fortschritt). Bei ticks==0 last_us unveraendert.
+    if (!ticks) { ct_update_pwm(c); return; }
+    c.last_us += (ticks * denom) / hz;
     if (ticks > g_ct_max_ticks) g_ct_max_ticks = ticks;   // Diagnose
-    uint32_t mask = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
-    // Defensiv-Deckel: Mehr als eine volle Zaehlperiode zu simulieren offenbart
-    // KEINE neuen (unterschiedlichen) Match-Ereignisse — Matches wiederholen sich
-    // und die IRQ wird im vNVIC ohnehin zu einem Pending-Bit zusammengefasst. Der
-    // Deckel haelt die Schleife (und damit den SysTick-Shim) beschraenkt, selbst
-    // bei einem grossen dt (lange Shim-Pause / Takt-Retarget) — statt Milliarden
-    // Iterationen. Im Normalbetrieb (dt ~1 ms) greift er nie.
-    const uint64_t cap = static_cast<uint64_t>(mask) + 1u;   // eine natuerliche Periode
-    uint64_t sim = ticks < cap ? ticks : cap;
-    uint64_t skipped = ticks - sim;
-    for (uint64_t i = 0; i < sim; ++i) {
-        c.tc = (c.tc + 1u) & mask;
-        for (int m = 0; m < 4; ++m) {
-            if (c.tc == c.mr[m]) {
-                uint32_t mcr = (c.mcr >> (m * 3)) & 0x7u;
-                if (mcr & 0x1) { c.ir |= (1u << m); irq_inject::pend(c.irq_num); }
-                ct_apply_external_match(c, m);   // EMR: MATm-Pin treiben
-                if (mcr & 0x2) c.tc = 0;
-                if (mcr & 0x4) c.enabled = false;
-            }
-        }
+
+    const uint64_t mask = c.is32 ? 0xFFFF'FFFFull : 0xFFFFull;
+    const uint32_t tc0  = c.tc & static_cast<uint32_t>(mask);
+
+    // Effektive Zaehlperiode: kleinster MR mit MCR-Reset-Bit (Bit1) bestimmt den
+    // Umlauf (Zaehler laeuft 0..MR, dann Reset). Ohne Reset = voller Umlauf.
+    uint64_t period = mask + 1u;
+    for (int m = 0; m < 4; ++m) {
+        if (((c.mcr >> (m * 3)) & 0x2u) &&
+            (static_cast<uint64_t>(c.mr[m]) + 1u) < period)
+            period = static_cast<uint64_t>(c.mr[m]) + 1u;
     }
-    if (skipped) c.tc = static_cast<uint32_t>((c.tc + skipped) & mask);  // uebersprungene Perioden
+
+    // Stop-on-Match (MCR Bit2): der erste erreichte Stop-Match haelt den Zaehler
+    // an. Fruehesten Stop-Zeitpunkt suchen und die betrachtete Tick-Zahl kappen.
+    bool stopped = false;
+    for (int m = 0; m < 4; ++m) {
+        if (!((c.mcr >> (m * 3)) & 0x4u)) continue;
+        uint32_t mr = static_cast<uint32_t>(c.mr[m] % period);
+        uint64_t k0 = (static_cast<uint64_t>(mr) + period - tc0 % period) % period;
+        if (k0 == 0) k0 = period;                 // Treffer erst nach vollem Umlauf
+        if (k0 <= ticks) { ticks = k0; stopped = true; }
+    }
+
+    // Jeden Match-Kanal analytisch abarbeiten: Anzahl Treffer in 'ticks' Schritten.
+    for (int m = 0; m < 4; ++m) {
+        uint32_t mcr = (c.mcr >> (m * 3)) & 0x7u;
+        uint32_t mr  = static_cast<uint32_t>(c.mr[m] % period);
+        uint64_t k0  = (static_cast<uint64_t>(mr) + period - tc0 % period) % period;
+        if (k0 == 0) k0 = period;
+        if (k0 > ticks) continue;                 // in diesem Intervall kein Treffer
+        uint64_t fires = 1u + (ticks - k0) / period;
+        if (mcr & 0x1u) { c.ir |= (1u << m); irq_inject::pend(c.irq_num); }
+        // EMR/PWM-Pin: Endzustand annaehern. Toggle haengt von der Trefferparitaet
+        // ab, Set/Clear ist idempotent -> jeweils passend oft anwenden.
+        uint32_t emc = (c.emr >> (4u + 2u * static_cast<uint32_t>(m))) & 0x3u;
+        if (emc == 3u) { if (fires & 1u) ct_apply_external_match(c, m); }
+        else if (emc)  { ct_apply_external_match(c, m); }
+    }
+
+    // Endstand des Zaehlers (alle Resets via Modulo beruecksichtigt).
+    c.tc = static_cast<uint32_t>((static_cast<uint64_t>(tc0) + ticks) % period)
+           & static_cast<uint32_t>(mask);
+    if (stopped) c.enabled = false;
     ct_update_pwm(c);
 }
 
