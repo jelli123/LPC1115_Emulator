@@ -14,6 +14,7 @@
 #include "led.h"
 #include "xmodem.h"
 #include "debug_bridge.h"
+#include "usb_descriptors.h"
 
 extern "C" void usb_stdio_task(void);
 #include <cstdio>
@@ -167,7 +168,7 @@ void cmd_help() {
         "  pinmap set <port_pin> <rp> Pin zuweisen (z.B. pinmap set 1_8 17)",
         "  pinmap reset               Default-Tabelle wiederherstellen",
         "",
-        "  gdb on|off|status          GDB-Stub auf CDC#1",
+        "  gdb on|off|status          GDB-Stub auf der GDB-CDC",
         "  bp <addr>                  SW-Breakpoint setzen",
         "  bp clr <addr>              Breakpoint loeschen",
         "  regs                       Register anzeigen (r0-r15, xPSR)",
@@ -177,11 +178,11 @@ void cmd_help() {
         "  swd stop                   SWD-Target deaktivieren",
         "  pio capture <pin> <count>  Edge-Capture-Trace (Zyklen)",
         "",
-        "  cdc start <tx> <rx>        USB-Serial-Konverter (CDC#2 <-> PIO-UART)",
+        "  cdc start <tx> <rx>        USB-Serial-Konverter (Serial-CDC <-> PIO-UART)",
         "  cdc stop                   CDC-Serial-Konverter stoppen",
         "  cdc status                 Pins, Baudrate, Datenfluss",
         "  uart pins <tx> <rx>|off    LPC-UART0 auf RP-UART-Pads routen",
-        "  uart cdc on|off            LPC-UART0 virtuell an CDC#2 koppeln",
+        "  uart cdc on|off            LPC-UART0 virtuell an Serial-CDC koppeln",
         "  uart status                LPC-UART0-Routing anzeigen",
         "",
         "  i2c on <inst> <sda> <scl> [hz]  I2C-Bridge auf RP2350-HW (Neustart noetig)",
@@ -215,6 +216,30 @@ void cmd_status() {
     std::printf("CPU-target=%lu Hz  GDB=%s\n",
                 static_cast<unsigned long>(peripherals::current_cpu_hz()),
                 gdb_stub::active() ? "on" : "off");
+    // USB-CDC-Zuordnung (dynamisch, haengt von cli/gdb/serial_enable ab; MSC ist
+    // immer vorhanden). Zeigt, welcher COM-Port am Host welche Rolle hat.
+    {
+        const int c_cli = usb_desc_cdc_cli();
+        const int c_gdb = usb_desc_cdc_gdb();
+        const int c_ser = usb_desc_cdc_serial();
+        char line[128]; int p = 0;
+        p += std::snprintf(line + p, sizeof line - p, "USB-CDC:");
+        for (int i = 0; i < usb_desc_cdc_count(); ++i) {
+            const char* nm = (i == c_cli) ? "CLI"
+                           : (i == c_gdb) ? "GDB"
+                           : (i == c_ser) ? "Serial-Adapter" : "?";
+            p += std::snprintf(line + p, sizeof line - p, " CDC#%d=%s", i, nm);
+        }
+        if (usb_desc_cdc_count() == 0)
+            p += std::snprintf(line + p, sizeof line - p, " (keine)");
+        // deaktivierte Rollen benennen
+        char off[48]; int op = 0;
+        if (c_cli < 0) op += std::snprintf(off + op, sizeof off - op, " CLI");
+        if (c_gdb < 0) op += std::snprintf(off + op, sizeof off - op, " GDB");
+        if (c_ser < 0) op += std::snprintf(off + op, sizeof off - op, " Serial");
+        if (op) std::snprintf(line + p, sizeof line - p, " | aus:%s", off);
+        std::puts(line);
+    }
     // SysTick-Diagnose (klaert, ob der Gast-SysTick getrappt + korrekt gesetzt wird).
     uint32_t st_r, st_w, st_csr, st_rvr, st_cvr;
     uint64_t st_ticks;
@@ -714,10 +739,10 @@ void handle_command(char* line) {
         }
     }
 
-    // --- CDC-Serial-Konverter (eigenstaendige USB-Serial-Bruecke, CDC#2 <-> PIO-UART) ---
+    // --- CDC-Serial-Konverter (eigenstaendige USB-Serial-Bruecke, Serial-CDC <-> PIO-UART) ---
     // Voellig unabhaengig vom Gast: macht den RP2350 zu einem USB<->UART-Adapter
     // auf frei waehlbaren Pins (PIO). 'uart' betrifft dagegen NUR den LPC-UART0
-    // des Gasts. Legacy: 'uart start/stop' wird unten als Alias weitergeleitet.
+    // des Gasts.
     if (std::strcmp(tokens[0], "cdc") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "start") == 0) {
             if (n == 4) {
@@ -754,39 +779,20 @@ void handle_command(char* line) {
         return;
     }
 
-    // --- LPC-UART0 des Gasts: HW-Pin-Routing ODER virtuelle CDC#2-Kopplung ---
+    // --- LPC-UART0 des Gasts: HW-Pin-Routing ODER virtuelle Serial-CDC-Kopplung ---
     if (std::strcmp(tokens[0], "uart") == 0 && n >= 2) {
-        // Legacy-Alias: 'uart start/stop' -> CDC-Bridge (frueher hier verortet).
-        if (std::strcmp(tokens[1], "start") == 0 || std::strcmp(tokens[1], "stop") == 0) {
-            std::puts("[hinweis] 'uart start/stop' ist jetzt 'cdc start/stop' "
-                      "('uart' = LPC-UART0 des Gasts).");
-            if (std::strcmp(tokens[1], "start") == 0) {
-                if (n == 4) {
-                    long tx, rx;
-                    if (!parse_int(tokens[2], 0, 47, tx) ||
-                        !parse_int(tokens[3], 0, 47, rx)) {
-                        std::puts("err: cdc start <tx-gpio> <rx-gpio>"); return;
-                    }
-                    uart_bridge::set_tx_pin(static_cast<int>(tx));
-                    uart_bridge::set_rx_pin(static_cast<int>(rx));
-                    config::set_uart_bridge_tx_pin(static_cast<int>(tx));
-                    config::set_uart_bridge_rx_pin(static_cast<int>(rx));
-                }
-                std::puts(uart_bridge::start() ? "ok" : "err: Pins nicht gesetzt oder PIO voll");
-            } else {
-                uart_bridge::stop();
-            }
-            return;
-        }
-        // LPC-UART0 virtuell an CDC#2 koppeln (kein Draht/Pin). Schliesst die
-        // CDC-Bridge auf CDC#2 aus (beide koennen CDC#2 nicht gleichzeitig nutzen).
+        // LPC-UART0 virtuell an die Serial-CDC koppeln (kein Draht/Pin). Schliesst die
+        // CDC-Bridge auf der Serial-CDC aus (beide koennen sie nicht gleichzeitig nutzen).
         if (std::strcmp(tokens[1], "cdc") == 0 && n >= 3) {
             bool on = (std::strcmp(tokens[2], "on") == 0 || std::strcmp(tokens[2], "1") == 0);
-            if (on) uart_bridge::stop();     // CDC-Bridge gibt CDC#2 frei
+            if (on) uart_bridge::stop();     // CDC-Bridge gibt die Serial-CDC frei
             config::set_uart0_cdc_enabled(on);
             { emulator::FlashPauseGuard _fp; config::save(); }
             usb_msc::refresh_config_volume();
-            std::printf("uart0-cdc=%s (LPC-UART0 %s CDC#2)\n",
+            if (on && usb_desc_cdc_serial() < 0)
+                std::puts("[warn] Serial-CDC ist per Config deaktiviert (serial_enable=0) "
+                          "-> Kopplung wirkt erst nach Reset mit aktiver Serial-CDC.");
+            std::printf("uart0-cdc=%s (LPC-UART0 %s Serial-CDC)\n",
                         on ? "on" : "off",
                         on ? "<->" : "getrennt von");
             return;
@@ -817,7 +823,7 @@ void handle_command(char* line) {
             return;
         }
         if (std::strcmp(tokens[1], "status") == 0) {
-            std::printf("LPC-UART0: HW-Pads TX=GP%d RX=GP%d | CDC#2-virtuell=%s\n",
+            std::printf("LPC-UART0: HW-Pads TX=GP%d RX=GP%d | Serial-CDC-virtuell=%s\n",
                         config::uart0_tx_gpio(), config::uart0_rx_gpio(),
                         config::uart0_cdc_enabled() ? "on" : "off");
             return;
@@ -902,13 +908,20 @@ void process_hex_line(const char* line) {
 namespace cli {
 
 void init() {
-    std::puts("\nLPC1115 Emulator @ RP2350 — type 'help'");
+    if (config::cli_enabled())
+        std::puts("\nLPC1115 Emulator @ RP2350 — type 'help'");
+    else
+        std::puts("\n[CLI deaktiviert (cli_enable=0) — Housekeeping laeuft weiter]");
 }
 
 void run() {
+    // CLI-Interaktion per Config abschaltbar (cli_enable=0). Auch dann muss der
+    // Hauptloop weiterlaufen (USB-Task, GDB, MSC, UART-Bridge, Boot-Requests) —
+    // nur Prompt + Tastatureingabe entfallen.
+    const bool cli_on = config::cli_enabled();
     char line[LINE_MAX];
     std::size_t len = 0;
-    std::printf("emu> ");
+    if (cli_on) std::printf("emu> ");
     while (true) {
         usb_stdio_task();
         led::poll();
@@ -916,7 +929,7 @@ void run() {
         swd_target::poll();
         usb_msc::poll();
         uart_bridge::poll();
-        uart_bridge::uart0_cdc_poll();   // virtuelle LPC-UART0 <-> CDC#2
+        uart_bridge::uart0_cdc_poll();   // virtuelle LPC-UART0 <-> Serial-CDC
         if (emulator::guest_reset_pending()) {
             // Vom Gast angeforderter Soft-Reset (NVIC_SystemReset/WDT). Core1
             // hat geparkt; Core0 fuehrt den eigentlichen Core-Reset aus.
@@ -925,7 +938,12 @@ void run() {
         if (usb_msc::consume_pending_boot_request()) {
             std::printf("\n[BOOT] BOOT.HEX ueber USB-MSC erkannt -> Start\n");
             emulator::load_and_start();
-            std::printf("emu> ");
+            if (cli_on) std::printf("emu> ");
+        }
+        if (!cli_on) {
+            // Keine CLI: Eingabe/Prompt ueberspringen, nur Loop-Pacing.
+            sleep_us(500);
+            continue;
         }
         int c = getchar_timeout_us(1'000);
         if (c == PICO_ERROR_TIMEOUT) continue;

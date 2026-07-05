@@ -27,9 +27,9 @@ Legende: ⬜ offen · ✅ ok · ❌ Fehler
 | # | Test | Schritte | Erwartung | Status |
 |---|------|----------|-----------|:------:|
 | A1 | UF2-Flash | Board im BOOTSEL anstecken, `emulator.uf2` kopieren | Board re-enumeriert | ⬜ |
-| A2 | CDC-Ports | Geräte-Manager / `ls /dev/ttyACM*` | 3 serielle Ports (CLI, GDB, UART-Bridge) | ⬜ |
+| A2 | CDC-Ports | Geräte-Manager / `ls /dev/ttyACM*` | bis zu 3 serielle Ports (CLI, GDB, Serial-Adapter) je nach `*_enable`, Default alle 3 | ⬜ |
 | A3 | MSC-Volume | Datei-Explorer | Laufwerk `LPC1115EMU` (FAT12) mit `HELP.HTM` + `CONFIG.INI` sichtbar | ⬜ |
-| A4 | CLI-Prompt | Terminal an CDC#0, Enter | `emu>`-Prompt | ⬜ |
+| A4 | CLI-Prompt | Terminal an CLI-CDC, Enter | `emu>`-Prompt | ⬜ |
 | A5 | Status-LED | ohne geladene Firmware | Onboard-LED (GP25) ~1 Hz Heartbeat | ⬜ |
 
 ## B — CLI-Grundfunktionen
@@ -38,7 +38,7 @@ Legende: ⬜ offen · ✅ ok · ❌ Fehler
 |---|------|----------|-----------|:------:|
 | B1 | Hilfe | `help` | Befehlsliste inkl. `xmodem`, `erase`, `cfg …` | ⬜ |
 | B2 | Version | `version` | `LPC1115-Emu  RP2350  SDK=2.2.0` | ⬜ |
-| B3 | Status | `status` (oder `stats`) | Zustand, Zähler, GDB-Status | ⬜ |
+| B3 | Status | `status` (oder `stats`) | Zustand, Zähler, GDB-Status, `USB-CDC:`-Zuordnung, `PIO used:` | ⬜ |
 | B5 | HELP.HTM | `HELP.HTM` vom Laufwerk im Browser öffnen | Kurzanleitung wird angezeigt | ⬜ |
 | B6 | CONFIG.INI-Referenz | `CONFIG.INI` vom Laufwerk öffnen | aktive Zeilen = aktueller Zustand (inkl. `pin.*`), Optionen auskommentiert | ⬜ |
 | B4 | Reset | `reset` | Neustart, erneuter Prompt | ⬜ |
@@ -47,11 +47,11 @@ Legende: ⬜ offen · ✅ ok · ❌ Fehler
 
 | # | Test | Schritte | Erwartung | Status |
 |---|------|----------|-----------|:------:|
-| C1 | USB-MSC | `t1_blink.hex` als `BOOT.HEX` aufs Volume, auswerfen | LED an GP9 blinkt (Autostart) | ⬜ |
+| C1 | USB-MSC | `t1_blink.hex` als `BOOT.HEX` aufs Volume, auswerfen | LED an GP9 blinkt (Autostart); HEX verschwindet danach vom Laufwerk | ⬜ |
 | C2 | CLI-Upload | `upload`, dann `t2_uart_echo.hex` als Plain-Text senden | `[upload] … bytes … CRC` | ⬜ |
 | C3 | `info` | nach C2 `info` | Reset-Vektor/Stack/Size plausibel | ⬜ |
 | C4 | XMODEM | `xmodem`, dann `.hex` per XMODEM-1K senden (Tera Term/`sx -k`) | `[xmodem] … CRC ok` | ⬜ |
-| C5 | GDB-Load | `arm-none-eabi-gdb`, `target extended-remote <CDC#1>`, `load` | Übertragung ohne Fehler | ⬜ |
+| C5 | GDB-Load | `arm-none-eabi-gdb`, `target extended-remote <GDB-CDC>`, `load` | Übertragung ohne Fehler | ⬜ |
 | C6 | Run/Halt | `run` … `halt` … `run` | State wechselt Running/Halted (LED) | ⬜ |
 
 ## D — Konfiguration & Pinmap
@@ -94,7 +94,7 @@ Jeweils HEX laden (Weg aus Abschnitt C) und `run`.
 | # | Test | Schritte | Erwartung | Status |
 |---|------|----------|-----------|:------:|
 | G1 | GDB-Stub aktiv | `gdb on`, `status` | `GDB=on` | ⬜ |
-| G2 | GDB verbinden | `gdb` an CDC#1, `target extended-remote …` | Verbindung steht | ⬜ |
+| G2 | GDB verbinden | `gdb` an die GDB-CDC, `target extended-remote …` | Verbindung steht | ⬜ |
 | G3 | Halt/Register | `monitor`/`Ctrl-C`, `info registers` | r0-r15/xPSR plausibel | ⬜ |
 | G4 | Breakpoint | `b main`/`b <addr>`, `c` | hält am Breakpoint | ⬜ |
 | G5 | Single-Step | `si` / `s` | genau ein Schritt | ⬜ |
@@ -102,13 +102,25 @@ Jeweils HEX laden (Weg aus Abschnitt C) und `run`.
 | G7 | SWD-Target | `swd start 14 15`, OpenOCD `lpc11xx.cfg` | DPIDR `0x0BB11477`, AHB-AP `0x04770031` | ⬜ |
 | G8 | SWD-Mem | OpenOCD `mdw 0x10000000` | liest Guest-RAM | ⬜ |
 
-## H — UART-Bridge (CDC#2)
+## H — Serielle Schnittstellen (`cdc` / `uart`)
 
 | # | Test | Schritte | Erwartung | Status |
 |---|------|----------|-----------|:------:|
-| H1 | Bridge starten | `uart start 4 5` | `[uart-bridge] TX=GP4 RX=GP5` | ⬜ |
-| H2 | Durchgriff | GP4/GP5 an externe Gegenstelle, Terminal an CDC#2 | Daten bidirektional | ⬜ |
-| H3 | Baudwechsel | Terminal-Baud ändern, `uart status` | neue Baudrate übernommen | ⬜ |
+| H1 | Konverter starten | `cdc start 4 5` | `ok`, `cdc status` zeigt `active TX=GP4 RX=GP5` | ⬜ |
+| H2 | Durchgriff | GP4/GP5 an externe Gegenstelle, Terminal an Serial-Adapter-CDC | Daten bidirektional | ⬜ |
+| H3 | Baudwechsel | Terminal-Baud ändern, `cdc status` | neue Baudrate übernommen | ⬜ |
+| H4 | Konverter stoppen | `cdc stop`, `cdc status` | `cdc-bridge=off` | ⬜ |
+| H5 | LPC-UART0-Pads | `uart pins 0 1`, `uart status` | `HW-Pads TX=GP0 RX=GP1` | ⬜ |
+| H6 | LPC-UART0 virtuell | `uart cdc on`, `uart status` | `Serial-CDC-virtuell=on`; Gast-`printf` erscheint am Serial-Adapter-Port | ⬜ |
+
+## H2 — USB-Schnittstellen abschaltbar (`*_enable`)
+
+| # | Test | Schritte | Erwartung | Status |
+|---|------|----------|-----------|:------:|
+| U1 | GDB-CDC aus | `cli_enable=on`, `gdb_enable=off` in CONFIG.INI, auswerfen, Reset | ein COM-Port weniger; `status` zeigt `\| aus: GDB` | ⬜ |
+| U2 | Serial-CDC aus | `serial_enable=off`, Reset | Serial-Adapter-Port verschwindet; `cdc start` wirkungslos | ⬜ |
+| U3 | CLI aus | `cli_enable=off`, Reset | CLI-Port weg; Autostart/GDB/MSC laufen weiter (Bedienung über CONFIG.INI) | ⬜ |
+| U4 | Alles wieder an | alle `*_enable=on`, Reset | 3 COM-Ports + MSC wieder da | ⬜ |
 
 ## I — PIO Edge-Capture
 

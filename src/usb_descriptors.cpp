@@ -1,45 +1,27 @@
 #include "tusb.h"
 #include "pico/unique_id.h"
+#include "usb_descriptors.h"
+#include "config.h"
 
 #include <cstring>
 
-// Eigene USB-Descriptoren mit DREI CDC-Interfaces:
-//   CDC #0 → stdio / CLI
-//   CDC #1 → GDB Remote Serial Protocol (gdb_stub.cpp)
-//   CDC #2 → UART-Bridge (uart_bridge.cpp, PIO-UART ↔ USB)
-//
-// Pico-SDK lässt mit TINYUSB_OPT_USE_CUSTOM_USBD_DESCRIPTORS=1 (in
-// CMakeLists per pico_enable_stdio_usb(...) und Override) eigene
-// Descriptoren zu. Wir folgen dem TinyUSB-CDC-Multi-Beispiel.
+// Composite-USB mit bis zu DREI CDC-Interfaces + MSC. Welche CDCs erscheinen,
+// bestimmt die CONFIG.INI (cli_enable/gdb_enable/serial_enable). Deaktivierte
+// CDCs fallen komplett aus dem Konfigurations-Deskriptor -> der Host zeigt einen
+// COM-Port weniger. Das MSC-Laufwerk ist IMMER dabei (Recovery-Pfad ueber
+// CONFIG.INI). Der Deskriptor wird zur Bootzeit dynamisch gebaut (usb_desc_build,
+// vor tusb_init). Die Reihenfolge der aktiven CDCs ist fix: CLI, GDB, Serial;
+// ihre tud_cdc_n_*-Instanzindizes vergibt der Builder entsprechend.
 
 #define USB_VID   0xCAFE
 #define USB_PID   0x4012
 #define USB_BCD   0x0200
 
+// String-Indizes (Reihenfolge in string_desc_arr unten).
 enum {
-    ITF_NUM_CDC0_NOTIF = 0,
-    ITF_NUM_CDC0_DATA,
-    ITF_NUM_CDC1_NOTIF,
-    ITF_NUM_CDC1_DATA,
-    ITF_NUM_CDC2_NOTIF,
-    ITF_NUM_CDC2_DATA,
-    ITF_NUM_MSC,
-    ITF_NUM_TOTAL
+    STRID_LANG = 0, STRID_MANUF, STRID_PRODUCT, STRID_SERIAL,
+    STRID_CLI, STRID_GDB, STRID_MSC, STRID_SERIALADP,
 };
-
-#define EPNUM_CDC0_NOTIF  0x81
-#define EPNUM_CDC0_OUT    0x02
-#define EPNUM_CDC0_IN     0x82
-#define EPNUM_CDC1_NOTIF  0x83
-#define EPNUM_CDC1_OUT    0x04
-#define EPNUM_CDC1_IN     0x84
-#define EPNUM_CDC2_NOTIF  0x85
-#define EPNUM_CDC2_OUT    0x06
-#define EPNUM_CDC2_IN     0x86
-#define EPNUM_MSC_OUT     0x07
-#define EPNUM_MSC_IN      0x87
-
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + 3 * TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN)
 
 static tusb_desc_device_t const desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
@@ -62,23 +44,87 @@ uint8_t const* tud_descriptor_device_cb(void) {
     return reinterpret_cast<uint8_t const*>(&desc_device);
 }
 
-static uint8_t const desc_fs_configuration[] = {
-    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
+// --- Dynamischer Konfigurations-Deskriptor --------------------------------
+namespace {
 
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC0_NOTIF, 4, EPNUM_CDC0_NOTIF, 8,
-                       EPNUM_CDC0_OUT, EPNUM_CDC0_IN, 64),
+// Puffer gross genug fuer 3x CDC + MSC + Header.
+uint8_t  g_cfg_desc[TUD_CONFIG_DESC_LEN + 3 * TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN];
+uint16_t g_cfg_len = 0;
 
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1_NOTIF, 5, EPNUM_CDC1_NOTIF, 8,
-                       EPNUM_CDC1_OUT, EPNUM_CDC1_IN, 64),
+// CDC-Instanzindizes je Rolle (-1 = deaktiviert). MSC ist immer dabei.
+int g_cdc_cli    = -1;
+int g_cdc_gdb    = -1;
+int g_cdc_serial = -1;
+int g_cdc_count  =  0;
+bool g_built = false;
 
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC2_NOTIF, 7, EPNUM_CDC2_NOTIF, 8,
-                       EPNUM_CDC2_OUT, EPNUM_CDC2_IN, 64),
+// Fuegt einen CDC-Funktionsblock an und vergibt Interface-/Endpoint-Nummern.
+// itf/ep_num werden fortgeschrieben. Endpoint-Schema wie zuvor: notif = 0x80|n,
+// dann n++, data-out = n, data-in = 0x80|n, dann n++.
+void append_cdc(uint32_t& pos, uint8_t& itf, uint8_t& ep_num, uint8_t str_idx) {
+    uint8_t ep_notif = static_cast<uint8_t>(0x80u | ep_num); ++ep_num;
+    uint8_t ep_out   = ep_num;
+    uint8_t ep_in    = static_cast<uint8_t>(0x80u | ep_num); ++ep_num;
+    uint8_t blk[TUD_CDC_DESC_LEN] = {
+        TUD_CDC_DESCRIPTOR(itf, str_idx, ep_notif, 8, ep_out, ep_in, 64)
+    };
+    std::memcpy(g_cfg_desc + pos, blk, sizeof blk);
+    pos += TUD_CDC_DESC_LEN;
+    itf += 2;
+}
 
-    TUD_MSC_DESCRIPTOR(ITF_NUM_MSC, 6, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
-};
+} // namespace
+
+void usb_desc_build() {
+    g_cdc_cli = g_cdc_gdb = g_cdc_serial = -1;
+    g_cdc_count = 0;
+
+    const bool cli = config::cli_enabled();
+    const bool gdb = config::gdb_enabled();
+    const bool ser = config::serial_cdc_enabled();
+    int idx = 0;
+    if (cli) g_cdc_cli    = idx++;
+    if (gdb) g_cdc_gdb    = idx++;
+    if (ser) g_cdc_serial = idx++;
+    g_cdc_count = idx;
+
+    const uint8_t itf_total = static_cast<uint8_t>(g_cdc_count * 2 + 1); // +MSC
+    uint32_t pos = TUD_CONFIG_DESC_LEN;   // Header spaeter (braucht total_len)
+    uint8_t  itf = 0;
+    uint8_t  ep  = 1;
+
+    if (cli) append_cdc(pos, itf, ep, STRID_CLI);
+    if (gdb) append_cdc(pos, itf, ep, STRID_GDB);
+    if (ser) append_cdc(pos, itf, ep, STRID_SERIALADP);
+
+    // MSC: OUT = ep, IN = 0x80|ep.
+    {
+        uint8_t msc_out = ep;
+        uint8_t msc_in  = static_cast<uint8_t>(0x80u | ep);
+        uint8_t blk[TUD_MSC_DESC_LEN] = {
+            TUD_MSC_DESCRIPTOR(itf, STRID_MSC, msc_out, msc_in, 64)
+        };
+        std::memcpy(g_cfg_desc + pos, blk, sizeof blk);
+        pos += TUD_MSC_DESC_LEN;
+    }
+
+    g_cfg_len = static_cast<uint16_t>(pos);
+    // Header mit endgueltiger Gesamtlaenge + Interface-Anzahl schreiben.
+    uint8_t hdr[TUD_CONFIG_DESC_LEN] = {
+        TUD_CONFIG_DESCRIPTOR(1, itf_total, 0, g_cfg_len, 0x00, 100)
+    };
+    std::memcpy(g_cfg_desc, hdr, sizeof hdr);
+    g_built = true;
+}
+
+int usb_desc_cdc_cli()    { return g_cdc_cli; }
+int usb_desc_cdc_gdb()    { return g_cdc_gdb; }
+int usb_desc_cdc_serial() { return g_cdc_serial; }
+int usb_desc_cdc_count()  { return g_cdc_count; }
 
 uint8_t const* tud_descriptor_configuration_cb(uint8_t /*idx*/) {
-    return desc_fs_configuration;
+    if (!g_built) usb_desc_build();   // Fallback (sollte vor tusb_init erfolgen)
+    return g_cfg_desc;
 }
 
 static char const* string_desc_arr[] = {
@@ -86,10 +132,10 @@ static char const* string_desc_arr[] = {
     "Selfbus",                            // 1: Manufacturer
     "LPC1115-Emulator on RP2350",         // 2: Product
     nullptr,                              // 3: Serial (dynamisch)
-    "LPC-Emu CLI",                        // 4: CDC #0 name
-    "LPC-Emu GDB",                        // 5: CDC #1 name
-    "LPC-Emu MSC",                        // 6: MSC name
-    "LPC-Emu UART",                       // 7: CDC #2 name (UART-Bridge)
+    "LPC-Emu CLI",                        // 4: CDC CLI
+    "LPC-Emu GDB",                        // 5: CDC GDB
+    "LPC-Emu MSC",                        // 6: MSC
+    "LPC-Emu Serial",                     // 7: CDC Serial-Adapter
 };
 
 static uint16_t _desc_str[32];

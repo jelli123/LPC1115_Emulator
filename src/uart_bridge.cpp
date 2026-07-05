@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "peripherals.h"
+#include "usb_descriptors.h"
 #include "tusb.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
@@ -73,7 +74,8 @@ const struct pio_program uart_rx_program = {
 };
 
 // --- Zustand ---
-constexpr uint8_t CDC_ITF = 2;  // dritte CDC-Schnittstelle
+// CDC-Instanz des Serial-Adapters (dynamisch; -1 wenn per Config deaktiviert).
+inline int cdc_itf() { return usb_desc_cdc_serial(); }
 
 int      g_tx_pin   = -1;
 int      g_rx_pin   = -1;
@@ -257,14 +259,17 @@ uint32_t baud_rate()      { return g_baud; }
 
 void poll() {
     if (!g_active) return;
+    int itf_i = cdc_itf();
+    if (itf_i < 0) return;            // Serial-CDC per Config deaktiviert
+    uint8_t itf = (uint8_t)itf_i;
 
-    // --- CDC#2 RX → PIO UART TX ---
+    // --- CDC RX → PIO UART TX ---
     // KEIN tud_cdc_n_connected()-Gate: manche Terminalprogramme setzen DTR
     // nicht, wodurch connected() dauerhaft false meldet und die Bridge stumm
     // bliebe. tud_cdc_n_available() reicht — liegen Daten vor, verarbeiten wir sie.
-    if (tud_cdc_n_available(CDC_ITF)) {
+    if (tud_cdc_n_available(itf)) {
         uint8_t buf[64];
-        uint32_t count = tud_cdc_n_read(CDC_ITF, buf, sizeof buf);
+        uint32_t count = tud_cdc_n_read(itf, buf, sizeof buf);
         for (uint32_t i = 0; i < count; ++i) {
             // Warten, falls TX-FIFO voll (sollte selten sein bei normalen Baudraten)
             while (pio_sm_is_tx_fifo_full(g_pio, g_sm_tx)) tight_loop_contents();
@@ -274,7 +279,7 @@ void poll() {
         g_cnt_cdc_rx += count;
     }
 
-    // --- PIO UART RX → CDC#2 TX ---
+    // --- PIO UART RX → CDC TX ---
     g_rx_buf_len = 0;
     while (!pio_sm_is_rx_fifo_empty(g_pio, g_sm_rx) &&
            g_rx_buf_len < sizeof(g_rx_buf)) {
@@ -285,8 +290,8 @@ void poll() {
         g_cnt_pio_rx += g_rx_buf_len;
         // Unbedingt schreiben (kein connected-Gate): TinyUSB puffert bzw. verwirft
         // bei fehlendem Host selbst, der Datenfluss bleibt so aber sichtbar.
-        tud_cdc_n_write(CDC_ITF, g_rx_buf, g_rx_buf_len);
-        tud_cdc_n_write_flush(CDC_ITF);
+        tud_cdc_n_write(itf, g_rx_buf, g_rx_buf_len);
+        tud_cdc_n_write_flush(itf);
         g_cnt_cdc_tx += g_rx_buf_len;
     }
 }
@@ -300,24 +305,27 @@ void debug_counts(uint32_t& cdc_rx, uint32_t& pio_tx,
 }
 
 void uart0_cdc_poll() {
-    // Core0-Seite der virtuellen LPC-UART0 <-> CDC#2 Kopplung (config uart0_cdc).
+    // Core0-Seite der virtuellen LPC-UART0 <-> CDC-Serial Kopplung (config uart0_cdc).
     // Nur aktiv, wenn gewaehlt; laeuft UNABHAENGIG von der PIO-Bridge (die dann
-    // CDC#2 nicht nutzen darf). Kein connected()-Gate (DTR-unabhaengig).
+    // die Serial-CDC nicht nutzen darf). Kein connected()-Gate (DTR-unabhaengig).
     if (!config::uart0_cdc_enabled()) return;
+    int itf_i = cdc_itf();
+    if (itf_i < 0) return;            // Serial-CDC per Config deaktiviert
+    uint8_t itf = (uint8_t)itf_i;
 
-    // Gast-TX (aus dem Ring) -> CDC#2 an den PC.
+    // Gast-TX (aus dem Ring) -> CDC an den PC.
     uint8_t txbuf[64];
     uint32_t tn = 0;
     while (tn < sizeof txbuf && peripherals::uart0_cdc_tx_pop(txbuf[tn])) ++tn;
     if (tn > 0) {
-        tud_cdc_n_write(CDC_ITF, txbuf, tn);
-        tud_cdc_n_write_flush(CDC_ITF);
+        tud_cdc_n_write(itf, txbuf, tn);
+        tud_cdc_n_write_flush(itf);
     }
 
-    // PC (CDC#2) -> Gast-RX-Ring.
-    if (tud_cdc_n_available(CDC_ITF)) {
+    // PC (CDC) -> Gast-RX-Ring.
+    if (tud_cdc_n_available(itf)) {
         uint8_t rxbuf[64];
-        uint32_t rn = tud_cdc_n_read(CDC_ITF, rxbuf, sizeof rxbuf);
+        uint32_t rn = tud_cdc_n_read(itf, rxbuf, sizeof rxbuf);
         for (uint32_t i = 0; i < rn; ++i)
             peripherals::uart0_cdc_rx_push(rxbuf[i]);
     }
@@ -329,7 +337,8 @@ void uart0_cdc_poll() {
 // TinyUSB-Callback: Host setzt Line-Coding (Baudrate) auf CDC#2.
 // ---------------------------------------------------------------------------
 extern "C" void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* p_line_coding) {
-    if (itf != 2) return;
+    int serial = usb_desc_cdc_serial();
+    if (serial < 0 || itf != (uint8_t)serial) return;
     if (!p_line_coding || p_line_coding->bit_rate == 0) return;
 
     uart_bridge::g_baud = p_line_coding->bit_rate;

@@ -13,6 +13,9 @@ namespace {
 PinMap   g_pin_map{};
 uint32_t g_target_freq = 48'000'000;
 bool     g_autostart   = false;
+bool     g_cli_enable    = true;
+bool     g_gdb_enable    = true;
+bool     g_serial_enable = true;
 bool     g_uart_bridge_en = false;
 int      g_uart_bridge_tx = -1;
 int      g_uart_bridge_rx = -1;
@@ -111,6 +114,9 @@ void apply_defaults() {
     apply_default_pinmap_impl();
     g_target_freq = 48'000'000;
     g_autostart   = false;
+    g_cli_enable    = true;
+    g_gdb_enable    = true;
+    g_serial_enable = true;
     g_uart_bridge_en = false;
     g_uart_bridge_tx = -1;
     g_uart_bridge_rx = -1;
@@ -195,6 +201,13 @@ bool load() {
     if (storage::config_get(KEY_AUTOSTART, buf, sizeof buf)) {
         g_autostart = (buf[0] == '1');
     }
+    // USB-CDC-Praesenz (Default on, wenn Key fehlt).
+    if (storage::config_get(KEY_CLI_ENABLE, buf, sizeof buf))
+        g_cli_enable = (buf[0] == '1');
+    if (storage::config_get(KEY_GDB_ENABLE, buf, sizeof buf))
+        g_gdb_enable = (buf[0] == '1');
+    if (storage::config_get(KEY_SERIAL_ENABLE, buf, sizeof buf))
+        g_serial_enable = (buf[0] == '1');
     if (storage::config_get(KEY_TARGET_FREQ_HZ, buf, sizeof buf)) {
         uint32_t v;
         if (parse_uint32(buf, v) && v > 0 && v <= MAX_FREQ_HZ) g_target_freq = v;
@@ -334,6 +347,12 @@ bool save() {
     char buf[24];
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_autostart ? 1 : 0));
     if (!storage::config_set(KEY_AUTOSTART, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_cli_enable ? 1 : 0));
+    if (!storage::config_set(KEY_CLI_ENABLE, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_gdb_enable ? 1 : 0));
+    if (!storage::config_set(KEY_GDB_ENABLE, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_serial_enable ? 1 : 0));
+    if (!storage::config_set(KEY_SERIAL_ENABLE, buf)) return false;
     std::snprintf(buf, sizeof buf, "%lu", static_cast<unsigned long>(g_target_freq));
     if (!storage::config_set(KEY_TARGET_FREQ_HZ, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_uart_bridge_en ? 1 : 0));
@@ -450,6 +469,12 @@ void reset_pin_mappings() {
 
 bool        autostart()                    { return g_autostart; }
 void        set_autostart(bool v)          { g_autostart = v; }
+bool        cli_enabled()                  { return g_cli_enable; }
+void        set_cli_enabled(bool v)        { g_cli_enable = v; }
+bool        gdb_enabled()                  { return g_gdb_enable; }
+void        set_gdb_enabled(bool v)        { g_gdb_enable = v; }
+bool        serial_cdc_enabled()           { return g_serial_enable; }
+void        set_serial_cdc_enabled(bool v) { g_serial_enable = v; }
 uint32_t    target_frequency_hz()          { return g_target_freq; }
 
 void set_target_frequency_hz(uint32_t hz) {

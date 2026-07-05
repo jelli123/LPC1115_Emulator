@@ -9,8 +9,8 @@ native Geschwindigkeit; Interpretation findet nicht statt.
 
 ```
 +-- Core 0 (privilegiert) ------+    +-- Core 1 (Gast) ----------+
-| USB-CDC #0  CLI/stdio         |    | unprivileged Thread Mode  |
-| USB-CDC #1  GDB Remote (opt.) |    | PSP-Stack                 |
+| USB-CDC CLI/GDB/Serial (dyn.) |    | unprivileged Thread Mode  |
+| USB-MSC-Laufwerk (immer)      |    | PSP-Stack                 |
 | Storage (Wear-Leveling, CRC)  |    | Native LPC-Firmware in    |
 | peripherals::mmio_*           |    | RP2350-SRAM (aligned Array)|
 | pio_glue (Edge-Capture)       |    +---------------------------+
@@ -162,8 +162,12 @@ Mapping LPC-Peripherie → IRQ-Index ist zentral in
 > USB-CDC-Endpoint.
 
 * Implementierung: [gdb_stub.cpp](src/gdb_stub.cpp).
-* USB: zweiter CDC-Port via [usb_descriptors.cpp](src/usb_descriptors.cpp)
-  und [tusb_config.h](src/tusb_config.h) (`CFG_TUD_CDC = 2`).
+* USB: eigener CDC-Port via [usb_descriptors.cpp](src/usb_descriptors.cpp)
+  und [tusb_config.h](src/tusb_config.h) (`CFG_TUD_CDC = 3`). Der
+  Konfigurations-Deskriptor wird zur Bootzeit **dynamisch** aus der Config
+  gebaut: `cli_enable` / `gdb_enable` / `serial_enable` (CONFIG.INI, Default
+  `on`) bestimmen, welche CDCs am USB erscheinen. Deaktivierte CDCs fallen
+  komplett weg (ein COM-Port weniger); das MSC-Laufwerk ist immer aktiv.
 * Aktivierung in der CLI: `gdb on` / `gdb off` / `gdb status`.
 * Software-Breakpoints: `Z0`/`z0` ersetzt 16-bit-Instruktion durch `BKPT`,
   Hit landet im UsageFault-Handler → `gdb_stub::on_breakpoint()`,
@@ -284,6 +288,9 @@ Der Emulator unterstützt diesen Ablauf direkt:
   den 64-KiB-Slot (Sektor-Read-Modify-Write). Eine zweite Datei (z. B. die
   App) überschreibt den zuvor geladenen Bootloader **nicht**. Vollständiges
   Löschen nur explizit über `erase` (CLI) bzw. `flash_erase=on` (CONFIG.INI).
+  Nach dem Flashen einer per USB-Volume abgelegten HEX wird diese \u2014 wie beim
+  RP2350-UF2-Bootloader \u2014 automatisch vom Laufwerk entfernt und das Medium
+  neu eingeh\u00e4ngt (CONFIG.INI/HELP.HTM/DEBUG.TXT bleiben erhalten).
 * **Auto-Descriptor:** Erkennt der Loader beim Start eine gültige
   Applikation ab `app_start` (plausibler Initial-SP im LPC-RAM + Thumb-
   Reset-Vektor im Flash), synthetisiert er bei `autodesc=on` einen

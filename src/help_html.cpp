@@ -33,7 +33,7 @@ Fehleranzeige zusammen. Ausfuehrliche Doku: <span class="mono">README.md</span>,
 
 <h2>Dateien auf diesem Laufwerk</h2>
 <table class="files"><tr><th>Datei</th><th>Bedeutung</th></tr>
-<tr><td><code>BOOT.HEX</code></td><td>Hierher kopierte Intel-HEX-Firmware (max. 64&nbsp;KiB). Wird beim Auswerfen geladen. Jede <code>*.HEX</code> wird akzeptiert; <code>BOOT.HEX</code> hat Vorrang.</td></tr>
+<tr><td><code>BOOT.HEX</code></td><td>Hierher kopierte Intel-HEX-Firmware (max. 64&nbsp;KiB). Wird beim Auswerfen geladen und danach automatisch vom Laufwerk entfernt (wie beim RP2350-UF2-Bootloader). Jede <code>*.HEX</code> wird akzeptiert; <code>BOOT.HEX</code> hat Vorrang.</td></tr>
 <tr><td><code>CONFIG.INI</code></td><td>Aktuelle Einstellungen + auskommentierte Optionen. Editierbar; wird beim Auswerfen uebernommen.</td></tr>
 <tr><td><code>HELP.HTM</code></td><td>Diese Kurzanleitung.</td></tr>
 <tr><td><code>FAULT.TXT</code></td><td>Erscheint nur nach einem Gast-Fehler: kompletter Fehlerbericht (siehe unten).</td></tr>
@@ -41,7 +41,8 @@ Fehleranzeige zusammen. Ausfuehrliche Doku: <span class="mono">README.md</span>,
 <div class="note"><b>Firmware laden ohne CLI:</b> <code>BOOT.HEX</code> (und optional <code>CONFIG.INI</code>)
 aufs Laufwerk kopieren, dann <b>auswerfen</b> ("sicher entfernen"). Das Laden ist <b>additiv</b>
 (Merge) &ndash; zum vollstaendigen Ersetzen vorher <code>flash_erase=on</code> in <code>CONFIG.INI</code>
-setzen oder in der CLI <code>erase</code> ausfuehren.</div>
+setzen oder in der CLI <code>erase</code> ausfuehren. Nach dem Flashen verschwindet die HEX-Datei
+vom Laufwerk (Medienwechsel); die uebrigen Dateien bleiben.</div>
 
 <h2>Status-LED (Onboard, GP25)</h2>
 <table><tr><th>Muster</th><th>Bedeutung</th></tr>
@@ -51,7 +52,7 @@ setzen oder in der CLI <code>erase</code> ausfuehren.</div>
 <tr><td>schnelles Flackern (8&nbsp;Hz)</td><td>Gast-Fehler (State=Faulted) &ndash; siehe <code>FAULT.TXT</code></td></tr>
 </table>
 
-<h2>CLI-Befehle (USB-CDC#0, 115200&nbsp;8N1)</h2>
+<h2>CLI-Befehle (USB-CLI-CDC, 115200&nbsp;8N1)</h2>
 <table><tr><th>Befehl</th><th>Wirkung</th></tr>
 <tr><td><code>help</code> / <code>version</code></td><td>Hilfe / Build-Info</td></tr>
 <tr><td><code>stats</code></td><td>Status &amp; Zaehler (siehe unten)</td></tr>
@@ -63,9 +64,11 @@ setzen oder in der CLI <code>erase</code> ausfuehren.</div>
 <tr><td><code>autostart on|off</code></td><td>nach Reset automatisch starten</td></tr>
 <tr><td><code>cfg list|get|set|save</code></td><td>Konfiguration lesen/setzen/speichern</td></tr>
 <tr><td><code>pinmap show|set|reset</code></td><td>LPC-Pin &rarr; RP2350-GPIO</td></tr>
-<tr><td><code>gdb on|off</code>, <code>bp</code>, <code>regs</code>, <code>mem</code></td><td>Debugger (GDB-Stub auf CDC#1)</td></tr>
+<tr><td><code>gdb on|off</code>, <code>bp</code>, <code>regs</code>, <code>mem</code></td><td>Debugger (GDB-Stub auf der GDB-CDC)</td></tr>
 <tr><td><code>swd start &lt;dio&gt; &lt;clk&gt;</code></td><td>externes SWD-Target (clk = dio+1)</td></tr>
-<tr><td><code>uart</code>, <code>i2c</code></td><td>UART-/I2C-Bridges auf echte RP2350-Hardware</td></tr>
+<tr><td><code>cdc start|stop|status</code></td><td>USB&harr;UART-Adapter (Serial-CDC &harr; PIO-UART, beliebige GPIOs)</td></tr>
+<tr><td><code>uart pins|cdc|status</code></td><td>LPC-UART0 des Gasts: echte RP-Pads bzw. virtuell an Serial-CDC</td></tr>
+<tr><td><code>i2c on|off|status</code></td><td>I2C-Bridge auf echte RP2350-Hardware</td></tr>
 <tr><td><code>freq &lt;Hz&gt;</code></td><td>LPC-Soll-Takt der emulierten Zeitbasis</td></tr>
 </table>
 
@@ -80,7 +83,13 @@ setzen oder in der CLI <code>erase</code> ausfuehren.</div>
 <tr><td class="mono">NVIC-W</td><td>Schreibzugriffe auf den Schatten-NVIC (ISER/ICER/ISPR/ICPR/IPR)</td></tr>
 <tr><td class="mono">CPU-target</td><td>uebernommene LPC-Soll-Frequenz (Zeitbasis der Timer). Der reale RP2350-Takt bleibt bei 150&nbsp;MHz.</td></tr>
 <tr><td class="mono">GDB</td><td>GDB-Stub aktiv (on/off)</td></tr>
+<tr><td class="mono">USB-CDC</td><td>dynamische CDC-Zuordnung je COM-Port (z.&nbsp;B. <code>CDC#0=CLI CDC#1=GDB CDC#2=Serial-Adapter</code>); <code>| aus:</code> listet per Config deaktivierte Rollen</td></tr>
+<tr><td class="mono">PIO used</td><td>belegte/freie PIO-State-Machines + Instruktions-Slots</td></tr>
 </table>
+<div class="note">Die drei USB-CDCs sind einzeln abschaltbar: <code>cli_enable</code>,
+<code>gdb_enable</code>, <code>serial_enable</code> in der CONFIG.INI (Default <b>on</b>).
+Eine deaktivierte CDC verschwindet komplett vom USB (ein COM-Port weniger); das
+MSC-Laufwerk bleibt immer aktiv. Aenderung wirkt erst nach einem <b>Reset</b>.</div>
 <div class="note">Laeuft der Gast und die Zaehler steigen bei erneutem <code>stats</code>
 nicht mehr, dreht er meist eine Warteschleife (z.&nbsp;B. KNX-Bus-Idle) &ndash; das ist normal.</div>
 

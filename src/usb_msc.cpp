@@ -358,6 +358,15 @@ void parse_config(const char* buf, uint32_t len) {
                                   std::strcmp(eq, "1")  == 0);
         } else if (std::strcmp(line, "freq_hz") == 0) {
             config::set_target_frequency_hz(static_cast<uint32_t>(std::atol(eq)));
+        } else if (std::strcmp(line, "cli_enable") == 0) {
+            config::set_cli_enabled(std::strcmp(eq, "on") == 0 ||
+                                    std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "gdb_enable") == 0) {
+            config::set_gdb_enabled(std::strcmp(eq, "on") == 0 ||
+                                    std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "serial_enable") == 0) {
+            config::set_serial_cdc_enabled(std::strcmp(eq, "on") == 0 ||
+                                           std::strcmp(eq, "1")  == 0);
         } else if (std::strcmp(line, "uart_bridge_en") == 0) {
             config::set_uart_bridge_enabled(std::strcmp(eq, "on") == 0 ||
                                             std::strcmp(eq, "1")  == 0);
@@ -538,6 +547,18 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     A("# Laufwerks uebernommen. Werte: on/off oder Zahl (dez/0x-hex).\n");
     A("# ================================================================\n\n");
 
+    A("# --- USB-Schnittstellen (Aenderung wirkt erst nach RESET!) ------\n");
+    A("# Jede aktive CDC erscheint als eigener COM-Port am Host. off = die CDC\n");
+    A("# faellt komplett aus dem USB-Deskriptor (ein COM-Port weniger).\n");
+    A("# cli_enable:    Kommandozeile (CLI/Konsole) auf eigener USB-CDC.\n");
+    A("cli_enable=%s\n", config::cli_enabled() ? "on" : "off");
+    A("# gdb_enable:    GDB-Remote-Serial-Protokoll (arm-none-eabi-gdb).\n");
+    A("gdb_enable=%s\n", config::gdb_enabled() ? "on" : "off");
+    A("# serial_enable: Serial-Adapter-CDC (uart_bridge bzw. uart0_cdc).\n");
+    A("serial_enable=%s\n", config::serial_cdc_enabled() ? "on" : "off");
+    A("# Hinweis: Das USB-MSC-Laufwerk (diese CONFIG.INI) bleibt IMMER aktiv\n");
+    A("#          (Wiederherstellungs-Pfad, falls alle CDCs deaktiviert sind).\n\n");
+
     A("# --- Allgemein --------------------------------------------------\n");
     A("# autostart: nach Reset automatisch die geladene Firmware starten.\n");
     A("autostart=%s\n", config::autostart() ? "on" : "off");
@@ -573,8 +594,8 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     A("autodesc=%s\n\n", config::autodesc() ? "on" : "off");
 
     A("# --- Serielle Schnittstellen -----------------------------------\n");
-    A("# uart_bridge: eigenstaendige USB-Serial-Bruecke auf CDC#2 (PIO, JEDER GPIO).\n");
-    A("# uart_bridge_en/tx/rx: CDC#2 <-> PIO-UART-Pins (NICHT der Gast-UART0!).\n");
+    A("# uart_bridge: eigenstaendige USB-Serial-Bruecke auf der Serial-CDC (PIO, JEDER GPIO).\n");
+    A("# uart_bridge_en/tx/rx: Serial-CDC <-> PIO-UART-Pins (NICHT der Gast-UART0!).\n");
     if (config::uart_bridge_enabled()) {
         A("uart_bridge_en=on\n");
         A("uart_bridge_tx=%d\n", config::uart_bridge_tx_pin());
@@ -582,8 +603,8 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     } else {
         A("#uart_bridge_en=on\n#uart_bridge_tx=4\n#uart_bridge_rx=5\n");
     }
-    A("# uart0_cdc: LPC-UART0 des Gasts virtuell direkt an CDC#2 (kein Draht/Pin).\n");
-    A("# Schliesst uart_bridge auf CDC#2 aus. Ideal fuer printf/Serial des Gasts.\n");
+    A("# uart0_cdc: LPC-UART0 des Gasts virtuell direkt an die Serial-CDC (kein Draht/Pin).\n");
+    A("# Schliesst uart_bridge auf der Serial-CDC aus. Ideal fuer printf/Serial des Gasts.\n");
     A("uart0_cdc=%s\n", config::uart0_cdc_enabled() ? "on" : "off");
     A("# uart0_tx/uart0_rx: LPC-UART0 auf echte RP-UART-Pads (Hardwareentwurf).\n");
     A("# uart0 TX GP0/12/16 RX GP1/13/17 | uart1 TX GP4/8/20/24 RX GP5/9/21/25. -1=aus.\n");
@@ -662,8 +683,9 @@ void build_info_files() {
                    reinterpret_cast<const uint8_t*>(HELP_HTML),
                    HELP_HTML_LEN);
     // Reichlich bemessen: die generierte CONFIG.INI (Kommentare + alle mapped
-    // Pins) liegt bei ~3.7 KB; 6 KiB laesst Raum fuer volle Pinmaps/Bridges.
-    static char cfg[6144];
+    // Pins + USB-Schnittstellen) liegt bei ~4.5 KB; 8 KiB laesst Raum fuer volle
+    // Pinmaps/Bridges (deckungsgleich mit den 8192-Lesepuffern in parse/mark).
+    static char cfg[8192];
     uint32_t len = 0;
     build_config_ini(cfg, sizeof cfg, len);
     fat_write_file("CONFIG.INI", reinterpret_cast<const uint8_t*>(cfg), len);
@@ -822,6 +844,7 @@ void on_volume_ready() {
     // andere *.HEX-Datei (Originalname zulaessig).
     const bool hex_needs_flash =
         have_hex && (hex_changed || (g_erase_request && !g_have_hex_hash));
+    bool hex_flashed = false;
     if (hex_needs_flash) {
         // Stream-Parser mit Writer auf storage::firmware_write.
         struct Ctx {
@@ -857,9 +880,28 @@ void on_volume_ready() {
             g_boot_pending.store(true);   // nur bei geaenderter HEX -> Neustart
             g_last_hex_hash = hex_hash;
             g_have_hex_hash = true;
+            hex_flashed = true;           // -> Laufwerk ohne HEX neu aufbauen
             std::printf("[MSC] %s %lu B → flash\n", hex_name,
                         static_cast<unsigned long>(ctx.total));
         }
+    }
+
+    // Wie beim RP2350-Bootloader (UF2): nach dem Flashen die erkannte HEX-Datei
+    // vom Laufwerk entfernen und das Medium neu einhaengen. CONFIG.INI wurde
+    // oben bereits verarbeitet; build_info_files() schreibt nur HELP.HTM +
+    // CONFIG.INI + DEBUG.TXT (KEINE HEX) -> die HEX verschwindet, der Host sieht
+    // ein frisches Volume. Der eigentliche Gast-(Neu)start passiert danach ueber
+    // g_boot_pending im Hauptloop.
+    if (hex_flashed) {
+        format_blank();
+        build_info_files();
+        g_dirty.store(false);
+        g_volume_processed.store(true);
+        mark_config_processed();
+        g_last_volume_hash = volume_hash();
+        g_have_volume_hash = true;
+        trigger_media_change();
+        return;
     }
 
     // Verarbeiteten Volume-Zustand merken -> inhaltlich identische Re-Trigger

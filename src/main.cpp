@@ -30,18 +30,27 @@ int main() {
     // hängt (Heartbeat = bereit). Siehe led.cpp für Statemachine.
     led::init();
     stdio_init_all();
+
+    // WICHTIG: Storage + Config VOR usb_stdio_init(), denn der USB-Deskriptor
+    // wird beim tusb_init() aus der Config gebaut (welche CDCs — CLI/GDB/Serial —
+    // ueberhaupt am USB erscheinen). Aendert man das cli/gdb/serial_enable in der
+    // CONFIG.INI, greift es erst nach dem naechsten Reset (Descriptor ist statisch,
+    // solange USB laeuft).
+    storage::init();
+    config::load();
     usb_stdio_init();
 
     // Bis zu 6 s auf USB-Host warten, damit erste Konsolenausgaben sichtbar sind.
-    for (int i = 0; i < 60 && !usb_stdio_connected(); ++i) {
-        usb_stdio_task();
-        sleep_ms(100);
-        led::poll();
+    // Ist die CLI-CDC deaktiviert, gibt es keinen stdio-Port -> nicht warten.
+    if (config::cli_enabled()) {
+        for (int i = 0; i < 60 && !usb_stdio_connected(); ++i) {
+            usb_stdio_task();
+            sleep_ms(100);
+            led::poll();
+        }
     }
 
     setup_fault_handlers();
-    storage::init();
-    config::load();
     debug_bridge::init();
     {
         // Persistenz-Diagnose: zeigt, ob eine gueltige Config aus dem Flash

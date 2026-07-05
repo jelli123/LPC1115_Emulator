@@ -8,36 +8,42 @@
 #include "tusb.h"
 #include "pico/stdlib.h"
 #include "pico/stdio/driver.h"
+#include "usb_descriptors.h"
 
 #include <cstring>
 
 extern "C" {
 
-// stdio → CDC#0 OUT
+// CDC-Instanz der CLI (dynamisch; -1 wenn CLI per Config deaktiviert).
+static inline int cli_cdc() { return usb_desc_cdc_cli(); }
+
+// stdio -> CLI-CDC OUT
 static void stdio_cdc_out_chars(const char* buf, int length) {
-    if (!tud_cdc_n_connected(0)) return;
+    int itf = cli_cdc();
+    if (itf < 0 || !tud_cdc_n_connected((uint8_t)itf)) return;
     int written = 0;
     while (written < length) {
-        uint32_t avail = tud_cdc_n_write_available(0);
+        uint32_t avail = tud_cdc_n_write_available((uint8_t)itf);
         if (avail == 0) {
             tud_task();
-            tud_cdc_n_write_flush(0);
+            tud_cdc_n_write_flush((uint8_t)itf);
             sleep_us(100);
             continue;
         }
         uint32_t chunk = (uint32_t)(length - written);
         if (chunk > avail) chunk = avail;
-        tud_cdc_n_write(0, buf + written, chunk);
+        tud_cdc_n_write((uint8_t)itf, buf + written, chunk);
         written += (int)chunk;
     }
-    tud_cdc_n_write_flush(0);
+    tud_cdc_n_write_flush((uint8_t)itf);
 }
 
-// stdio ← CDC#0 IN  (non-blocking; returns PICO_ERROR_NO_DATA on empty)
+// stdio <- CLI-CDC IN  (non-blocking; returns PICO_ERROR_NO_DATA on empty)
 static int stdio_cdc_in_chars(char* buf, int length) {
-    if (!tud_cdc_n_connected(0)) return PICO_ERROR_NO_DATA;
-    if (!tud_cdc_n_available(0))  return PICO_ERROR_NO_DATA;
-    uint32_t r = tud_cdc_n_read(0, buf, (uint32_t)length);
+    int itf = cli_cdc();
+    if (itf < 0 || !tud_cdc_n_connected((uint8_t)itf)) return PICO_ERROR_NO_DATA;
+    if (!tud_cdc_n_available((uint8_t)itf))  return PICO_ERROR_NO_DATA;
+    uint32_t r = tud_cdc_n_read((uint8_t)itf, buf, (uint32_t)length);
     return r ? (int)r : PICO_ERROR_NO_DATA;
 }
 
@@ -58,8 +64,11 @@ static stdio_driver_t s_stdio_cdc = {
 // IRQ-safe; auf RP2350 führt das zu HardFault → Boot-ROM → BOOTSEL).
 
 void usb_stdio_init(void) {
+    usb_desc_build();        // Deskriptor aus config bauen (VOR tusb_init).
     tusb_init();
-    stdio_set_driver_enabled(&s_stdio_cdc, true);
+    // stdio nur einhaengen, wenn die CLI-CDC ueberhaupt existiert.
+    if (usb_desc_cdc_cli() >= 0)
+        stdio_set_driver_enabled(&s_stdio_cdc, true);
 }
 
 void usb_stdio_task(void) {
@@ -67,7 +76,8 @@ void usb_stdio_task(void) {
 }
 
 bool usb_stdio_connected(void) {
-    return tud_cdc_n_connected(0);
+    int itf = usb_desc_cdc_cli();
+    return itf >= 0 && tud_cdc_n_connected((uint8_t)itf);
 }
 
 } // extern "C"

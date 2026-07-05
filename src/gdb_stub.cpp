@@ -10,13 +10,15 @@
 #include "pico/multicore.h"
 #include "pico/time.h"
 #include "RP2350.h"
+#include "usb_descriptors.h"
 
 // GDB-Stub für 17 Register: r0..r12, sp, lr, pc, xpsr.
 
 namespace gdb_stub {
 namespace {
 
-constexpr uint8_t  CDC_GDB_ITF      = 1;     // CDC #0 = stdio, CDC #1 = GDB
+// CDC-Instanz des GDB-Ports (dynamisch; -1 wenn per Config deaktiviert).
+inline int gdb_cdc() { return usb_desc_cdc_gdb(); }
 constexpr uint32_t MAX_BP           = 16;
 constexpr uint32_t MAX_PKT          = 1024;
 
@@ -37,14 +39,15 @@ struct BP {
 };
 BP g_bp[MAX_BP]{};
 
-inline bool cdc_avail() { return tud_cdc_n_connected(CDC_GDB_ITF); }
+inline bool cdc_avail() { int i = gdb_cdc(); return i >= 0 && tud_cdc_n_connected((uint8_t)i); }
 
 void cdc_write(const char* s, size_t n) {
     if (!cdc_avail()) return;
+    uint8_t itf = (uint8_t)gdb_cdc();
     while (n) {
-        size_t w = tud_cdc_n_write(CDC_GDB_ITF, s, static_cast<uint32_t>(n));
+        size_t w = tud_cdc_n_write(itf, s, static_cast<uint32_t>(n));
         s += w; n -= w;
-        tud_cdc_n_write_flush(CDC_GDB_ITF);
+        tud_cdc_n_write_flush(itf);
         tud_task();
     }
 }
@@ -326,9 +329,10 @@ void poll() {
     tud_task();
     if (!g_active.load()) return;
     if (!cdc_avail())     return;
-    while (tud_cdc_n_available(CDC_GDB_ITF)) {
+    uint8_t itf = (uint8_t)gdb_cdc();
+    while (tud_cdc_n_available(itf)) {
         char c;
-        if (tud_cdc_n_read(CDC_GDB_ITF, &c, 1) == 1) rx_byte(c);
+        if (tud_cdc_n_read(itf, &c, 1) == 1) rx_byte(c);
     }
 }
 
@@ -363,9 +367,14 @@ void on_breakpoint(uint32_t* exc_frame, uint32_t* r4_r11) {
     g_frame = nullptr; g_r4_r11 = nullptr;
 }
 
-void start() { g_active.store(true);  std::printf("[GDB] aktiviert (CDC #%u)\n", CDC_GDB_ITF); }
+void start() {
+    int itf = gdb_cdc();
+    g_active.store(true);
+    if (itf >= 0) std::printf("[GDB] aktiviert (CDC #%d)\n", itf);
+    else          std::printf("[GDB] aktiviert, aber GDB-CDC ist per Config deaktiviert\n");
+}
 void stop()  { g_active.store(false); std::printf("[GDB] deaktiviert\n"); }
 bool active() { return g_active.load(); }
-uint16_t port_index() { return CDC_GDB_ITF; }
+uint16_t port_index() { int i = gdb_cdc(); return i >= 0 ? (uint16_t)i : 0xFFFFu; }
 
 } // namespace gdb_stub

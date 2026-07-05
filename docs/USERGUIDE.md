@@ -9,9 +9,10 @@ Die Implementierungs-Interna stehen in [TECHNICAL.md](TECHNICAL.md).
 
 | Funktion                 | RP2350-Pins (Default, änderbar)             |
 |--------------------------|----------------------------------------------|
-| USB CDC#0 (CLI)          | USB-Port (TinyUSB)                           |
-| USB CDC#1 (GDB-RSP)      | USB-Port (TinyUSB, zweite CDC-Schnittstelle) |
-| USB CDC#2 (UART-Bridge)  | USB-Port (TinyUSB, dritte CDC-Schnittstelle) |
+| USB CDC „CLI"            | USB-Port (TinyUSB) – abschaltbar (`cli_enable`) |
+| USB CDC „GDB-RSP"        | USB-Port (TinyUSB) – abschaltbar (`gdb_enable`) |
+| USB CDC „Serial-Adapter" | USB-Port (TinyUSB) – abschaltbar (`serial_enable`) |
+| USB-MSC-Laufwerk         | USB-Port (TinyUSB) – **immer aktiv** (Recovery) |
 | LPC-GPIO0 → RP-GPIO      | konfigurierbar, siehe Abschnitt 5            |
 | LPC-UART0 (TX/RX)        | RP2350 `uart0` (Default GP0/GP1)             |
 | UART-Bridge TX/RX        | frei wählbare GPIOs (PIO-basiert)            |
@@ -34,13 +35,20 @@ Eine Pico-2- oder Pico-2-W-Platine genügt.
    Ergebnis: `build/emulator.uf2`.
 
 2. RP2350 in BOOTSEL halten, einstecken, UF2 kopieren.
-3. Drei serielle Ports erscheinen:
-   * **CDC#0** – CLI (z. B. `COM7` / `/dev/ttyACM0`).
-   * **CDC#1** – GDB-Remote-Stub (z. B. `COM8` / `/dev/ttyACM1`).
-   * **CDC#2** – UART-Bridge (z. B. `COM9` / `/dev/ttyACM2`).
+3. Bis zu **drei serielle Ports** erscheinen (je nach `*_enable` in der
+   CONFIG.INI, Default alle an — deaktivierte CDCs verschwinden komplett vom USB):
+   * **CLI** – Kommandozeile (z. B. `COM7` / `/dev/ttyACM0`).
+   * **GDB-RSP** – GDB-Remote-Stub.
+   * **Serial-Adapter** – USB-Serial-Bridge bzw. virtueller LPC-UART0.
+
+   Die Reihenfolge der COM-Ports folgt genau dieser Liste; fehlt eine CDC,
+   rücken die nachfolgenden auf. `status` zeigt die aktuelle Zuordnung an
+   (`USB-CDC: CDC#0=CLI …`). Die Auswahl wirkt erst nach einem **Reset**
+   (der USB-Deskriptor wird beim Boot aus der Config gebaut).
 4. Außerdem erscheint ein **Wechseldatenträger** namens `LPC1115EMU`
-   (FAT12, 256 KiB).
-5. Mit Terminal an CDC#0 verbinden (115200 8N1, Line-Ending CRLF).
+   (FAT12, 256 KiB). Dieses MSC-Laufwerk ist **immer** vorhanden – auch wenn
+   alle CDCs deaktiviert sind – und dient als Wiederherstellungs-Pfad.
+5. Mit Terminal an die **CLI-CDC** verbinden (115200 8N1, Line-Ending CRLF).
 
 Es erscheint:
 
@@ -74,9 +82,14 @@ ob die Firmware bereit ist.
 
 ---
 
-## 3. CLI-Übersicht (CDC#0)
+## 3. CLI-Übersicht (CLI-CDC)
 
 Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getrennt.
+
+> **CLI abschaltbar:** Mit `cli_enable=off` in der CONFIG.INI entfällt die
+> CLI-CDC komplett (ein COM-Port weniger). Der Emulator läuft dann vollständig
+> autonom (Autostart, MSC, GDB, Serial-Adapter bleiben nutzbar); Bedienung/
+> Diagnose erfolgt über das USB-Laufwerk (CONFIG.INI, FAULT.TXT, DEBUG.TXT).
 
 ### Allgemein
 
@@ -91,7 +104,7 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 
 | Befehl              | Wirkung                                              |
 |---------------------|------------------------------------------------------|
-| `upload`            | wartet auf Intel-HEX-Stream auf CDC#0 (**additiv**)  |
+| `upload`            | wartet auf Intel-HEX-Stream auf der CLI-CDC (**additiv**) |
 | `xmodem`            | Intel-HEX per XMODEM-CRC/1K empfangen (robust)       |
 | `info`              | zeigt Reset-Vector, Stack, Größe, CRC                |
 | `erase`             | Firmware-Slot komplett leeren                        |
@@ -116,7 +129,7 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 
 | Befehl                        | Wirkung                                          |
 |-------------------------------|--------------------------------------------------|
-| `gdb on/off`                  | RSP-Server auf CDC#1 ein/aus                     |
+| `gdb on/off`                  | RSP-Server auf der GDB-CDC ein/aus               |
 | `bp <addr>`                   | SW-Breakpoint setzen (max. 8)                    |
 | `bp clr <addr>`               | Breakpoint löschen                               |
 | `regs`                        | r0-r15, xPSR, MSP/PSP, CONTROL                   |
@@ -125,13 +138,36 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 | `swd stop`                    | SWD-Target deaktivieren                          |
 | `pio capture <pin> <count>`   | Edge-Capture-Trace (Mikrosekunden)               |
 
-### UART-Bridge (CDC#2)
+### Serielle Schnittstellen
+
+Der Emulator trennt sauber zwischen **zwei unabhängigen** Dingen:
+
+* **`cdc …`** – ein eigenständiger **USB↔UART-Adapter** (PIO-basiert, auf
+  beliebigen GPIOs). Hat mit dem Gast **nichts** zu tun; verwendet die
+  Serial-Adapter-CDC.
+* **`uart …`** – betrifft **nur den LPC-UART0 des Gasts**: entweder auf echte
+  RP2350-UART-Pads routen (`uart pins`) oder virtuell direkt an die
+  Serial-Adapter-CDC koppeln (`uart cdc on`).
 
 | Befehl                        | Wirkung                                          |
 |-------------------------------|--------------------------------------------------|
-| `uart start <tx> <rx>`        | PIO-UART-Bridge starten, Pins zuweisen           |
-| `uart stop`                   | Bridge stoppen                                   |
-| `uart status`                 | TX/RX-Pins, Baudrate, Status anzeigen            |
+| `cdc start <tx> <rx>`         | USB-Serial-Konverter starten (Serial-CDC ↔ PIO-UART) |
+| `cdc stop`                    | Konverter stoppen                                |
+| `cdc status`                  | Pins, Baudrate, Datenfluss-Zähler                |
+| `uart pins <tx> <rx>` \| `off` | LPC-UART0 auf RP2350-UART-Pads routen (Hardware) |
+| `uart cdc on` \| `off`         | LPC-UART0 virtuell an die Serial-CDC koppeln     |
+| `uart status`                 | LPC-UART0-Routing (HW-Pads + virtuell) anzeigen  |
+
+> Die frühere Kommandogruppe `uart start/stop` heißt jetzt `cdc start/stop`
+> und wurde ersatzlos aus dem `uart`-Namespace entfernt.
+>
+> **UART0-Pad-Zuordnung (F2-Primärfunktion):** `uart0` TX GP0/12/16, RX
+> GP1/13/17 · `uart1` TX GP4/8/20/24, RX GP5/9/21/25. TX und RX müssen zum
+> selben RP-Peripheral gehören. `uart cdc on` schließt die `cdc`-Bridge auf
+> der Serial-CDC aus (beide können sie nicht gleichzeitig nutzen).
+>
+> Ist die Serial-CDC per `serial_enable=off` deaktiviert, sind `cdc …` und
+> `uart cdc on` wirkungslos (kein USB-Endpunkt).
 
 ---
 
@@ -142,6 +178,10 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 ```
 State=Running PC=0x20002fdd mmio-traps=1031 MMIO R=268 W=320  GPIO=4  PLL-cfg=1  NVIC-W=8
 CPU-target=48000000 Hz  GDB=off
+USB-CDC: CDC#0=CLI CDC#1=GDB CDC#2=Serial-Adapter
+SysTick: trapR=12 trapW=3 CSR=0x7 RVR=0xbb7f CVR=0x51a2 ticks=48213
+Config: Flash=4096KiB seq=5 keys=18 (persistent)
+PIO used: SM 2, Instr 9 | free: SM 10, Instr 87
 ```
 
 | Feld          | Bedeutung                                                                 |
@@ -155,6 +195,10 @@ CPU-target=48000000 Hz  GDB=off
 | `NVIC-W`      | Schreibzugriffe auf den Schatten-NVIC (`ISER`/`ICER`/`ISPR`/`ICPR`/`IPR`) |
 | `CPU-target`  | übernommene LPC-Soll-Frequenz (Zeitbasis der Timer/UART-Baud). Der **reale** RP2350-Takt bleibt bei 150 MHz. |
 | `GDB`         | GDB-Stub aktiv (`on`/`off`)                                               |
+| `USB-CDC`     | dynamische CDC-Zuordnung (Rolle je COM-Port); `\| aus:` listet per Config deaktivierte Rollen |
+| `SysTick`     | Trap-Zähler + aktuelle SysTick-Register des Gasts (Timer-Diagnose)        |
+| `Config`      | Flash-Größe, Persistenz-Sequenz/Key-Anzahl, ob aus Flash geladen         |
+| `PIO used`    | belegte/freie PIO-State-Machines + Instruktions-Slots (CDC-Bridge, Timer-Capture/Match) |
 
 > **Eingefrorene Zähler sind normal:** Bleiben `mmio-traps` bei erneutem
 > `stats` konstant, dreht der Gast meist eine Warteschleife (z. B. KNX-Bus-
@@ -239,6 +283,9 @@ vorgenommene Änderungen bleiben also erhalten.
 4. **Volume auswerfen** ("sicheres Entfernen" / "Eject"). Beim Eject:
    * `CONFIG.INI` wird geparst (siehe unten),
    * `BOOT.HEX` wird in den Firmware-Slot geschrieben,
+   * die erkannte HEX-Datei wird anschließend **automatisch vom Laufwerk
+     entfernt** und das Medium neu eingehängt (wie beim RP2350-UF2-Bootloader);
+     alle anderen Dateien (CONFIG.INI, HELP.HTM, DEBUG.TXT) bleiben,
    * `autostart on` ist Default → Guest läuft sofort weiter
      (kein CLI-Eingriff nötig).
 
@@ -246,6 +293,13 @@ vorgenommene Änderungen bleiben also erhalten.
 
 ```
 # Kommentare beginnen mit # oder ;
+
+# USB-Schnittstellen (wirken erst nach RESET!). off = die CDC fällt komplett
+# aus dem USB-Deskriptor -> ein COM-Port weniger. MSC-Laufwerk bleibt immer aktiv.
+cli_enable=on           # Kommandozeile (CLI/Konsole) auf eigener USB-CDC
+gdb_enable=on           # GDB-Remote-Serial-Protokoll (arm-none-eabi-gdb)
+serial_enable=on        # Serial-Adapter-CDC (uart_bridge bzw. uart0_cdc)
+
 autostart=on            # nach Reset automatisch starten
 freq_hz=48000000        # Wunsch-Coreclock (PLL-Soll)
 
@@ -255,10 +309,15 @@ pin.1_8=17              # KNX-RX -> uart0-RX
 pin.1_9=16              # KNX-TX -> uart0-TX
 pin.2_0=25              # Status-LED
 
-# UART-Bridge (CDC#2 ↔ PIO-UART)
+# Eigenständiger USB-Serial-Konverter (Serial-CDC <-> PIO-UART, beliebige GPIOs)
 uart_bridge_en=1        # Bridge beim Boot starten
 uart_bridge_tx=4        # TX-Pin (RP2350 → extern)
 uart_bridge_rx=5        # RX-Pin (extern → RP2350)
+
+# LPC-UART0 des Gasts (getrennt vom Konverter oben)
+uart0_cdc=off           # on = LPC-UART0 virtuell direkt an die Serial-CDC
+#uart0_tx=0             # LPC-UART0 auf echte RP-UART-Pads (Hardwareentwurf)
+#uart0_rx=1
 
 # I²C-Bridge (LPC-I²C-Master → echte RP2350-Hardware)
 i2c_bridge_en=1         # Bridge aktivieren
@@ -333,7 +392,7 @@ Sender-Seite:
 
 Auch der XMODEM-Upload ist **additiv** — für Vollersatz vorher `erase`.
 
-### Variante C: GDB-Load über CDC#1
+### Variante C: GDB-Load über die GDB-CDC
 
 ```
 arm-none-eabi-gdb fw.elf
@@ -341,6 +400,10 @@ arm-none-eabi-gdb fw.elf
 (gdb) load
 (gdb) continue
 ```
+
+> Der Port `/dev/ttyACM1` ist nur ein Beispiel – die genaue Nummer hängt davon
+> ab, welche CDCs aktiv sind (`gdb_enable` muss `on` sein). `status` zeigt die
+> Zuordnung; unter Windows den zur „LPC-Emu GDB"-CDC gehörenden COM-Port wählen.
 
 Die geladene Firmware landet sowohl im RAM-View des Emulators als auch im
 Wear-Leveling-Slot des QSPI-Flash (überlebt Power-Cycle wenn `autostart on`).
@@ -454,7 +517,7 @@ Adressformat: `port_pin` (z. B. `0_3`, `2_11`).
 
 ## 6. Debugging
 
-### 6.1 Über USB-CDC#1 (eingebauter GDB-Stub, einfach)
+### 6.1 Über die USB-GDB-CDC (eingebauter GDB-Stub, einfach)
 
 ```
 arm-none-eabi-gdb 16in_bim112.elf
@@ -525,13 +588,19 @@ zwei PHYs:
 
 ---
 
-## 7a. UART-Bridge (CDC#2 ↔ PIO-UART)
+## 7a. USB-Serial-Konverter (`cdc`, Serial-CDC ↔ PIO-UART)
 
-Der Emulator stellt eine **dritte serielle USB-Schnittstelle** (CDC#2)
-bereit, die transparent auf zwei frei wählbare RP2350-GPIOs gemappt wird.
-Die Datenübertragung läuft über **PIO-basiertes UART** — die Hardware-
-UARTs des RP2350 werden **nicht** belegt und stehen dem Emulator (z. B.
-für die LPC1115-UART0-Emulation) weiterhin zur Verfügung.
+Der Emulator stellt einen eigenständigen **USB↔UART-Adapter** bereit, der
+transparent auf zwei frei wählbare RP2350-GPIOs gemappt wird. Er nutzt die
+**Serial-Adapter-CDC** (nur vorhanden, wenn `serial_enable=on`). Die
+Datenübertragung läuft über **PIO-basiertes UART** — die Hardware-UARTs des
+RP2350 werden **nicht** belegt und stehen dem Emulator (z. B. für die
+LPC1115-UART0-Emulation) weiterhin zur Verfügung.
+
+> **`cdc` vs. `uart`:** `cdc …` ist dieser gast-**unabhängige** Adapter.
+> Der **LPC-UART0 des Gasts** wird stattdessen mit `uart pins` (echte Pads)
+> bzw. `uart cdc on` (virtuell an dieselbe Serial-CDC) bedient — siehe
+> Abschnitt 3 und 7b.
 
 ### Anwendungsfälle
 
@@ -544,8 +613,8 @@ für die LPC1115-UART0-Emulation) weiterhin zur Verfügung.
 **Variante A — über CLI:**
 
 ```
-emu> uart start 4 5            # TX=GP4, RX=GP5
-[uart-bridge] TX=GP4 RX=GP5 baud=115200
+emu> cdc start 4 5            # TX=GP4, RX=GP5
+ok
 ```
 
 Zum Persistieren (startet dann automatisch beim nächsten Boot):
@@ -569,10 +638,10 @@ uart_bridge_rx=5
 
 Die Baudrate wird **vom Host-PC** über den Standard-CDC-Mechanismus
 gesetzt (`SET_LINE_CODING`). Jedes Terminal-Programm, das die Baudrate
-konfigurieren kann, funktioniert:
+konfigurieren kann, funktioniert (Port = die Serial-Adapter-CDC):
 
 ```bash
-# Linux
+# Linux (Beispiel-Port; genaue Nummer je nach aktiven CDCs)
 stty -F /dev/ttyACM2 19200
 picocom -b 19200 /dev/ttyACM2
 
@@ -586,16 +655,53 @@ nicht nötig.
 ### Status abfragen
 
 ```
-emu> uart status
-uart-bridge=active TX=GP4 RX=GP5 baud=19200
+emu> cdc status
+cdc-bridge=active TX=GP4 RX=GP5 baud=19200
+  Fluss: CDC-RX=0 -> PIO-TX=0 -> PIO-RX=0 -> CDC-TX=0
 ```
 
 ### Stoppen
 
 ```
-emu> uart stop
-[uart-bridge] stopped
+emu> cdc stop
 ```
+
+---
+
+## 7b. LPC-UART0 des Gasts (`uart pins` / `uart cdc`)
+
+Der **LPC-UART0 des emulierten Gasts** kann auf zwei Wegen nach außen geführt
+werden (unabhängig vom `cdc`-Adapter oben):
+
+* **Auf echte RP2350-UART-Pads** (Hardwareentwurf, echte TX/RX-Leitungen):
+
+  ```
+  emu> uart pins 0 1          # TX=GP0, RX=GP1 (uart0)
+  emu> uart pins off          # Routing entfernen
+  ```
+
+  Zulässige Pads (F2-Primärfunktion): `uart0` TX GP0/12/16, RX GP1/13/17 ·
+  `uart1` TX GP4/8/20/24, RX GP5/9/21/25. TX und RX müssen zum selben
+  RP-Peripheral gehören.
+
+* **Virtuell direkt an die Serial-Adapter-CDC** (kein Draht, ideal für
+  `printf`/Serial des Gasts am PC):
+
+  ```
+  emu> uart cdc on            # LPC-UART0 <-> Serial-CDC
+  emu> uart cdc off
+  ```
+
+  `uart cdc on` schließt den `cdc`-Adapter auf der Serial-CDC aus (beide
+  können sie nicht gleichzeitig nutzen). Ist `serial_enable=off`, ist die
+  Kopplung wirkungslos (kein USB-Endpunkt).
+
+```
+emu> uart status
+LPC-UART0: HW-Pads TX=GP0 RX=GP1 | Serial-CDC-virtuell=off
+```
+
+Entsprechende CONFIG.INI-Schlüssel: `uart0_cdc`, `uart0_tx`, `uart0_rx`.
 
 ---
 
@@ -636,7 +742,7 @@ upload          # HEX laden (additiv)
 xmodem          # HEX per XMODEM-CRC/1K laden (robust)
 erase           # Firmware-Slot komplett löschen
 run / halt      # Guest steuern
-gdb on          # GDB-Stub auf CDC#1
+gdb on          # GDB-Stub auf der GDB-CDC
 swd start 14 15 # SWD-Target auf GP14(DIO)/GP15(CLK)
 cfg save        # Persistieren
 stats           # Diagnose

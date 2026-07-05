@@ -199,7 +199,7 @@ real-zeit-skalierten CT16/CT32-Capture/Match-Modelle und bleibt korrekt.
 
 ## 8. GDB-Remote-Stub
 
-Auf CDC#1, RSP-Subset:
+Auf der GDB-CDC (Instanz-Index dynamisch, siehe §16a), RSP-Subset:
 
 * `g` / `G` (Register), `m` / `M` (Memory)
 * `c` / `s` (Continue / Step), `?` (Stop-Reason)
@@ -246,9 +246,11 @@ zurück. So wirkt der externe Debugger zwischen zwei Guest-Instruktionen.
 ```
 main.cpp (Core 0, privilegiert)
   +-- pico_stdio_init
-  +-- tinyusb init  (CDC#0 + CDC#1)
-  +-- storage::init
+  +-- storage::init            # VOR USB: Config bestimmt den Deskriptor
   +-- config::load
+  +-- usb_stdio_init
+  |     +-- usb_desc_build     # Konfig-Deskriptor dynamisch aus config bauen
+  |     +-- tinyusb init       # aktive CDCs (CLI/GDB/Serial) + MSC (immer)
   +-- mmu::init           (MPU 8 Regionen)
   +-- vnvic::init
   +-- peripherals::init
@@ -258,7 +260,7 @@ main.cpp (Core 0, privilegiert)
   +-- swd_target::init
   +-- gdb_stub::init
   +-- multicore_launch_core1(emulator::core1_entry)
-  +-- cli::run            (forever)
+  +-- cli::run            (forever; Eingabe/Prompt nur bei cli_enable=on)
 
 emulator::core1_entry
   +-- mmu::drop_to_unprivileged   (MSP -> PSP, CONTROL.nPRIV=1)
@@ -282,7 +284,7 @@ src/
   iap.cpp         iap.h           # IAP-ROM-Stub-Dispatcher
   target_halt.cpp                 # Halt-Bridge für SWD/GDB
   swd_target.cpp                  # ADIv5-Target
-  gdb_stub.cpp                    # RSP-Server auf CDC#1
+  gdb_stub.cpp                    # RSP-Server auf der GDB-CDC
   pio_glue.cpp                    # Edge-Capture-PIO
   hex_parser.cpp  hex_patcher.cpp # Intel-HEX + Relokation
   xmodem.cpp                      # XMODEM-CRC/1K-Empfänger (CLI-Upload)
@@ -508,9 +510,14 @@ Diskette über TinyUSB-MSC bereit (LUN 0, 256 KiB). Der Host sieht
 das Volume `LPC1115EMU`. Beim **Eject** (`SCSI START_STOP_UNIT
 load_eject=1, start=0`) parst der Emulator:
 
-* `CONFIG.INI` → `pin.<p>_<n>=<gpio>`, `autostart`, `freq_hz`.
-  Konfig wird in den Storage-Slot persistiert.
-* `BOOT.HEX` → Stream-Parser → Firmware-Slot.
+* `CONFIG.INI` → `pin.<p>_<n>=<gpio>`, `autostart`, `freq_hz`, die
+  USB-Schnittstellen-Schalter `cli_enable`/`gdb_enable`/`serial_enable` (§16a)
+  sowie alle Bridge-Schlüssel. Konfig wird in den Storage-Slot persistiert.
+* `BOOT.HEX` (oder jede `*.HEX`) → Stream-Parser → Firmware-Slot. Nach
+  erfolgreichem Flashen wird die HEX-Datei — wie beim RP2350-UF2-Bootloader —
+  automatisch vom Volume entfernt und ein Medienwechsel ausgelöst
+  (`format_blank` + `build_info_files` ohne HEX + `trigger_media_change`);
+  CONFIG.INI/HELP.HTM/DEBUG.TXT bleiben erhalten.
 
 Ist `autostart=on` aktiv, wird die Firmware **sofort gestartet**.
 Beim nächsten Power-Cycle läuft der Emulator damit autonom — keine
@@ -525,6 +532,45 @@ Weitere CONFIG.INI-Schlüssel (Auszug, Phase 3): `app_start`, `desc_addr`,
 `autodesc` (siehe §18) sowie `flash_erase=on`/`erase=on`, das den
 Firmware-Slot **vor** dem Anwenden einer ggf. mitgelieferten `BOOT.HEX`
 komplett löscht. Ohne diesen Schlüssel wird `BOOT.HEX` additiv gemergt.
+
+---
+
+## 16a. Dynamische USB-Composite-Deskriptoren
+
+[src/usb_descriptors.cpp](../src/usb_descriptors.cpp) baut den
+Konfigurations-Deskriptor **zur Bootzeit** (`usb_desc_build()`, aufgerufen von
+`usb_stdio_init()` **vor** `tusb_init()`). `tusb_config.h` reserviert
+`CFG_TUD_CDC = 3` und `CFG_TUD_MSC = 1`; welche der drei CDCs tatsächlich im
+Deskriptor erscheinen, entscheiden die CONFIG.INI-Schalter (Default alle `on`):
+
+| Schlüssel        | Rolle / TU-Instanz            | CLI-Nutzung                    |
+|------------------|-------------------------------|--------------------------------|
+| `cli_enable`     | CLI / stdio (`usb_stdio.cpp`) | Kommandozeile, `printf`        |
+| `gdb_enable`     | GDB-RSP (`gdb_stub.cpp`)      | `gdb on/off`                   |
+| `serial_enable`  | Serial-Adapter (`uart_bridge.cpp`) | `cdc …`, `uart cdc on`    |
+
+Mechanik:
+
+* Die aktiven CDCs werden in **fester Reihenfolge** CLI → GDB → Serial
+  gezählt und erhalten fortlaufende TinyUSB-Instanz-Indizes (0..n-1). Diese
+  Reihenfolge deckt sich mit der Interface-Reihenfolge im Deskriptor, sodass
+  `tud_cdc_n_*` mit dem berechneten Index den richtigen Endpunkt trifft.
+* Endpoint-Nummern werden über einen laufenden Zähler vergeben (CDC: notif
+  `0x80|n`, out `n`, in `0x80|n`); das **MSC** liegt immer zuletzt und ist
+  **immer** präsent (Recovery-Pfad über CONFIG.INI, selbst wenn alle CDCs aus).
+* Interface- und Endpoint-Blöcke werden mit den TinyUSB-Makros in lokale
+  Puffer erzeugt und in einen statischen Deskriptor-Puffer kopiert;
+  `tud_descriptor_configuration_cb()` liefert diesen zurück.
+* Die Zuordnung wird zentral über `usb_desc_cdc_cli()` / `_gdb()` / `_serial()`
+  abgefragt (Rückgabe: Instanz-Index oder **-1** = deaktiviert). `usb_stdio.cpp`,
+  `gdb_stub.cpp` und `uart_bridge.cpp` nutzen diese Accessoren statt fester
+  Konstanten; bei `-1` werden die zugehörigen Pfade übersprungen.
+
+Weil der Deskriptor statisch ist, solange USB läuft, wirkt eine Änderung der
+`*_enable`-Schalter erst nach einem **Reset**. `cli::run()` läuft bei
+`cli_enable=off` weiter (Housekeeping, GDB/MSC/UART-Poll), überspringt aber
+Prompt und Tastatureingabe. `status` gibt die aktuelle Zuordnung aus
+(`USB-CDC: CDC#0=CLI …`, plus `| aus:` für deaktivierte Rollen).
 
 ---
 

@@ -12,6 +12,13 @@ namespace config {
 // Schlüssel
 inline constexpr const char* KEY_AUTOSTART       = "autostart";        // "0"/"1"
 inline constexpr const char* KEY_TARGET_FREQ_HZ  = "freq_hz";          // dezimal, 1..150_000_000
+// USB-Schnittstellen: einzelne CDC-Ports am USB komplett ein/ausblenden. Bei
+// "off" verschwindet das zugehoerige CDC-Interface aus dem USB-Deskriptor (der
+// Host sieht dann einen COM-Port weniger). MSC (Laufwerk) bleibt IMMER da, damit
+// CONFIG.INI zur Wiederherstellung erreichbar ist. Default alle on.
+inline constexpr const char* KEY_CLI_ENABLE      = "cli_enable";       // "0"/"1" CDC-CLI
+inline constexpr const char* KEY_GDB_ENABLE      = "gdb_enable";       // "0"/"1" CDC-GDB
+inline constexpr const char* KEY_SERIAL_ENABLE   = "serial_enable";    // "0"/"1" CDC-Serial(#2)
 inline constexpr const char* KEY_PIN_PREFIX      = "pin.";             // pin.<lpc>=<rp2350>
 inline constexpr const char* KEY_UART_BRIDGE_EN  = "uart_bridge_en";   // "0"/"1"
 inline constexpr const char* KEY_UART_BRIDGE_TX  = "uart_bridge_tx";   // GPIO-Nummer
@@ -64,6 +71,14 @@ bool save();
 
 bool        autostart();
 void        set_autostart(bool v);
+
+// USB-CDC-Praesenz (wirkt beim Boot: baut den USB-Deskriptor entsprechend).
+bool        cli_enabled();
+void        set_cli_enabled(bool v);
+bool        gdb_enabled();
+void        set_gdb_enabled(bool v);
+bool        serial_cdc_enabled();
+void        set_serial_cdc_enabled(bool v);
 
 uint32_t    target_frequency_hz();
 void        set_target_frequency_hz(uint32_t hz);
