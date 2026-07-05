@@ -43,6 +43,14 @@ constexpr uint32_t PC_SAMPLES = 8;
 std::atomic<uint32_t>        g_pc_samples[PC_SAMPLES]{};
 std::atomic<uint32_t>        g_pc_sample_pos{0};
 
+// SysTick-Shim-Heartbeat (Diagnose). enter wird am SHIM-ANFANG, exit am SHIM-ENDE
+// erhoeht. enter>exit (Differenz waechst) => Shim haengt INNERHALB (Runaway-Loop
+// in poll_timed_sources/ct_advance). enter==exit aber eingefroren => Shim feuert
+// nicht mehr (realer SysTick gestoppt/maskiert). last_us = Zeit des letzten Eintritts.
+std::atomic<uint32_t>        g_shim_enter{0};
+std::atomic<uint32_t>        g_shim_exit{0};
+std::atomic<uint64_t>        g_shim_last_us{0};
+
 // Vom Gast (Core1) angeforderter Soft-Reset (NVIC_SystemReset/WDT). Wird vom
 // Core0-Loop konsumiert, der den eigentlichen Core1-Reset ausfuehrt — ein
 // multicore_reset_core1() VON Core1 aus wuerde sich selbst abschiessen und nie
@@ -163,6 +171,8 @@ void isr_svc() {
 // Exception-Return dieses Shims wird ein evtl. gependeter LPC-IRQ per PendSV
 // (tail-chained) in den Gast injiziert.
 extern "C" void isr_systick_shim() {
+    g_shim_enter.fetch_add(1, std::memory_order_relaxed);
+    g_shim_last_us.store(time_us_64(), std::memory_order_relaxed);
     // PC-Sampler: der unterbrochene Gast lief in Thread-Mode auf PSP; die HW hat
     // dort {r0,r1,r2,r3,r12,lr,pc,xpsr} gestackt -> psp[6] = Gast-PC. Als
     // LPC-Offset (PC - load_base) merken. Nur gueltige Thread-Frames (Gast lief,
@@ -208,6 +218,7 @@ extern "C" void isr_systick_shim() {
 
     // Naechsten Host-Tick am kommenden Deadline neu programmieren (adaptiv).
     peripherals::systick_hw_rearm();
+    g_shim_exit.fetch_add(1, std::memory_order_relaxed);
 }
 
 // Naked Trampolin: wechselt auf PSP/unprivileged Thread Mode und springt mit
@@ -674,6 +685,14 @@ uint32_t pc_samples(uint32_t* out, uint32_t max) {
         out[i] = g_pc_samples[idx].load(std::memory_order_relaxed);
     }
     return n;
+}
+
+void shim_debug(uint32_t& enter, uint32_t& exit, uint32_t& age_ms) {
+    enter = g_shim_enter.load(std::memory_order_relaxed);
+    exit  = g_shim_exit.load(std::memory_order_relaxed);
+    uint64_t last = g_shim_last_us.load(std::memory_order_relaxed);
+    uint64_t now  = time_us_64();
+    age_ms = (last && now > last) ? static_cast<uint32_t>((now - last) / 1000u) : 0u;
 }
 
 uint32_t load_base() {

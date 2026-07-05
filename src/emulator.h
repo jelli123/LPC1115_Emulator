@@ -92,4 +92,9 @@ uint32_t start_count();
 // CPU-Schleife dreht (im .map/.lst der Firmware nachschlagbar).
 uint32_t pc_samples(uint32_t* out, uint32_t max);
 
+// SysTick-Shim-Heartbeat (Diagnose): enter = Aufrufe am Shim-Anfang, exit = am
+// Shim-Ende, age_ms = ms seit letztem Shim-Eintritt. enter>exit => Shim haengt
+// INNERHALB; enter==exit aber age_ms waechst => Shim feuert nicht mehr.
+void shim_debug(uint32_t& enter, uint32_t& exit, uint32_t& age_ms);
+
 } // namespace emulator

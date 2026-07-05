@@ -219,6 +219,16 @@ void cmd_status() {
             std::putchar('\n');
         }
     }
+    {
+        uint32_t sh_enter, sh_exit, sh_age;
+        emulator::shim_debug(sh_enter, sh_exit, sh_age);
+        std::printf("SysTick-Shim: enter=%lu exit=%lu age=%lums%s\n",
+                    static_cast<unsigned long>(sh_enter),
+                    static_cast<unsigned long>(sh_exit),
+                    static_cast<unsigned long>(sh_age),
+                    (sh_enter != sh_exit) ? "  [HAENGT IM SHIM!]"
+                    : (sh_age > 100u)     ? "  [Shim feuert nicht mehr!]" : "");
+    }
     std::printf("MMIO R=%llu W=%llu  GPIO=%llu  PLL-cfg=%llu  NVIC-W=%llu\n",
                 static_cast<unsigned long long>(s.mmio_reads),
                 static_cast<unsigned long long>(s.mmio_writes),
