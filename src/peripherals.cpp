@@ -749,6 +749,12 @@ uint32_t g_uart0_rx_irq_pends = 0;
 uint32_t g_uart0_rbr_reads    = 0;
 uint32_t g_uart0_tx_writes    = 0;
 
+// Letzter getrappter MMIO-Zugriff (via 'uart status'). Die Adresse identifiziert
+// das zuletzt beruehrte LPC-Peripherie-Register -> zeigt, wo der Gast haengt,
+// wenn er in einer Nicht-MMIO-Schleife steht (Adresse aendert sich dann nicht).
+uint32_t g_last_mmio_addr  = 0;
+bool     g_last_mmio_write = false;
+
 // --- Virtuelle UART0 <-> USB CDC#2 Kopplung -------------------------------
 // Zwei SPSC-Ringpuffer (lock-frei, je ein Producer/Consumer auf getrennten
 // Cores), damit Gast-UART0 (Core1, MMIO-Trap) und USB-CDC#2 (Core0, TinyUSB)
@@ -1087,10 +1093,17 @@ void ct_advance(CtModel& c) {
     if (!c.enabled) { c.last_us = time_us_64(); ct_update_pwm(c); return; }
     uint64_t now = time_us_64();
     uint64_t dt  = now - c.last_us;
-    c.last_us = now;
-    uint64_t ticks = (dt * static_cast<uint64_t>(g_current_hz))
-                     / (1'000'000ull * static_cast<uint64_t>(c.pre + 1u));
-    if (!ticks) { ct_update_pwm(c); return; }
+    uint64_t hz    = g_current_hz ? static_cast<uint64_t>(g_current_hz) : 1u;
+    uint64_t denom = 1'000'000ull * static_cast<uint64_t>(c.pre + 1u);
+    uint64_t ticks = (dt * hz) / denom;
+    // WICHTIG: last_us NUR um die tatsaechlich konsumierte Zeit vorstellen, NICHT
+    // bedingungslos auf 'now'. Sonst geht bei jedem Aufruf mit ticks==0 die
+    // Sub-Tick-Restzeit verloren -> bei grossem Prescaler + schnellem Pollen
+    // (z. B. sblib KNX-Bus `while(getMatchChannelLevel(pwm))` in Bus::begin())
+    // wuerde der Zaehler NIE vorruecken -> Endlosschleife im Gast. Der Rest
+    // bleibt so erhalten und summiert sich ueber mehrere Aufrufe zu ganzen Ticks.
+    if (!ticks) { ct_update_pwm(c); return; }   // last_us unveraendert -> Rest bleibt
+    c.last_us += (ticks * denom) / hz;          // nur konsumierte Zeit verbrauchen
     uint32_t mask = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
     for (uint64_t i = 0; i < ticks; ++i) {
         c.tc = (c.tc + 1u) & mask;
@@ -1313,10 +1326,13 @@ void wdt_advance() {
     if ((g_wdt.mod & 0x1u) == 0) { g_wdt.last_us = time_us_64(); return; }
     uint64_t now = time_us_64();
     uint64_t dt  = now - g_wdt.last_us;
-    g_wdt.last_us = now;
     uint32_t hz = g_wdt.wdt_clk_hz ? g_wdt.wdt_clk_hz : 500'000u;
     uint64_t ticks = (dt * static_cast<uint64_t>(hz)) / 1'000'000ull;
+    // last_us nur um konsumierte Zeit vorstellen (Rest erhalten), sonst wuerde
+    // bei haeufigem Aufruf (< 1 WDT-Tick pro Aufruf) die Restzeit verworfen und
+    // der Watchdog zaehlte nie herunter. Gleiche Fehlerklasse wie ct_advance.
     if (!ticks) return;
+    g_wdt.last_us += (ticks * 1'000'000ull) / static_cast<uint64_t>(hz);
     if (ticks >= g_wdt.tv) {
         g_wdt.tv = 0;
         g_wdt.mod |= 0x4u;       // WDTOF (timeout)
@@ -2228,6 +2244,7 @@ void gint_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
 
 bool mmio_read8(uint32_t addr, uint8_t& out) {
     ++g_stats.mmio_reads;
+    g_last_mmio_addr = addr; g_last_mmio_write = false;
     sample_pin_interrupts();
 
     if (addr >= GPIO_BASE && addr < GPIO_PORTS_END) {
@@ -2321,6 +2338,7 @@ bool mmio_read8(uint32_t addr, uint8_t& out) {
 
 bool mmio_write8(uint32_t addr, uint8_t val) {
     ++g_stats.mmio_writes;
+    g_last_mmio_addr = addr; g_last_mmio_write = true;
     sample_pin_interrupts();
 
     if (addr >= GPIO_BASE && addr < GPIO_PORTS_END) {
@@ -2488,6 +2506,11 @@ void uart0_debug(uint8_t& ier, bool& nvic_en, uint32_t& rx_irq_pends,
     rx_irq_pends = g_uart0_rx_irq_pends;
     rbr_reads    = g_uart0_rbr_reads;
     tx_writes    = g_uart0_tx_writes;
+}
+
+void last_mmio(uint32_t& addr, bool& is_write) {
+    addr     = g_last_mmio_addr;
+    is_write = g_last_mmio_write;
 }
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-

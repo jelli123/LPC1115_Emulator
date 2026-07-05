@@ -843,6 +843,12 @@ void handle_command(char* line) {
                             static_cast<unsigned long>(rx_pends),
                             static_cast<unsigned long>(rbr_reads),
                             static_cast<unsigned long>(tx_writes));
+                uint32_t mmio_addr; bool mmio_wr;
+                peripherals::last_mmio(mmio_addr, mmio_wr);
+                std::printf("  Letzter MMIO-Zugriff: 0x%08lx (%s)  [aendert er sich nicht, "
+                            "haengt der Gast hier]\n",
+                            static_cast<unsigned long>(mmio_addr),
+                            mmio_wr ? "Write" : "Read");
             }
             return;
         }

@@ -93,4 +93,9 @@ void uart0_cdc_rx_push(uint8_t b);   // von CDC#2 empfangenes Byte an Gast-RX
 void uart0_debug(uint8_t& ier, bool& nvic_en, uint32_t& rx_irq_pends,
                  uint32_t& rbr_reads, uint32_t& tx_writes);
 
+// Letzter getrappter MMIO-Zugriff (Adresse + R/W). Die Adresse identifiziert das
+// zuletzt beruehrte LPC-Peripherie-Register. Aendert sie sich zwischen zwei
+// Abfragen nicht, steht der Gast in einer Nicht-MMIO-Schleife an dieser Stelle.
+void last_mmio(uint32_t& addr, bool& is_write);
+
 } // namespace peripherals
