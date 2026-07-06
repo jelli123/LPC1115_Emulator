@@ -244,6 +244,16 @@ void cmd_status() {
                     static_cast<unsigned long>(ui_exit),
                     (ui_enter != ui_exit) ? "  [HAENGT in uart_init!]" : "");
     }
+    {
+        // Letzter getrappter MMIO-Zugriff. Bei eingefrorenem mmio-traps + stehendem
+        // SysTick-Shim zeigt diese Adresse das Register, an dem Core1 mitten im
+        // Trap haengt (Handler-Mode, hoehere Prio als SysTick).
+        uint32_t mmio_addr; bool mmio_wr;
+        peripherals::last_mmio(mmio_addr, mmio_wr);
+        std::printf("Letzter MMIO: 0x%08lx (%s)\n",
+                    static_cast<unsigned long>(mmio_addr),
+                    mmio_wr ? "Write" : "Read");
+    }
     std::printf("MMIO R=%llu W=%llu  GPIO=%llu  PLL-cfg=%llu  NVIC-W=%llu\n",
                 static_cast<unsigned long long>(s.mmio_reads),
                 static_cast<unsigned long long>(s.mmio_writes),
