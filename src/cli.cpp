@@ -255,6 +255,14 @@ void cmd_status() {
                     static_cast<unsigned long>(u1_cr_boot),
                     static_cast<unsigned long>(resets_now),
                     (resets_now & 0x04000000u) ? "JA" : "nein");
+        uint32_t acc_u0, acc_u1, u0_addr, u1_addr;
+        peripherals::uart0_acc_debug(acc_u0, acc_u1, u0_addr, u1_addr);
+        std::printf("UART0-acc: u0-acc=0x%02lx(CORE0=%s) u1-acc=0x%02lx | u0@0x%08lx u1@0x%08lx\n",
+                    static_cast<unsigned long>(acc_u0),
+                    (acc_u0 & 0x10u) ? "JA" : "NEIN",
+                    static_cast<unsigned long>(acc_u1),
+                    static_cast<unsigned long>(u0_addr),
+                    static_cast<unsigned long>(u1_addr));
     }
     {
         // Letzter getrappter MMIO-Zugriff. Bei eingefrorenem mmio-traps + stehendem

@@ -122,6 +122,12 @@ void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit,
 void uart0_boot_regs(uint32_t& cr_boot, uint32_t& lcrh_boot, uint32_t& resets_now,
                      uint32_t& u0_cr_wb, uint32_t& u1_cr_boot);
 
+// ACCESSCTRL-Zugriffsrechte pro UART (Bit4=CORE0, Bit5=CORE1, Bit3=SP) + reale
+// Basisadressen von uart0/uart1. Zeigt, ob uart0 fuer Core0 gesperrt ist (Bit4=0
+// -> Writes verpuffen) und ob die Adressen stimmen (0x40070000/0x40078000).
+void uart0_acc_debug(uint32_t& acc_u0, uint32_t& acc_u1,
+                     uint32_t& u0_addr, uint32_t& u1_addr);
+
 // Live-RX-Zustand der LPC-UART0 (LSR.DR): true = meldet gerade Empfangsdaten.
 // Zeigt, ob eine haengende serial.begin()-Drain-Schleife echte Bytes sieht.
 bool uart0_rx_live();

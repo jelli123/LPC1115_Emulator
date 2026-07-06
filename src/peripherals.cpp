@@ -24,6 +24,7 @@
 #include "hardware/structs/scb.h"
 #include "hardware/structs/systick.h"
 #include "hardware/structs/resets.h"
+#include "hardware/structs/accessctrl.h"
 #include "hardware/regs/resets.h"
 #include "hardware/regs/powman.h"
 #include "pico/stdlib.h"
@@ -791,6 +792,14 @@ uint32_t g_uart0_lcrh_boot = 0xDEAD;
 // RESETS=0. u0-wb=0x301 -> Writes greifen, aber etwas loescht cr spaeter wieder.
 uint32_t g_u0_cr_wb   = 0xDEAD;
 uint32_t g_u1_cr_boot = 0xDEAD;
+// ACCESSCTRL-Zugriffsrechte pro UART (Bit4=CORE0, Bit5=CORE1, Bit3=SP). Ist bei
+// uart0 das CORE0-Bit (0x10) geloescht, verwirft der Bus Core0-Writes an uart0
+// STILL (Read liefert 0) -> exakt u0-wb=0 bei intaktem uart1. + reale Basisadressen
+// (Kontrolle, dass uart0/uart1 auf 0x40070000/0x40078000 zeigen).
+uint32_t g_acc_u0   = 0xDEAD;
+uint32_t g_acc_u1   = 0xDEAD;
+uint32_t g_u0_addr  = 0;
+uint32_t g_u1_addr  = 0;
 
 // Letzter getrappter MMIO-Zugriff (via 'uart status'). Die Adresse identifiziert
 // das zuletzt beruehrte LPC-Peripherie-Register -> zeigt, wo der Gast haengt,
@@ -986,6 +995,11 @@ void uart_hw_boot_init() {
     uart_get_hw(uart0)->cr = UART_UARTCR_UARTEN_BITS |
                              UART_UARTCR_TXE_BITS | UART_UARTCR_RXE_BITS;
     g_u0_cr_wb = uart_get_hw(uart0)->cr;
+    // ACCESSCTRL + Basisadressen erfassen (erklaeren, warum uart0-Writes verpuffen)
+    g_acc_u0  = accessctrl_hw->uart[0];
+    g_acc_u1  = accessctrl_hw->uart[1];
+    g_u0_addr = reinterpret_cast<uint32_t>(uart_get_hw(uart0));
+    g_u1_addr = reinterpret_cast<uint32_t>(uart_get_hw(uart1));
     ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
 }
 
@@ -2756,6 +2770,14 @@ void uart0_boot_regs(uint32_t& cr_boot, uint32_t& lcrh_boot, uint32_t& resets_no
     resets_now = resets_hw->reset;   // Bit26=uart0, Bit27=uart1 (1=IM RESET gehalten)
     u0_cr_wb   = g_u0_cr_wb;
     u1_cr_boot = g_u1_cr_boot;
+}
+
+void uart0_acc_debug(uint32_t& acc_u0, uint32_t& acc_u1,
+                     uint32_t& u0_addr, uint32_t& u1_addr) {
+    acc_u0  = g_acc_u0;
+    acc_u1  = g_acc_u1;
+    u0_addr = g_u0_addr;
+    u1_addr = g_u1_addr;
 }
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-
