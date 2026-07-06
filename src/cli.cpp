@@ -247,14 +247,14 @@ void cmd_status() {
                     static_cast<unsigned long>(cp_hz),
                     static_cast<unsigned long>(cp_ctrl),
                     (ui_enter != ui_exit) ? "  [HAENGT in uart_init!]" : "");
-        uint32_t cr_boot, lcrh_boot, resets_now;
-        peripherals::uart0_boot_regs(cr_boot, lcrh_boot, resets_now);
-        std::printf("UART0-boot: cr=0x%03lx lcr_h=0x%02lx | RESETS=0x%08lx u0-reset=%s u1-reset=%s\n",
+        uint32_t cr_boot, lcrh_boot, resets_now, u0_cr_wb, u1_cr_boot;
+        peripherals::uart0_boot_regs(cr_boot, lcrh_boot, resets_now, u0_cr_wb, u1_cr_boot);
+        std::printf("UART0-boot: cr=0x%03lx u0-wb=0x%03lx u1-cr=0x%03lx | RESETS=0x%08lx u0-reset=%s\n",
                     static_cast<unsigned long>(cr_boot),
-                    static_cast<unsigned long>(lcrh_boot),
+                    static_cast<unsigned long>(u0_cr_wb),
+                    static_cast<unsigned long>(u1_cr_boot),
                     static_cast<unsigned long>(resets_now),
-                    (resets_now & 0x04000000u) ? "JA" : "nein",
-                    (resets_now & 0x08000000u) ? "JA" : "nein");
+                    (resets_now & 0x04000000u) ? "JA" : "nein");
     }
     {
         // Letzter getrappter MMIO-Zugriff. Bei eingefrorenem mmio-traps + stehendem

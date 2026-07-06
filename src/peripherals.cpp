@@ -784,6 +784,13 @@ uint32_t g_uart0_init_ret = 0xFFFFFFFFu;
 // uart0 nach dem Boot. Sind sie schon hier 0 -> uart_init-Writes greifen nicht.
 uint32_t g_uart0_cr_boot   = 0xDEAD;
 uint32_t g_uart0_lcrh_boot = 0xDEAD;
+// Entscheidender Direkttest (Boot): nimmt uart0 ueberhaupt Register-Writes an?
+//   g_u0_cr_wb   = uart0->cr NACH einem expliziten Direktschreiben von 0x301.
+//   g_u1_cr_boot = uart1->cr NACH uart_init(uart1) (Referenz: uart1/GP4-5 laeuft laut HW-Test).
+// u0-wb=0 + u1-cr=0x301 -> uart0-Block nimmt keine Writes an (Takt/Power), obwohl
+// RESETS=0. u0-wb=0x301 -> Writes greifen, aber etwas loescht cr spaeter wieder.
+uint32_t g_u0_cr_wb   = 0xDEAD;
+uint32_t g_u1_cr_boot = 0xDEAD;
 
 // Letzter getrappter MMIO-Zugriff (via 'uart status'). Die Adresse identifiziert
 // das zuletzt beruehrte LPC-Peripherie-Register -> zeigt, wo der Gast haengt,
@@ -974,6 +981,11 @@ void uart_hw_boot_init() {
     g_uart0_cr_boot   = uart_get_hw(uart0)->cr;
     g_uart0_lcrh_boot = uart_get_hw(uart0)->lcr_h;
     uart_init(uart1, 115200);
+    g_u1_cr_boot = uart_get_hw(uart1)->cr;
+    // Entscheidender Test: schreibt sich uart0->cr ueberhaupt? (uart1 = Referenz)
+    uart_get_hw(uart0)->cr = UART_UARTCR_UARTEN_BITS |
+                             UART_UARTCR_TXE_BITS | UART_UARTCR_RXE_BITS;
+    g_u0_cr_wb = uart_get_hw(uart0)->cr;
     ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
 }
 
@@ -2737,10 +2749,13 @@ void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit,
     uart0_init_ret = g_uart0_init_ret;
 }
 
-void uart0_boot_regs(uint32_t& cr_boot, uint32_t& lcrh_boot, uint32_t& resets_now) {
+void uart0_boot_regs(uint32_t& cr_boot, uint32_t& lcrh_boot, uint32_t& resets_now,
+                     uint32_t& u0_cr_wb, uint32_t& u1_cr_boot) {
     cr_boot    = g_uart0_cr_boot;
     lcrh_boot  = g_uart0_lcrh_boot;
     resets_now = resets_hw->reset;   // Bit26=uart0, Bit27=uart1 (1=IM RESET gehalten)
+    u0_cr_wb   = g_u0_cr_wb;
+    u1_cr_boot = g_u1_cr_boot;
 }
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-
