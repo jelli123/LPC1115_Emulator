@@ -93,24 +93,18 @@ bool parse_uint32_auto(const char* s, uint32_t& out) {
 // kollidieren. Wer P1_10/11 bzw. Port 2/3 als GPIO braucht und kein ADC
 // nutzt, kann sie per CONFIG.INI (pin.<port>_<pin>=<gpio>) frei zuordnen.
 void apply_default_pinmap_impl() {
+    // KEIN Default-GPIO-Mapping mehr. Die Pinmap startet LEER (alle -1); jeder
+    // LPC-Pin muss explizit per CONFIG.INI (pin.<port>_<pin>=<gpio>) oder CLI
+    // (pinmap set) zugeordnet werden.
+    //
+    // Grund: Ein automatisches Default-Mapping (frueher P0_x->GP2.., P1_x->GP14..)
+    // kollidierte mit den UART-Pads GP0/GP1 (uart0_tx/uart0_rx) und liess sich
+    // nicht dauerhaft entfernen — die geraetegenerierte CONFIG.INI schrieb die
+    // Default-Zuordnungen nach jedem 'cfg clear' wieder zurueck, und eine
+    // GPIO-Belegung von GP0/GP1 uebersteuerte das UART-Routing (GP0 als GPIO-low
+    // -> uart0-RX las Dauer-0x00 -> serial.begin() haing). Ohne Default entsteht
+    // dieser Konflikt nie; der Anwender bestimmt die Belegung vollstaendig selbst.
     for (auto& v : g_pin_map.lpc_to_rp) v = -1;
-
-    // Port 0: P0_0..P0_11 → GP2..GP13
-    for (int i = 0; i <= 11; ++i)
-        g_pin_map.lpc_to_rp[0 * 12 + i] = static_cast<int8_t>(2 + i);
-
-    // Port 1: P1_0..P1_7 → GP14..GP21
-    for (int i = 0; i <= 7; ++i)
-        g_pin_map.lpc_to_rp[1 * 12 + i] = static_cast<int8_t>(14 + i);
-
-    // GP0/GP1 werden BEWUSST NICHT als GPIO gemappt: sie sind die RP2350-uart0-
-    // Pads. Wer den Gast-UART0 auf echte Pins legen will, nutzt uart0_tx/uart0_rx
-    // (Config) -> das routet GP0/GP1 exklusiv auf GPIO_FUNC_UART. Eine doppelte
-    // GPIO-Belegung (frueher P1_8→GP1, P1_9→GP0) liess das GPIO-Modell die
-    // UART-Pads uebersteuern (GP0 als GPIO-low getrieben) -> uart0-RX las Dauer-
-    // 0x00, serial.begin() haing in der RX-Drain-Schleife. Daher hier ungemappt.
-    g_pin_map.lpc_to_rp[1 * 12 + 10] = 22;
-    // P1_8/P1_9/P1_11, P2_x: ungemappt (GP26..29 für ADC reserviert, siehe oben).
 }
 
 void apply_defaults() {
