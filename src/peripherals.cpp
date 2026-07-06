@@ -828,6 +828,15 @@ void uart0_apply_pins() {
     g_uart0.hw = inst;
     gpio_set_function(static_cast<uint>(tx), tx_func);
     gpio_set_function(static_cast<uint>(rx), rx_func);
+    // Pull-up auf den RX-Pin: der Ruhepegel einer UART-Leitung ist HIGH. Ohne
+    // angeschlossene Gegenstelle floatet der Pin sonst -> das RP-uart0 sampelt
+    // Stoer-/Break-Frames -> uart_is_readable() bleibt DAUERHAFT true -> sblib
+    // serial.begin() haengt in `while (LSR & RDR) val = RBR;` (RX-FIFO-Drain).
+    // Der Gast fordert denselben Pull ohnehin an (FT12: pinMode(RX, SERIAL_RXD |
+    // PULL_UP | HYSTERESIS)); da der Emulator die IOCON-Pull-Konfig nicht auf die
+    // gerouteten Pads durchreicht, setzen wir ihn hier explizit. Auf dem Pad
+    // wirkt der Pull unabhaengig von der UART-Funktionswahl.
+    gpio_pull_up(static_cast<uint>(rx));
     g_uart0_tx_gpio = tx;
     g_uart0_rx_gpio = rx;
     std::printf("[UART0] TX->GP%d RX->GP%d (%s)\n", tx, rx,
@@ -842,10 +851,23 @@ void uart0_ensure_hw(uint32_t f_cpu) {
         return;
     }
     // Pins ZUERST routen: waehlt g_uart0.hw (uart0/uart1) anhand der Config-Pads.
-    // Vorher init_done ggf. zuruecksetzen, falls sich das Peripheral aendert.
     uart_inst_t* prev = g_uart0.hw;
     uart0_apply_pins();
-    if (!g_uart0.hw) g_uart0.hw = uart0;   // Fallback (kein/ungueltiges Routing)
+    // OHNE gueltiges Pin-Routing (uart0_tx/rx = -1) gibt es KEIN reales HW-Backing.
+    // Frueher wurde blind auf uart0 (GP0/GP1) zurueckgefallen + uart_init gerufen —
+    // ein so aktiviertes, aber pin-loses UART liest seinen RX-Eingang von einem
+    // nicht zugewiesenen (floatenden/low) Pin und meldet DAUERHAFT "readable"
+    // (Dauer-0x00-Frames). sblib serial.begin() enthaelt danach die Schleife
+    // `while (LPC_UART->LSR & LSR_RDR) val = LPC_UART->RBR;` -> HING ENDLOS
+    // (Gast steht in serial.begin(), beobachtet bei FT12 ohne uart0_cdc). Daher:
+    // ohne Routing die LPC-UART0 als IDLE-LEITUNG modellieren (kein RX, TX
+    // verworfen). Fuer echten seriellen Verkehr: 'uart pins <tx> <rx>' ODER
+    // 'uart cdc on' (+ serial_enable=on) nutzen.
+    if (g_uart0_rx_gpio < 0 && g_uart0_tx_gpio < 0) {
+        g_uart0.hw       = nullptr;
+        g_uart0.init_done = true;
+        return;
+    }
     if (g_uart0.hw != prev) g_uart0.init_done = false;
     if (g_uart0.divisor == 0) return;
     uint32_t baud = f_cpu / (16u * g_uart0.divisor);
@@ -930,7 +952,20 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
                 uart0_ensure_hw(g_current_hz);
             } else g_uart0.ier = val;
             break;
-        case UART0_FCR: g_uart0.fcr = val; break;
+        case UART0_FCR: {
+            g_uart0.fcr = val;
+            // FCR Bit1 = RX-FIFO-Reset (UM10398): verwirft alle gepufferten
+            // Empfangsdaten -> LSR.DR wird 0. sblib serial.begin() schreibt
+            // FCR=0x07 direkt vor der Drain-Schleife; ohne echtes Zuruecksetzen
+            // haette ein voller Ring/FIFO die Schleife am Laufen gehalten.
+            if (val & 0x02u) {
+                uint8_t tmp;
+                while (ring_pop(g_uart0_rx, tmp)) { /* Ring leeren */ }
+                if (!config::uart0_cdc_enabled() && g_uart0.hw)
+                    while (uart_is_readable(g_uart0.hw)) (void)uart_getc(g_uart0.hw);
+            }
+            break;
+        }
         case UART0_LCR: g_uart0.lcr = val; uart0_ensure_hw(g_current_hz); break;
         case UART0_MCR: g_uart0.mcr = val; break;
         default: break;
