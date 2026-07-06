@@ -267,6 +267,18 @@ void cmd_status() {
                     static_cast<unsigned long>(u_rbr),
                     static_cast<unsigned long>(u_tx));
     }
+    {
+        // REALER Pad-Zustand der HW-uart0-Bruecke (misst GP0/GP1 elektrisch).
+        // txf/rxf=2 -> GPIO_FUNC_UART korrekt geroutet. rxlvl=0 -> RX-Leitung
+        // LOW (erklaert Dauer-0x00). cr Bit0/8/9 = UARTEN/TXE/RXE.
+        int p_hw, p_tx, p_rx, p_txf, p_rxf, p_rxl; uint32_t p_cr;
+        peripherals::uart0_pad_debug(p_hw, p_tx, p_rx, p_txf, p_rxf, p_rxl, p_cr);
+        const char* hwname = (p_hw == 0) ? "uart0" : (p_hw == 1) ? "uart1" : "keins";
+        std::printf("UART0-PAD: hw=%s TX=GP%d(f%d) RX=GP%d(f%d) RX-Pegel=%s cr=0x%03lx\n",
+                    hwname, p_tx, p_txf, p_rx, p_rxf,
+                    (p_rxl < 0) ? "n/a" : (p_rxl ? "HIGH" : "LOW"),
+                    static_cast<unsigned long>(p_cr));
+    }
     std::printf("MMIO R=%llu W=%llu  GPIO=%llu  PLL-cfg=%llu  NVIC-W=%llu\n",
                 static_cast<unsigned long long>(s.mmio_reads),
                 static_cast<unsigned long long>(s.mmio_writes),

@@ -2636,6 +2636,22 @@ bool uart0_rx_live() {
     return g_uart0.hw && uart_is_readable(g_uart0.hw);
 }
 
+// Misst den REALEN Pad-Zustand der HW-uart0-Bruecke (GP-Funktion, RX-Pegel,
+// uart-CR). gpio_get_function/gpio_get lesen die echten SIO-/PADS-/IO-Register
+// (unabhaengig von der gewaehlten Funktion) -> zeigt, ob GP0/GP1 wirklich auf
+// FUNC_UART liegen und ob die RX-Leitung idle-high (1) oder low (0, -> 0x00) ist.
+void uart0_pad_debug(int& hw_sel, int& tx_gpio, int& rx_gpio,
+                     int& tx_func, int& rx_func, int& rx_level,
+                     uint32_t& uart_cr) {
+    hw_sel   = (g_uart0.hw == uart0) ? 0 : (g_uart0.hw == uart1) ? 1 : -1;
+    tx_gpio  = g_uart0_tx_gpio;
+    rx_gpio  = g_uart0_rx_gpio;
+    tx_func  = (tx_gpio >= 0) ? static_cast<int>(gpio_get_function(static_cast<uint>(tx_gpio))) : -1;
+    rx_func  = (rx_gpio >= 0) ? static_cast<int>(gpio_get_function(static_cast<uint>(rx_gpio))) : -1;
+    rx_level = (rx_gpio >= 0) ? (gpio_get(static_cast<uint>(rx_gpio)) ? 1 : 0) : -1;
+    uart_cr  = g_uart0.hw ? uart_get_hw(g_uart0.hw)->cr : 0u;
+}
+
 void last_mmio(uint32_t& addr, bool& is_write) {
     addr     = g_last_mmio_addr;
     is_write = g_last_mmio_write;

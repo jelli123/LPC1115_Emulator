@@ -113,4 +113,17 @@ void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit);
 // Zeigt, ob eine haengende serial.begin()-Drain-Schleife echte Bytes sieht.
 bool uart0_rx_live();
 
+// Pad-Diagnose der HW-UART0-Bruecke: liest den REALEN RP2350-Pad-Zustand der
+// gerouteten uart0-Pins (statt Emulator-Schatten). Damit laesst sich MESSEN, ob
+// TX/RX korrekt auf GPIO_FUNC_UART (=2) liegen und welchen Pegel die RX-Leitung
+// fuehrt — entscheidend fuer die Loopback-/FT12-Diagnose.
+//   hw_sel  : 0=uart0, 1=uart1, -1=kein HW-Backing (idle/CDC)
+//   tx_gpio/rx_gpio: aktuell geroutete RP2350-Pads (-1 = keins)
+//   tx_func/rx_func: reale Pad-Funktion (gpio_get_function); 2=GPIO_FUNC_UART
+//   rx_level: realer Eingangspegel des RX-Pads (0=LOW -> Dauer-0x00-Frames)
+//   uart_cr : uart0/1-Control-Register (Bit0 UARTEN, Bit8 TXE, Bit9 RXE)
+void uart0_pad_debug(int& hw_sel, int& tx_gpio, int& rx_gpio,
+                     int& tx_func, int& rx_func, int& rx_level,
+                     uint32_t& uart_cr);
+
 } // namespace peripherals
