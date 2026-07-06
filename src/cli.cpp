@@ -237,32 +237,12 @@ void cmd_status() {
                     static_cast<unsigned long long>(ct_mt));
     }
     {
-        uint32_t ui_enter, ui_exit, cs_hz, cp_hz, cp_ctrl, u0ret;
-        peripherals::uart0_init_debug(ui_enter, ui_exit, cs_hz, cp_hz, cp_ctrl, u0ret);
-        std::printf("UART-init: enter=%lu exit=%lu ret0=%lu clk_sys=%luHz clk_peri=%luHz ctrl=0x%08lx%s\n",
+        uint32_t ui_enter, ui_exit;
+        peripherals::uart0_init_debug(ui_enter, ui_exit);
+        std::printf("UART-init: enter=%lu exit=%lu%s\n",
                     static_cast<unsigned long>(ui_enter),
                     static_cast<unsigned long>(ui_exit),
-                    static_cast<unsigned long>(u0ret),
-                    static_cast<unsigned long>(cs_hz),
-                    static_cast<unsigned long>(cp_hz),
-                    static_cast<unsigned long>(cp_ctrl),
                     (ui_enter != ui_exit) ? "  [HAENGT in uart_init!]" : "");
-        uint32_t cr_boot, lcrh_boot, resets_now, u0_cr_wb, u1_cr_boot;
-        peripherals::uart0_boot_regs(cr_boot, lcrh_boot, resets_now, u0_cr_wb, u1_cr_boot);
-        std::printf("UART0-boot: cr=0x%03lx u0-wb=0x%03lx u1-cr=0x%03lx | RESETS=0x%08lx u0-reset=%s\n",
-                    static_cast<unsigned long>(cr_boot),
-                    static_cast<unsigned long>(u0_cr_wb),
-                    static_cast<unsigned long>(u1_cr_boot),
-                    static_cast<unsigned long>(resets_now),
-                    (resets_now & 0x04000000u) ? "JA" : "nein");
-        uint32_t acc_u0, acc_u1, u0_addr, u1_addr;
-        peripherals::uart0_acc_debug(acc_u0, acc_u1, u0_addr, u1_addr);
-        std::printf("UART0-acc: u0-acc=0x%02lx(CORE0=%s) u1-acc=0x%02lx | u0@0x%08lx u1@0x%08lx\n",
-                    static_cast<unsigned long>(acc_u0),
-                    (acc_u0 & 0x10u) ? "JA" : "NEIN",
-                    static_cast<unsigned long>(acc_u1),
-                    static_cast<unsigned long>(u0_addr),
-                    static_cast<unsigned long>(u1_addr));
     }
     {
         // Letzter getrappter MMIO-Zugriff. Bei eingefrorenem mmio-traps + stehendem

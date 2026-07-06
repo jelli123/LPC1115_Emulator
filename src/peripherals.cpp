@@ -23,9 +23,6 @@
 #include "hardware/structs/clocks.h"
 #include "hardware/structs/scb.h"
 #include "hardware/structs/systick.h"
-#include "hardware/structs/resets.h"
-#include "hardware/structs/accessctrl.h"
-#include "hardware/regs/resets.h"
 #include "hardware/regs/powman.h"
 #include "pico/stdlib.h"
 
@@ -783,44 +780,13 @@ uint32_t g_uart0_rx_irq_pends = 0;
 uint32_t g_uart0_rbr_reads    = 0;
 uint32_t g_uart0_tx_writes    = 0;
 
-// uart_init-Enter/Exit-Zaehler (Diagnose, via 'uart status'). uart_init() der
+// uart_init-Enter/Exit-Zaehler (Diagnose, via 'stats'). uart_init() der
 // Pico-SDK enthaelt unreset_block_num_wait_blocking (Busy-Wait). Laeuft es im
 // MMIO-Fault-Handler (Core1) und blockiert, kann der reale SysTick (niedrigere
 // Prio als der Fault-Handler) nicht mehr preempten -> SysTick-Shim steht ->
 // Core1 komplett blockiert. enter>exit beweist genau diesen Hang in uart_init.
 uint32_t g_uart_init_enter = 0;
 uint32_t g_uart_init_exit  = 0;
-
-// Boot-Takt-Diagnose (via 'stats' UART-init-Zeile): reale Werte, um den cr=0x000-
-// Fall (UART bleibt HW-deaktiviert) datengetrieben zu erklaeren, statt zu raten.
-//   g_clk_sys_hz / g_clk_peri_hz: clock_get_hz() NACH clk_peri-Setup.
-//   g_clk_peri_ctrl: clocks_hw->clk[clk_peri].ctrl (Bit11 ENABLE). clock_get_hz
-//     spiegelt NUR die konfigurierte Freq, NICHT das Enable-Bit -> hier direkt lesen.
-//   g_uart0_init_ret: Rueckgabe von uart_init(uart0) (0 = Early-Return, Takt war 0).
-uint32_t g_clk_sys_hz    = 0;
-uint32_t g_clk_peri_hz   = 0;
-uint32_t g_clk_peri_ctrl = 0;
-uint32_t g_uart0_init_ret = 0xFFFFFFFFu;
-// uart0->cr / ->lcr_h DIREKT nach uart_init(uart0) im Boot (Core0). Trennt die
-// Diagnose: sind sie hier 0x301/0x70, aber in 'stats' spaeter 0 -> etwas RESETtet
-// uart0 nach dem Boot. Sind sie schon hier 0 -> uart_init-Writes greifen nicht.
-uint32_t g_uart0_cr_boot   = 0xDEAD;
-uint32_t g_uart0_lcrh_boot = 0xDEAD;
-// Entscheidender Direkttest (Boot): nimmt uart0 ueberhaupt Register-Writes an?
-//   g_u0_cr_wb   = uart0->cr NACH einem expliziten Direktschreiben von 0x301.
-//   g_u1_cr_boot = uart1->cr NACH uart_init(uart1) (Referenz: uart1/GP4-5 laeuft laut HW-Test).
-// u0-wb=0 + u1-cr=0x301 -> uart0-Block nimmt keine Writes an (Takt/Power), obwohl
-// RESETS=0. u0-wb=0x301 -> Writes greifen, aber etwas loescht cr spaeter wieder.
-uint32_t g_u0_cr_wb   = 0xDEAD;
-uint32_t g_u1_cr_boot = 0xDEAD;
-// ACCESSCTRL-Zugriffsrechte pro UART (Bit4=CORE0, Bit5=CORE1, Bit3=SP). Ist bei
-// uart0 das CORE0-Bit (0x10) geloescht, verwirft der Bus Core0-Writes an uart0
-// STILL (Read liefert 0) -> exakt u0-wb=0 bei intaktem uart1. + reale Basisadressen
-// (Kontrolle, dass uart0/uart1 auf 0x40070000/0x40078000 zeigen).
-uint32_t g_acc_u0   = 0xDEAD;
-uint32_t g_acc_u1   = 0xDEAD;
-uint32_t g_u0_addr  = 0;
-uint32_t g_u1_addr  = 0;
 
 // Letzter getrappter MMIO-Zugriff (via 'uart status'). Die Adresse identifiziert
 // das zuletzt beruehrte LPC-Peripherie-Register -> zeigt, wo der Gast haengt,
@@ -993,34 +959,20 @@ void uart0_ensure_hw(uint32_t f_cpu) {
 // Ohne geroutete Pins treiben/lesen die Bloecke keine echten Pins (harmlos).
 void uart_hw_boot_init() {
     ++g_uart_init_enter;                 // vor dem (auf Core0 unkritischen) SDK-Call
-    // clk_peri MUSS laufen, sonst kehrt uart_init() SOFORT zurueck (Early-Return
-    // bei uart_clock_get_hz(uart)==0 -> clock_get_hz(clk_peri)==0) OHNE das
-    // Control-Register zu setzen + OHNE den Block aus dem Reset zu holen -> die
-    // UART bleibt HW-deaktiviert, spaetere cr/lcr_h-Schreibzugriffe verpuffen
-    // (per 'stats' gemessen: cr=0x000 lcr_h=0x00 trotz korrektem Pin-Routing).
-    // UNBEDINGT neu konfigurieren: clock_get_hz() liefert nur die zuletzt
-    // KONFIGURIERTE Frequenz, NICHT den realen Enable-Zustand -> ein bedingtes
-    // "nur wenn ==0" kann faelschlich ueberspringen, obwohl der Takt real steht.
+    // clk_peri defensiv aufsetzen: ist der Peripherietakt 0, nimmt uart_init()
+    // einen stillen Early-Return (uart_clock_get_hz==0) und laesst die UART
+    // HW-deaktiviert. Der SDK-Runtime-Init setzt clk_peri zwar bereits auf
+    // clk_sys, aber diese Zeile macht die HW-UART-Bereitschaft unabhaengig davon.
     clock_configure(clk_peri, 0,
                     CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
                     clock_get_hz(clk_sys), clock_get_hz(clk_sys));
-    g_clk_sys_hz    = clock_get_hz(clk_sys);
-    g_clk_peri_hz   = clock_get_hz(clk_peri);
-    g_clk_peri_ctrl = clocks_hw->clk[clk_peri].ctrl;
-    g_uart0_init_ret = uart_init(rp2350_hw::inst0(), 115200);
-    g_uart0_cr_boot   = uart_get_hw(rp2350_hw::inst0())->cr;
-    g_uart0_lcrh_boot = uart_get_hw(rp2350_hw::inst0())->lcr_h;
+    // WICHTIG: rp2350_hw::inst0()/inst1() statt der SDK-Makros uart0/uart1 nutzen.
+    // Der Emulator definiert UART0_BASE weiter unten auf die LPC-Adresse um,
+    // wodurch das Makro 'uart0' auf 0x40008000 statt die echte RP2350-uart0
+    // (0x40070000) zeigen wuerde -> uart_init/uart_get_hw traefen die falsche
+    // Adresse, die HW-UART0 bliebe stumm (cr/lcr_h lesen 0). Siehe rp2350_hw oben.
+    uart_init(rp2350_hw::inst0(), 115200);
     uart_init(rp2350_hw::inst1(), 115200);
-    g_u1_cr_boot = uart_get_hw(rp2350_hw::inst1())->cr;
-    // Verifikation: schreibt sich uart0->cr jetzt (mit korrektem RP2350-Zeiger)?
-    uart_get_hw(rp2350_hw::inst0())->cr = UART_UARTCR_UARTEN_BITS |
-                             UART_UARTCR_TXE_BITS | UART_UARTCR_RXE_BITS;
-    g_u0_cr_wb = uart_get_hw(rp2350_hw::inst0())->cr;
-    // ACCESSCTRL + Basisadressen erfassen (Kontrolle)
-    g_acc_u0  = accessctrl_hw->uart[0];
-    g_acc_u1  = accessctrl_hw->uart[1];
-    g_u0_addr = reinterpret_cast<uint32_t>(uart_get_hw(rp2350_hw::inst0()));
-    g_u1_addr = reinterpret_cast<uint32_t>(uart_get_hw(rp2350_hw::inst1()));
     ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
 }
 
@@ -2773,32 +2725,9 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks) {
     max_ticks        = g_ct_max_ticks;
 }
 
-void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit,
-                      uint32_t& clk_sys_hz, uint32_t& clk_peri_hz,
-                      uint32_t& clk_peri_ctrl, uint32_t& uart0_init_ret) {
-    init_enter     = g_uart_init_enter;
-    init_exit      = g_uart_init_exit;
-    clk_sys_hz     = g_clk_sys_hz;
-    clk_peri_hz    = g_clk_peri_hz;
-    clk_peri_ctrl  = g_clk_peri_ctrl;
-    uart0_init_ret = g_uart0_init_ret;
-}
-
-void uart0_boot_regs(uint32_t& cr_boot, uint32_t& lcrh_boot, uint32_t& resets_now,
-                     uint32_t& u0_cr_wb, uint32_t& u1_cr_boot) {
-    cr_boot    = g_uart0_cr_boot;
-    lcrh_boot  = g_uart0_lcrh_boot;
-    resets_now = resets_hw->reset;   // Bit26=uart0, Bit27=uart1 (1=IM RESET gehalten)
-    u0_cr_wb   = g_u0_cr_wb;
-    u1_cr_boot = g_u1_cr_boot;
-}
-
-void uart0_acc_debug(uint32_t& acc_u0, uint32_t& acc_u1,
-                     uint32_t& u0_addr, uint32_t& u1_addr) {
-    acc_u0  = g_acc_u0;
-    acc_u1  = g_acc_u1;
-    u0_addr = g_u0_addr;
-    u1_addr = g_u1_addr;
+void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit) {
+    init_enter = g_uart_init_enter;
+    init_exit  = g_uart_init_exit;
 }
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-

@@ -107,26 +107,7 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks);
 // Diagnose der HW-uart0-Initialisierung: Enter/Exit-Zaehler um den (potenziell
 // blockierenden) SDK-uart_init(). init_enter>init_exit = uart_init haengt gerade
 // (Busy-Wait im Fault-Handler-Kontext -> Core1 blockiert, SysTick-Shim steht).
-// Zusaetzlich reale Boot-Taktwerte + uart_init-Rueckgabe, um den cr=0x000-Fall
-// (UART HW-deaktiviert) zu erklaeren: clk_peri_hz/ctrl (Bit11 ENABLE) zeigen, ob
-// der UART-Takt real laeuft; uart0_init_ret=0 = uart_init nahm den Early-Return.
-void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit,
-                      uint32_t& clk_sys_hz, uint32_t& clk_peri_hz,
-                      uint32_t& clk_peri_ctrl, uint32_t& uart0_init_ret);
-
-// uart0->cr / ->lcr_h wie sie DIREKT nach uart_init(uart0) im Boot waren, plus
-// das LIVE RESETS-Register (Bit26=uart0, Bit27=uart1; 1 = Block wird IM RESET
-// gehalten -> Registerschreibzugriffe verpuffen, cr/lcr_h lesen 0). u0_cr_wb =
-// uart0->cr nach explizitem Direktschreiben (Test: nimmt uart0 Writes an?);
-// u1_cr_boot = uart1->cr (Referenz, uart1 laeuft).
-void uart0_boot_regs(uint32_t& cr_boot, uint32_t& lcrh_boot, uint32_t& resets_now,
-                     uint32_t& u0_cr_wb, uint32_t& u1_cr_boot);
-
-// ACCESSCTRL-Zugriffsrechte pro UART (Bit4=CORE0, Bit5=CORE1, Bit3=SP) + reale
-// Basisadressen von uart0/uart1. Zeigt, ob uart0 fuer Core0 gesperrt ist (Bit4=0
-// -> Writes verpuffen) und ob die Adressen stimmen (0x40070000/0x40078000).
-void uart0_acc_debug(uint32_t& acc_u0, uint32_t& acc_u1,
-                     uint32_t& u0_addr, uint32_t& u1_addr);
+void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit);
 
 // Live-RX-Zustand der LPC-UART0 (LSR.DR): true = meldet gerade Empfangsdaten.
 // Zeigt, ob eine haengende serial.begin()-Drain-Schleife echte Bytes sieht.
