@@ -244,6 +244,16 @@ bool bridge_owns_gpio(int g) {
     // GPIO_FUNC_UART gerouteten Pads dem Hardware-uart0 (uart0_apply_pins) -> das
     // GPIO-Modell darf sie nicht als digitale I/O uebersteuern.
     if (g == g_uart0_tx_gpio || g == g_uart0_rx_gpio) return true;
+    // Auch die KONFIGURIERTEN uart0-Pads (uart0_tx/uart0_rx) schuetzen, BEVOR
+    // uart0_apply_pins lief. Sonst wuerde das GPIO-Modell die Pads beim Gast-
+    // Start (Default-GPIO-Zustand) kurz als digitale I/O treiben -> GP0 low ->
+    // uart0-RX (ggf. gebrueckt) liest Dauer-0x00.
+    if (g == config::uart0_tx_gpio() || g == config::uart0_rx_gpio()) return true;
+    // Ebenso die PIO-UART-Bridge-Pads (uart_bridge_tx/rx), wenn aktiv.
+    if (config::uart_bridge_enabled()) {
+        if (g == config::uart_bridge_tx_pin() ||
+            g == config::uart_bridge_rx_pin()) return true;
+    }
     return false;
 }
 

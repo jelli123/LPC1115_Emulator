@@ -103,11 +103,14 @@ void apply_default_pinmap_impl() {
     for (int i = 0; i <= 7; ++i)
         g_pin_map.lpc_to_rp[1 * 12 + i] = static_cast<int8_t>(14 + i);
 
-    // Port 1 UART (KNX-Bus): P1_8=RX → GP1, P1_9=TX → GP0
-    g_pin_map.lpc_to_rp[1 * 12 + 8]  = 1;   // UART0 RX
-    g_pin_map.lpc_to_rp[1 * 12 + 9]  = 0;   // UART0 TX
+    // GP0/GP1 werden BEWUSST NICHT als GPIO gemappt: sie sind die RP2350-uart0-
+    // Pads. Wer den Gast-UART0 auf echte Pins legen will, nutzt uart0_tx/uart0_rx
+    // (Config) -> das routet GP0/GP1 exklusiv auf GPIO_FUNC_UART. Eine doppelte
+    // GPIO-Belegung (frueher P1_8→GP1, P1_9→GP0) liess das GPIO-Modell die
+    // UART-Pads uebersteuern (GP0 als GPIO-low getrieben) -> uart0-RX las Dauer-
+    // 0x00, serial.begin() haing in der RX-Drain-Schleife. Daher hier ungemappt.
     g_pin_map.lpc_to_rp[1 * 12 + 10] = 22;
-    // P1_11, P2_x: ungemappt (GP26..29 für ADC reserviert, siehe oben).
+    // P1_8/P1_9/P1_11, P2_x: ungemappt (GP26..29 für ADC reserviert, siehe oben).
 }
 
 void apply_defaults() {
