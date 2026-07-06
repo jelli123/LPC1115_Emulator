@@ -251,13 +251,16 @@ void cmd_status() {
         // = IRQ-Sturm -> Gast-Thread-Starvation. Nur belegte Timer zeigen.
         static const char* ctname[4] = { "CT16B0", "CT16B1", "CT32B0", "CT32B1" };
         for (int i = 0; i < 4; ++i) {
-            bool en; uint32_t pre, mr0, mcr, tc, ir, pends;
-            peripherals::ct_debug(i, en, pre, mr0, mcr, tc, ir, pends);
+            bool en; uint32_t pre, mr0, mcr, tc, ir, pends, mr1, mr2, mr3;
+            peripherals::ct_debug(i, en, pre, mr0, mcr, tc, ir, pends, mr1, mr2, mr3);
             if (!en && pends == 0u) continue;
-            std::printf("%s: %s pre=%lu MR0=0x%lx MCR=0x%lx TC=0x%lx IR=0x%lx pends=%lu\n",
+            std::printf("%s: %s pre=%lu MR0=0x%lx MR1=0x%lx MR2=0x%lx MR3=0x%lx MCR=0x%lx TC=0x%lx IR=0x%lx pends=%lu\n",
                         ctname[i], en ? "an" : "aus",
                         static_cast<unsigned long>(pre),
                         static_cast<unsigned long>(mr0),
+                        static_cast<unsigned long>(mr1),
+                        static_cast<unsigned long>(mr2),
+                        static_cast<unsigned long>(mr3),
                         static_cast<unsigned long>(mcr),
                         static_cast<unsigned long>(tc),
                         static_cast<unsigned long>(ir),

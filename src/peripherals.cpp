@@ -1301,7 +1301,21 @@ void ct_advance(CtModel& c) {
         if (k0 == 0) k0 = period;
         if (k0 > ticks) continue;                 // in diesem Intervall kein Treffer
         uint64_t fires = 1u + (ticks - k0) / period;
-        if (mcr & 0x1u) { c.ir |= (1u << m); irq_inject::pend(c.irq_num); ++c.dbg_pends; }
+        if (mcr & 0x1u) {
+            // LEVEL-getriggert (wie echter NVIC): nur eine IRQ-Anforderung
+            // erzeugen, wenn das IR-Match-Flag NEU von 0->1 geht. Ist es bereits
+            // gesetzt, hat der Gast die vorige Anforderung noch nicht per IR-Write
+            // quittiert (ISR laeuft/steht aus) -> die Anforderung bleibt bestehen,
+            // aber wir injizieren KEINEN weiteren Frame. Ohne das pumpte ein Timer
+            // mit kurzer Periode (KNX-Bus-Timer CT16B1) pro Match einen weiteren
+            // Inject und hungerte den Gast-Thread aus (live=1 dauerhaft, PC klebt
+            // in der ISR, serial.begin() kommt nie zurueck).
+            if (!(c.ir & (1u << m))) {
+                c.ir |= (1u << m);
+                irq_inject::pend(c.irq_num);
+                ++c.dbg_pends;
+            }
+        }
         // EMR/PWM-Pin: Endzustand annaehern. Toggle haengt von der Trefferparitaet
         // ab, Set/Clear ist idempotent -> jeweils passend oft anwenden.
         uint32_t emc = (c.emr >> (4u + 2u * static_cast<uint32_t>(m))) & 0x3u;
@@ -2746,12 +2760,19 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks) {
 // Match-IRQ-Pend-Zaehler. Erlaubt zu sehen, WELCHER Timer wie oft einen IRQ
 // pendet (Runaway-/Sturm-Erkennung) und mit welcher Konfiguration (pre/MR0/MCR).
 void ct_debug(int idx, bool& enabled, uint32_t& pre, uint32_t& mr0,
-              uint32_t& mcr, uint32_t& tc, uint32_t& ir, uint32_t& pends) {
-    if (idx < 0 || idx > 3) { enabled = false; pre = mr0 = mcr = tc = ir = pends = 0; return; }
+              uint32_t& mcr, uint32_t& tc, uint32_t& ir, uint32_t& pends,
+              uint32_t& mr1, uint32_t& mr2, uint32_t& mr3) {
+    if (idx < 0 || idx > 3) {
+        enabled = false; pre = mr0 = mcr = tc = ir = pends = mr1 = mr2 = mr3 = 0;
+        return;
+    }
     const CtModel& c = g_ct[idx];
     enabled = c.enabled;
     pre     = c.pre;
     mr0     = c.mr[0];
+    mr1     = c.mr[1];
+    mr2     = c.mr[2];
+    mr3     = c.mr[3];
     mcr     = c.mcr;
     tc      = c.tc;
     ir      = c.ir;
