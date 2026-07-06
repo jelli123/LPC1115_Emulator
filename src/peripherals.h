@@ -104,4 +104,9 @@ void last_mmio(uint32_t& addr, bool& is_write);
 // fruehreren ct_advance-Endlos-Loop.
 void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks);
 
+// Diagnose der HW-uart0-Initialisierung: Enter/Exit-Zaehler um den (potenziell
+// blockierenden) SDK-uart_init(). init_enter>init_exit = uart_init haengt gerade
+// (Busy-Wait im Fault-Handler-Kontext -> Core1 blockiert, SysTick-Shim steht).
+void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit);
+
 } // namespace peripherals

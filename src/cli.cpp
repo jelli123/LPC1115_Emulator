@@ -236,6 +236,14 @@ void cmd_status() {
                     static_cast<unsigned long>(ct_ug),
                     static_cast<unsigned long long>(ct_mt));
     }
+    {
+        uint32_t ui_enter, ui_exit;
+        peripherals::uart0_init_debug(ui_enter, ui_exit);
+        std::printf("UART-init: enter=%lu exit=%lu%s\n",
+                    static_cast<unsigned long>(ui_enter),
+                    static_cast<unsigned long>(ui_exit),
+                    (ui_enter != ui_exit) ? "  [HAENGT in uart_init!]" : "");
+    }
     std::printf("MMIO R=%llu W=%llu  GPIO=%llu  PLL-cfg=%llu  NVIC-W=%llu\n",
                 static_cast<unsigned long long>(s.mmio_reads),
                 static_cast<unsigned long long>(s.mmio_writes),

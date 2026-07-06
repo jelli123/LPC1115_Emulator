@@ -749,6 +749,14 @@ uint32_t g_uart0_rx_irq_pends = 0;
 uint32_t g_uart0_rbr_reads    = 0;
 uint32_t g_uart0_tx_writes    = 0;
 
+// uart_init-Enter/Exit-Zaehler (Diagnose, via 'uart status'). uart_init() der
+// Pico-SDK enthaelt unreset_block_num_wait_blocking (Busy-Wait). Laeuft es im
+// MMIO-Fault-Handler (Core1) und blockiert, kann der reale SysTick (niedrigere
+// Prio als der Fault-Handler) nicht mehr preempten -> SysTick-Shim steht ->
+// Core1 komplett blockiert. enter>exit beweist genau diesen Hang in uart_init.
+uint32_t g_uart_init_enter = 0;
+uint32_t g_uart_init_exit  = 0;
+
 // Letzter getrappter MMIO-Zugriff (via 'uart status'). Die Adresse identifiziert
 // das zuletzt beruehrte LPC-Peripherie-Register -> zeigt, wo der Gast haengt,
 // wenn er in einer Nicht-MMIO-Schleife steht (Adresse aendert sich dann nicht).
@@ -873,7 +881,9 @@ void uart0_ensure_hw(uint32_t f_cpu) {
     uint32_t baud = f_cpu / (16u * g_uart0.divisor);
     if (baud == 0) baud = 9600;
     if (!g_uart0.init_done) {
+        ++g_uart_init_enter;                 // vor dem (evtl. blockierenden) SDK-Call
         uart_init(g_uart0.hw, baud);
+        ++g_uart_init_exit;                  // nur erreicht, wenn uart_init zurueckkam
         g_uart0.init_done = true;
     } else {
         uart_set_baudrate(g_uart0.hw, baud);
@@ -2599,6 +2609,11 @@ void last_mmio(uint32_t& addr, bool& is_write) {
 void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks) {
     underflow_guards = g_ct_underflow_guards;
     max_ticks        = g_ct_max_ticks;
+}
+
+void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit) {
+    init_enter = g_uart_init_enter;
+    init_exit  = g_uart_init_exit;
 }
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-
