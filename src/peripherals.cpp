@@ -793,6 +793,15 @@ UartModel g_uart0{};
 uint32_t g_uart0_rx_irq_pends = 0;
 uint32_t g_uart0_rbr_reads    = 0;
 uint32_t g_uart0_tx_writes    = 0;
+// LEVEL-Halte-Flag fuer den UART0-RX-IRQ: true = wir haben fuer die aktuell
+// anliegenden Empfangsdaten bereits GENAU EINMAL gepended, der Gast hat sie noch
+// nicht vollstaendig gedraint. Verhindert, dass poll_timed_sources (laeuft sehr
+// oft: jeder SysTick-Shim + WFI-Loop) bei DAUERHAFT anliegenden Daten pro Zyklus
+// erneut pended -> sonst UART-RX-IRQ-Sturm (RX-IRQ-pends=320996 vs RBR-reads=1,
+// live=1, Gast-Thread verhungert in der ISR). Wird beim Leerlaufen der FIFO/des
+// Rings zurueckgesetzt (RBR-Read + poll) -> naechste Daten penden wieder frisch.
+// Analog zum Timer-IR-Flag (echter NVIC ist level-, nicht flankengetriggert).
+bool g_uart0_rx_signaled = false;
 
 // uart_init-Enter/Exit-Zaehler (Diagnose, via 'stats'). uart_init() der
 // Pico-SDK enthaelt unreset_block_num_wait_blocking (Busy-Wait). Laeuft es im
@@ -1005,6 +1014,8 @@ uint8_t uart0_read_reg(uint32_t addr) {
                 if ((g_uart0.ier & 0x01u) && !ring_empty(g_uart0_rx)) {
                     ++g_uart0_rx_irq_pends;
                     irq_inject::pend(lpc_irq::UART0);
+                } else if (ring_empty(g_uart0_rx)) {
+                    g_uart0_rx_signaled = false;   // Ring leer -> fuer neue Daten neu scharf
                 }
                 return b;
             }
@@ -1012,7 +1023,9 @@ uint8_t uart0_read_reg(uint32_t addr) {
                 uint8_t b = static_cast<uint8_t>(uart_getc(g_uart0.hw));
                 ++g_uart0_rbr_reads;
                 if ((g_uart0.ier & 0x01u) && uart_is_readable(g_uart0.hw))
-                    irq_inject::pend(lpc_irq::UART0);
+                    irq_inject::pend(lpc_irq::UART0);   // noch Daten -> weiter draining
+                else
+                    g_uart0_rx_signaled = false;        // FIFO leer -> neu scharf
                 return b;
             }
             return 0;
@@ -2160,6 +2173,7 @@ void reset() {
     g_pll_reconfig_pending = false;
     g_stats = {};
     g_uart0 = {};
+    g_uart0_rx_signaled = false;
     g_uart0_tx_gpio = -1;   // UART0-Pin-Routing bei Guest-(Neu)start zuruecksetzen
     g_uart0_rx_gpio = -1;
     for (auto& c : g_ct) c = {};
@@ -2376,7 +2390,19 @@ void poll_timed_sources() {
         bool have = config::uart0_cdc_enabled()
                         ? !ring_empty(g_uart0_rx)
                         : (g_uart0.hw && uart_is_readable(g_uart0.hw));
-        if (have) { ++g_uart0_rx_irq_pends; irq_inject::pend(lpc_irq::UART0); }
+        // LEVEL-Halten: nur bei der Flanke "keine Daten -> Daten" EINMAL penden.
+        // Liegen die Daten weiter an (Gast noch nicht gedraint), NICHT erneut
+        // penden (sonst RX-IRQ-Sturm -> Thread-Starvation). Sind keine Daten da,
+        // fuer die naechste Zustellung neu scharf machen.
+        if (have) {
+            if (!g_uart0_rx_signaled) {
+                ++g_uart0_rx_irq_pends;
+                irq_inject::pend(lpc_irq::UART0);
+                g_uart0_rx_signaled = true;
+            }
+        } else {
+            g_uart0_rx_signaled = false;
+        }
     }
 }
 
