@@ -861,6 +861,34 @@ void uart0_apply_pins() {
                 (inst == uart0) ? "uart0" : "uart1");
 }
 
+// Uebertraegt das vom Gast programmierte LPC-LCR-Format (Datenbits, Stopbits,
+// Paritaet) auf die reale RP2350-PL011 (lcr_h). OHNE das laeuft die HW-uart0 im
+// uart_init-Default 8N1 -> ein externes 8E1-Geraet (knxd/FT12, LCR=0x1B) wuerde
+// bei JEDEM Frame die Paritaet als Datenbit/Stopbit fehldeuten (Dauer-Framing-
+// Error). Busy-wait-frei: es gibt bei der (Re-)Konfiguration keine laufenden
+// Zeichen, daher entfaellt die 15-Baud-Wartezeit von uart_set_format() (die im
+// MMIO-Fault-Handler ohnehin unerwuenscht waere). Nur Registerschreibzugriffe.
+void uart0_apply_format() {
+    if (!g_uart0.hw) return;
+    const uint8_t lcr = g_uart0.lcr;
+    const uint32_t data_bits = 5u + (lcr & 0x03u);         // LPC LCR[1:0]=00..11 -> 5..8
+    const bool     two_stop  = (lcr & 0x04u) != 0;         // LPC LCR[2]=1 -> 2 Stopbits
+    const bool     pen       = (lcr & 0x08u) != 0;         // LPC LCR[3]=1 -> Paritaet an
+    const bool     even      = (lcr & 0x30u) == 0x10u;     // LPC LCR[5:4]=01 -> even
+    uint32_t lcr_h = ((data_bits - 5u) << UART_UARTLCR_H_WLEN_LSB) |
+                     (two_stop ? (1u << UART_UARTLCR_H_STP2_LSB) : 0u) |
+                     (pen  ? UART_UARTLCR_H_PEN_BITS : 0u) |
+                     (even ? UART_UARTLCR_H_EPS_BITS : 0u) |
+                     UART_UARTLCR_H_FEN_BITS;
+    uart_hw_t* hw = uart_get_hw(g_uart0.hw);
+    const uint32_t enabled = UART_UARTCR_UARTEN_BITS |
+                             UART_UARTCR_TXE_BITS | UART_UARTCR_RXE_BITS;
+    uint32_t cr_save = hw->cr;
+    hw->cr    = 0;                     // PL011: LCR_H nur bei DISABLED UART schreiben
+    hw->lcr_h = lcr_h;
+    hw->cr    = cr_save ? cr_save : enabled;
+}
+
 void uart0_ensure_hw(uint32_t f_cpu) {
     // Virtueller CDC-Modus: kein HW-uart0/Pin-Routing — TX/RX laufen ueber die
     // Ringe zu CDC#2. Nur den "konfiguriert"-Status fuehren (fuer LSR/Baud).
@@ -898,6 +926,7 @@ void uart0_ensure_hw(uint32_t f_cpu) {
     // Baudrate setzen (uart_set_baudrate).
     if (g_uart0.hw) {
         uart_set_baudrate(g_uart0.hw, baud);
+        uart0_apply_format();   // 8E1 (o. a.) aus Gast-LCR auf die PL011 uebernehmen
         g_uart0.init_done = true;
     }
 }
@@ -909,6 +938,18 @@ void uart0_ensure_hw(uint32_t f_cpu) {
 // Ohne geroutete Pins treiben/lesen die Bloecke keine echten Pins (harmlos).
 void uart_hw_boot_init() {
     ++g_uart_init_enter;                 // vor dem (auf Core0 unkritischen) SDK-Call
+    // clk_peri MUSS laufen, sonst kehrt uart_init() SOFORT zurueck (Early-Return
+    // bei uart_clock_get_hz(uart)==0 -> clock_get_hz(clk_peri)==0) OHNE das
+    // Control-Register zu setzen -> die UART bleibt HW-deaktiviert (cr=0x000, per
+    // 'stats' UART0-PAD gemessen: TX/RX korrekt auf FUNC_UART, RX-Pegel HIGH,
+    // aber cr=0 -> kein Loopback). In diesem Emulator ist clk_peri beim Boot 0
+    // (der Gast-Takt-Pfad konfiguriert nur clk_sys; clk_peri wird bewusst nicht
+    // angefasst). Daher hier EINMALIG clk_peri auf clk_sys aufsetzen (immer !=0).
+    if (clock_get_hz(clk_peri) == 0) {
+        clock_configure(clk_peri, 0,
+                        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                        clock_get_hz(clk_sys), clock_get_hz(clk_sys));
+    }
     uart_init(uart0, 115200);
     uart_init(uart1, 115200);
     ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
@@ -2642,14 +2683,15 @@ bool uart0_rx_live() {
 // FUNC_UART liegen und ob die RX-Leitung idle-high (1) oder low (0, -> 0x00) ist.
 void uart0_pad_debug(int& hw_sel, int& tx_gpio, int& rx_gpio,
                      int& tx_func, int& rx_func, int& rx_level,
-                     uint32_t& uart_cr) {
+                     uint32_t& uart_cr, uint32_t& uart_lcr_h) {
     hw_sel   = (g_uart0.hw == uart0) ? 0 : (g_uart0.hw == uart1) ? 1 : -1;
     tx_gpio  = g_uart0_tx_gpio;
     rx_gpio  = g_uart0_rx_gpio;
     tx_func  = (tx_gpio >= 0) ? static_cast<int>(gpio_get_function(static_cast<uint>(tx_gpio))) : -1;
     rx_func  = (rx_gpio >= 0) ? static_cast<int>(gpio_get_function(static_cast<uint>(rx_gpio))) : -1;
     rx_level = (rx_gpio >= 0) ? (gpio_get(static_cast<uint>(rx_gpio)) ? 1 : 0) : -1;
-    uart_cr  = g_uart0.hw ? uart_get_hw(g_uart0.hw)->cr : 0u;
+    uart_cr    = g_uart0.hw ? uart_get_hw(g_uart0.hw)->cr    : 0u;
+    uart_lcr_h = g_uart0.hw ? uart_get_hw(g_uart0.hw)->lcr_h : 0u;
 }
 
 void last_mmio(uint32_t& addr, bool& is_write) {

@@ -122,8 +122,10 @@ bool uart0_rx_live();
 //   tx_func/rx_func: reale Pad-Funktion (gpio_get_function); 2=GPIO_FUNC_UART
 //   rx_level: realer Eingangspegel des RX-Pads (0=LOW -> Dauer-0x00-Frames)
 //   uart_cr : uart0/1-Control-Register (Bit0 UARTEN, Bit8 TXE, Bit9 RXE)
+//   uart_lcr_h: uart0/1-Leitungsformat (WLEN Bits6:5, STP2 Bit3, PEN Bit1,
+//               EPS Bit2, FEN Bit4). 8E1+FIFO = 0x76.
 void uart0_pad_debug(int& hw_sel, int& tx_gpio, int& rx_gpio,
                      int& tx_func, int& rx_func, int& rx_level,
-                     uint32_t& uart_cr);
+                     uint32_t& uart_cr, uint32_t& uart_lcr_h);
 
 } // namespace peripherals
