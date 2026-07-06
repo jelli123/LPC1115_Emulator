@@ -859,7 +859,6 @@ void uart0_ensure_hw(uint32_t f_cpu) {
         return;
     }
     // Pins ZUERST routen: waehlt g_uart0.hw (uart0/uart1) anhand der Config-Pads.
-    uart_inst_t* prev = g_uart0.hw;
     uart0_apply_pins();
     // OHNE gueltiges Pin-Routing (uart0_tx/rx = -1) gibt es KEIN reales HW-Backing.
     // Frueher wurde blind auf uart0 (GP0/GP1) zurueckgefallen + uart_init gerufen —
@@ -876,18 +875,33 @@ void uart0_ensure_hw(uint32_t f_cpu) {
         g_uart0.init_done = true;
         return;
     }
-    if (g_uart0.hw != prev) g_uart0.init_done = false;
     if (g_uart0.divisor == 0) return;
     uint32_t baud = f_cpu / (16u * g_uart0.divisor);
     if (baud == 0) baud = 9600;
-    if (!g_uart0.init_done) {
-        ++g_uart_init_enter;                 // vor dem (evtl. blockierenden) SDK-Call
-        uart_init(g_uart0.hw, baud);
-        ++g_uart_init_exit;                  // nur erreicht, wenn uart_init zurueckkam
-        g_uart0.init_done = true;
-    } else {
+    // WICHTIG: KEIN uart_init() hier! Das laeuft im MMIO-Fault-Handler (Core1,
+    // Handler-Mode) und enthaelt in der SDK unreset_block_num_wait_blocking()
+    // (Busy-Wait); zudem wuerde ein Zugriff auf einen noch im RESET liegenden
+    // UART-Block dauerhaft "readable" liefern -> Endlos-/Blockier-Hang (bei FT12
+    // beobachtet: Core1 stand im FCR-Handler/serial.begin, mmio-traps + SysTick-
+    // Shim eingefroren). Die uart0/uart1-Bloecke werden EINMALIG beim Boot aus
+    // dem Reset geholt (uart_hw_boot_init, Core0). Hier nur die busy-wait-freie
+    // Baudrate setzen (uart_set_baudrate).
+    if (g_uart0.hw) {
         uart_set_baudrate(g_uart0.hw, baud);
+        g_uart0.init_done = true;
     }
+}
+
+// Holt uart0 + uart1 EINMALIG beim Boot (Core0, peripherals::init) aus dem Reset
+// + initialisiert sie. Danach sind beide Bloecke bereit; spaetere Zugriffe im
+// MMIO-Fault-Handler (Core1) brauchen nur noch uart_set_baudrate (busy-wait-frei)
+// und uart_is_readable/uart_getc (Peripheral NICHT mehr im Reset -> kein Hang).
+// Ohne geroutete Pins treiben/lesen die Bloecke keine echten Pins (harmlos).
+void uart_hw_boot_init() {
+    ++g_uart_init_enter;                 // vor dem (auf Core0 unkritischen) SDK-Call
+    uart_init(uart0, 115200);
+    uart_init(uart1, 115200);
+    ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
 }
 
 uint8_t uart0_read_reg(uint32_t addr) {
@@ -964,15 +978,17 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
             break;
         case UART0_FCR: {
             g_uart0.fcr = val;
-            // FCR Bit1 = RX-FIFO-Reset (UM10398): verwirft alle gepufferten
-            // Empfangsdaten -> LSR.DR wird 0. sblib serial.begin() schreibt
-            // FCR=0x07 direkt vor der Drain-Schleife; ohne echtes Zuruecksetzen
-            // haette ein voller Ring/FIFO die Schleife am Laufen gehalten.
+            // FCR Bit1 = RX-FIFO-Reset (UM10398): verwirft gepufferte Empfangs-
+            // daten -> LSR.DR wird 0. sblib serial.begin() schreibt FCR=0x07 vor
+            // der Drain-Schleife. Wir leeren nur den SOFTWARE-Ring (CDC-Pfad).
+            // KEIN uart_getc-Drain der echten HW-FIFO hier: eine `while
+            // (uart_is_readable) uart_getc`-Schleife auf einem (noch) im Reset
+            // liegenden oder dauerhaft "readable" meldenden Block haengt endlos
+            // (bei FT12 GENAU hier beobachtet: Core1 stand im FCR-Write auf
+            // 0x40008008). Die HW-FIFO wird vom regulaeren RBR-Read geleert.
             if (val & 0x02u) {
                 uint8_t tmp;
                 while (ring_pop(g_uart0_rx, tmp)) { /* Ring leeren */ }
-                if (!config::uart0_cdc_enabled() && g_uart0.hw)
-                    while (uart_is_readable(g_uart0.hw)) (void)uart_getc(g_uart0.hw);
             }
             break;
         }
@@ -2010,6 +2026,7 @@ namespace peripherals {
 
 void init() {
     reset();
+    uart_hw_boot_init();   // uart0/uart1 EINMALIG (Core0) aus dem Reset holen
     i2c_bridge_init();
     spi_bridge_init();
     adc_bridge_init();
