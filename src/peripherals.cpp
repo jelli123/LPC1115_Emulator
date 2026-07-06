@@ -29,6 +29,27 @@
 #include "hardware/regs/powman.h"
 #include "pico/stdlib.h"
 
+// ---------------------------------------------------------------------------
+// ECHTE RP2350-Hardware-UART-Zeiger — MUESSEN vor dem folgenden
+// '#undef UART0_BASE' festgehalten werden.
+//
+// Der Emulator widmet UART0_BASE weiter unten fuer die LPC-Sicht um
+// (#undef + 'constexpr uint32_t UART0_BASE = 0x40008000'). Das SDK-Makro
+//     #define uart0 ((uart_inst_t *)UART0_BASE)
+// wird aber erst BEI VERWENDUNG expandiert und setzte dann die LPC-Adresse ein
+// -> jedes uart_init(uart0)/uart_get_hw(uart0)/... im Emulator zielte auf
+// 0x40008000 statt auf die echte RP2350-uart0 (0x40070000). uart1 blieb dabei
+// zufaellig korrekt, weil UART1_BASE NICHT umdefiniert wird. Genau das war die
+// Ursache, dass die HW-UART0 nie ansprach (cr/lcr_h lasen 0, Writes verpufften),
+// waehrend uart1 (GP4/5) einwandfrei lief. Hier die korrekten SDK-Adressen
+// EINMAL sichern (Makros noch gueltig) und ueberall statt uart0/uart1 nutzen.
+// Namen bewusst NICHT uart0_hw/uart1_hw: das sind bereits SDK-Makros
+// (#define uart0_hw ((uart_hw_t *)UART0_BASE)) -> Namenskollision.
+namespace rp2350_hw {
+inline uart_inst_t* inst0() { return reinterpret_cast<uart_inst_t*>(UART0_BASE); }
+inline uart_inst_t* inst1() { return reinterpret_cast<uart_inst_t*>(UART1_BASE); }
+}
+
 // Pico-SDK 2.x definiert in addressmap.h Makros wie WDT_BASE, ADC_BASE,
 // I2C_BASE, … für RP2350. Wir modellieren hier LPC1115-Adressen und
 // brauchen die RP2350-Adressen nicht — Makros wegnehmen.
@@ -218,7 +239,7 @@ bool resolve_uart_pins(int tx, int rx, uart_inst_t*& inst,
     const UartPad* pt = lookup_uart_pad(tx, /*tx=*/true);
     const UartPad* pr = lookup_uart_pad(rx, /*tx=*/false);
     if (!pt || !pr || pt->inst != pr->inst) return false;
-    inst    = pt->inst == 0 ? uart0 : uart1;
+    inst    = pt->inst == 0 ? rp2350_hw::inst0() : rp2350_hw::inst1();
     tx_func = pt->aux ? GPIO_FUNC_UART_AUX : GPIO_FUNC_UART;
     rx_func = pr->aux ? GPIO_FUNC_UART_AUX : GPIO_FUNC_UART;
     return true;
@@ -892,7 +913,7 @@ void uart0_apply_pins() {
     g_uart0_tx_gpio = tx;
     g_uart0_rx_gpio = rx;
     std::printf("[UART0] TX->GP%d RX->GP%d (%s)\n", tx, rx,
-                (inst == uart0) ? "uart0" : "uart1");
+                (inst == rp2350_hw::inst0()) ? "uart0" : "uart1");
 }
 
 // Uebertraegt das vom Gast programmierte LPC-LCR-Format (Datenbits, Stopbits,
@@ -986,20 +1007,20 @@ void uart_hw_boot_init() {
     g_clk_sys_hz    = clock_get_hz(clk_sys);
     g_clk_peri_hz   = clock_get_hz(clk_peri);
     g_clk_peri_ctrl = clocks_hw->clk[clk_peri].ctrl;
-    g_uart0_init_ret = uart_init(uart0, 115200);
-    g_uart0_cr_boot   = uart_get_hw(uart0)->cr;
-    g_uart0_lcrh_boot = uart_get_hw(uart0)->lcr_h;
-    uart_init(uart1, 115200);
-    g_u1_cr_boot = uart_get_hw(uart1)->cr;
-    // Entscheidender Test: schreibt sich uart0->cr ueberhaupt? (uart1 = Referenz)
-    uart_get_hw(uart0)->cr = UART_UARTCR_UARTEN_BITS |
+    g_uart0_init_ret = uart_init(rp2350_hw::inst0(), 115200);
+    g_uart0_cr_boot   = uart_get_hw(rp2350_hw::inst0())->cr;
+    g_uart0_lcrh_boot = uart_get_hw(rp2350_hw::inst0())->lcr_h;
+    uart_init(rp2350_hw::inst1(), 115200);
+    g_u1_cr_boot = uart_get_hw(rp2350_hw::inst1())->cr;
+    // Verifikation: schreibt sich uart0->cr jetzt (mit korrektem RP2350-Zeiger)?
+    uart_get_hw(rp2350_hw::inst0())->cr = UART_UARTCR_UARTEN_BITS |
                              UART_UARTCR_TXE_BITS | UART_UARTCR_RXE_BITS;
-    g_u0_cr_wb = uart_get_hw(uart0)->cr;
-    // ACCESSCTRL + Basisadressen erfassen (erklaeren, warum uart0-Writes verpuffen)
+    g_u0_cr_wb = uart_get_hw(rp2350_hw::inst0())->cr;
+    // ACCESSCTRL + Basisadressen erfassen (Kontrolle)
     g_acc_u0  = accessctrl_hw->uart[0];
     g_acc_u1  = accessctrl_hw->uart[1];
-    g_u0_addr = reinterpret_cast<uint32_t>(uart_get_hw(uart0));
-    g_u1_addr = reinterpret_cast<uint32_t>(uart_get_hw(uart1));
+    g_u0_addr = reinterpret_cast<uint32_t>(uart_get_hw(rp2350_hw::inst0()));
+    g_u1_addr = reinterpret_cast<uint32_t>(uart_get_hw(rp2350_hw::inst1()));
     ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
 }
 
@@ -2732,7 +2753,7 @@ bool uart0_rx_live() {
 void uart0_pad_debug(int& hw_sel, int& tx_gpio, int& rx_gpio,
                      int& tx_func, int& rx_func, int& rx_level,
                      uint32_t& uart_cr, uint32_t& uart_lcr_h) {
-    hw_sel   = (g_uart0.hw == uart0) ? 0 : (g_uart0.hw == uart1) ? 1 : -1;
+    hw_sel   = (g_uart0.hw == rp2350_hw::inst0()) ? 0 : (g_uart0.hw == rp2350_hw::inst1()) ? 1 : -1;
     tx_gpio  = g_uart0_tx_gpio;
     rx_gpio  = g_uart0_rx_gpio;
     tx_func  = (tx_gpio >= 0) ? static_cast<int>(gpio_get_function(static_cast<uint>(tx_gpio))) : -1;
