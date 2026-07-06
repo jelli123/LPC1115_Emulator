@@ -34,6 +34,26 @@ static inline void dbg_puts(const char* s)
     while (*s) { *port = (unsigned char)*s++; }
 }
 
+// Ein Byte als 2-stelligen Hex ausgeben (Debug-Bridge).
+static inline void dbg_hex8(unsigned char b)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    volatile unsigned char* port = (volatile unsigned char*)0x4FFF0000u;
+    *port = (unsigned char)hx[(b >> 4) & 0xF];
+    *port = (unsigned char)hx[b & 0xF];
+}
+
+// Vorzeichenlose Dezimalzahl ausgeben (Debug-Bridge).
+static inline void dbg_u32(unsigned int v)
+{
+    char buf[10];
+    int n = 0;
+    if (v == 0) { dbg_puts("0"); return; }
+    while (v && n < 10) { buf[n++] = (char)('0' + (v % 10)); v /= 10; }
+    volatile unsigned char* port = (volatile unsigned char*)0x4FFF0000u;
+    while (n) { *port = (unsigned char)buf[--n]; }
+}
+
 BcuFt12 bcuFt12 = BcuFt12();  //!< Bus coupling unit Maskversion 0x0012 of the ft12 module
 
 /** ft12 bit timeout converted in milliseconds */
@@ -517,6 +537,35 @@ void processTelegram()
  */
 void loop()
 {
+    // --- Debug-Heartbeat (nur Emulator): einmal pro Sekunde Lebenszeichen.
+    // Zeigt: (a) loop() laeuft, (b) millis() schreitet fort (Gast-SysTick ok),
+    // (c) wie viele Serial-Bytes bisher empfangen wurden. So sehen wir aus
+    // GAST-Sicht, ob ueberhaupt etwas von knxd ankommt.
+    static uint32_t s_rx_total = 0;
+    static uint32_t s_last_hb = 0;
+    static bool     s_first = true;
+    static uint32_t s_iter = 0;
+    ++s_iter;
+    uint32_t now_ms = millis();
+    // Erstmeldung sofort (unabhaengig von millis) -> beweist, dass loop() erreicht
+    // wird, selbst falls die Zeitbasis klemmen wuerde.
+    if (s_first)
+    {
+        s_first = false;
+        dbg_puts("[FT12] loop() erreicht\n");
+    }
+    if ((now_ms - s_last_hb) >= 1000u)
+    {
+        s_last_hb = now_ms;
+        dbg_puts("[FT12] alive t=");
+        dbg_u32(now_ms);
+        dbg_puts("ms iter=");
+        dbg_u32(s_iter);
+        dbg_puts(" rx_total=");
+        dbg_u32(s_rx_total);
+        dbg_puts("\n");
+    }
+
     if (knxRxTimeout.expired())
     {
         digitalWrite(LED_KNX_RX, LED_OFF);
@@ -525,6 +574,10 @@ void loop()
     int32_t byte;
     while ((byte = serial.read()) > -1)
     {
+        ++s_rx_total;
+        dbg_puts("[FT12] rx=");
+        dbg_hex8((unsigned char)byte);
+        dbg_puts("\n");
         lastSerialRecvTime = millis();
         // start byte / frame detection, fixed or variable frame or just a ack
         if (frameType == FT_NONE)
