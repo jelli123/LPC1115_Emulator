@@ -220,6 +220,11 @@ uint32_t inject_depth_max() {
     return g_inject_depth_max.load(std::memory_order_relaxed);
 }
 
+uint32_t inject_depth_live() {
+    int d = g_inject_depth;
+    return d < 0 ? 0u : static_cast<uint32_t>(d);
+}
+
 void reset_inject_depth() {
     g_inject_depth = 0;
 }

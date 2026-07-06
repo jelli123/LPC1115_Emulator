@@ -86,6 +86,7 @@ constexpr uint32_t MAINCLKSEL         = SYSCON_BASE + 0x070;
 constexpr uint32_t MAINCLKUEN         = SYSCON_BASE + 0x074;
 constexpr uint32_t SYSAHBCLKDIV       = SYSCON_BASE + 0x078;
 constexpr uint32_t SYSAHBCLKCTRL      = SYSCON_BASE + 0x080;
+constexpr uint32_t UARTCLKDIV         = SYSCON_BASE + 0x098;
 constexpr uint32_t PDRUNCFG           = SYSCON_BASE + 0x238;
 
 // IOCON Block bei 0x40044000 — Pinmux. Modellieren wir als RAM (kein Effekt).
@@ -515,6 +516,15 @@ uint32_t        g_mainclksel   = 0;       // 0 = IRC, 2 = SYSPLLOUT
 uint32_t        g_sysahbclkdiv = 1;
 uint32_t        g_pdruncfg     = 0xFFFF;
 uint32_t        g_bodctrl      = 0;        // LPC BODCTRL-Schatten
+// SYSAHBCLKCTRL (Peripherie-Takt-Gates) + UARTCLKDIV (UART-Teiler). Beide MUESSEN
+// modelliert werden: sblib serial.begin() setzt UARTCLKDIV=1 und berechnet daraus
+// den Baud-Divisor `SystemCoreClock*SYSAHBCLKDIV/UARTCLKDIV/16/baud`. Ohne Modell
+// las UARTCLKDIV 0 -> Division durch 0 -> divisor=0 -> uart0_ensure_hw brach ab
+// (apply_format uebersprungen) -> UART blieb im uart_init-Default 115200 8N1
+// statt 19200 8E1 (per 'stats' lcr_h=0x70). Reset-Default UARTCLKDIV=0 (UART-Takt
+// aus), der Gast aktiviert ihn in begin(); SYSAHBCLKCTRL Reset-Default 0x3F.
+uint32_t        g_sysahbclkctrl = 0x3F;
+uint32_t        g_uartclkdiv    = 0;
 
 // Bildet das LPC-Brownout-Detect auf die *echte* RP2350-POWMAN-BOD ab.
 //
@@ -684,6 +694,8 @@ void syscon_write32(uint32_t addr, uint32_t value) {
         case SYSPLLCLKSEL:  g_syspllclksel = value & 0x3u;  g_pll_reconfig_pending = true; break;
         case MAINCLKSEL:    g_mainclksel   = value & 0x3u;  g_pll_reconfig_pending = true; break;
         case SYSAHBCLKDIV:  g_sysahbclkdiv = value & 0xFFu; g_pll_reconfig_pending = true; break;
+        case SYSAHBCLKCTRL: g_sysahbclkctrl = value;                                         break;
+        case UARTCLKDIV:    g_uartclkdiv    = value & 0xFFu;                                  break;
         case PDRUNCFG:      g_pdruncfg     = value;                                           break;
         case BODCTRL:       g_bodctrl      = value & 0x1Fu; bod_apply();                       break;
         case SYSPLLCLKUEN:
@@ -707,6 +719,8 @@ uint32_t syscon_read32(uint32_t addr) {
         case MAINCLKSEL:   return g_mainclksel;
         case MAINCLKUEN:   return 1;
         case SYSAHBCLKDIV: return g_sysahbclkdiv;
+        case SYSAHBCLKCTRL: return g_sysahbclkctrl;
+        case UARTCLKDIV:   return g_uartclkdiv;
         case PDRUNCFG:     return g_pdruncfg;
         case BODCTRL:      return g_bodctrl;
         default:
@@ -1107,6 +1121,7 @@ struct CtModel {
     // Handle pro Kanal (m=0..3), -1 = Software-PWM (generischer Fallback).
     int      tx_handle[4]; // < 0 = Software-PWM für diesen Kanal
     float    tx_rate;      // PIO-Zählrate [Counts/s] (für alle Kanäle gleich)
+    uint32_t dbg_pends;    // Diagnose: wie oft dieser Timer einen Match-IRQ pendete
 };
 CtModel g_ct[4];
 
@@ -1286,7 +1301,7 @@ void ct_advance(CtModel& c) {
         if (k0 == 0) k0 = period;
         if (k0 > ticks) continue;                 // in diesem Intervall kein Treffer
         uint64_t fires = 1u + (ticks - k0) / period;
-        if (mcr & 0x1u) { c.ir |= (1u << m); irq_inject::pend(c.irq_num); }
+        if (mcr & 0x1u) { c.ir |= (1u << m); irq_inject::pend(c.irq_num); ++c.dbg_pends; }
         // EMR/PWM-Pin: Endzustand annaehern. Toggle haengt von der Trefferparitaet
         // ab, Set/Clear ist idempotent -> jeweils passend oft anwenden.
         uint32_t emc = (c.emr >> (4u + 2u * static_cast<uint32_t>(m))) & 0x3u;
@@ -2122,6 +2137,8 @@ void reset() {
     g_syspllclksel = 0;
     g_mainclksel   = 0;
     g_sysahbclkdiv = 1;
+    g_sysahbclkctrl = 0x3F;
+    g_uartclkdiv   = 0;
     g_pdruncfg     = 0xFFFF;
     g_bodctrl      = 0;
     g_current_hz   = 12'000'000;
@@ -2723,6 +2740,22 @@ void last_mmio(uint32_t& addr, bool& is_write) {
 void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks) {
     underflow_guards = g_ct_underflow_guards;
     max_ticks        = g_ct_max_ticks;
+}
+
+// Diagnose je CT-Timer (0=CT16B0,1=CT16B1,2=CT32B0,3=CT32B1): Grundzustand +
+// Match-IRQ-Pend-Zaehler. Erlaubt zu sehen, WELCHER Timer wie oft einen IRQ
+// pendet (Runaway-/Sturm-Erkennung) und mit welcher Konfiguration (pre/MR0/MCR).
+void ct_debug(int idx, bool& enabled, uint32_t& pre, uint32_t& mr0,
+              uint32_t& mcr, uint32_t& tc, uint32_t& ir, uint32_t& pends) {
+    if (idx < 0 || idx > 3) { enabled = false; pre = mr0 = mcr = tc = ir = pends = 0; return; }
+    const CtModel& c = g_ct[idx];
+    enabled = c.enabled;
+    pre     = c.pre;
+    mr0     = c.mr[0];
+    mcr     = c.mcr;
+    tc      = c.tc;
+    ir      = c.ir;
+    pends   = c.dbg_pends;
 }
 
 void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit) {

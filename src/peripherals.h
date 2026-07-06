@@ -103,6 +103,11 @@ void last_mmio(uint32_t& addr, bool& is_write);
 // + groesster je berechneter Tick-Wert. underflow_guards>0 erklaert einen
 // fruehreren ct_advance-Endlos-Loop.
 void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks);
+// Diagnose je CT-Timer (0=CT16B0,1=CT16B1,2=CT32B0,3=CT32B1): Grundzustand +
+// Match-IRQ-Pend-Zaehler (pends). Zeigt, welcher Timer wie oft einen IRQ pendet
+// (Runaway-/Sturm-Erkennung) und mit welcher Konfiguration (pre/MR0/MCR/TC/IR).
+void ct_debug(int idx, bool& enabled, uint32_t& pre, uint32_t& mr0,
+              uint32_t& mcr, uint32_t& tc, uint32_t& ir, uint32_t& pends);
 
 // Diagnose der HW-uart0-Initialisierung: Enter/Exit-Zaehler um den (potenziell
 // blockierenden) SDK-uart_init(). init_enter>init_exit = uart_init haengt gerade

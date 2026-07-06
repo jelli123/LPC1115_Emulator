@@ -241,8 +241,28 @@ void cmd_status() {
         // Groesste IRQ-Injektions-Verschachtelung. 1 = keine Reentrancy (gesund);
         // >1 = ein injizierter Handler wurde rekursiv preemptet (frueherer
         // UART0-RX-Storm). Nach dem Reentrancy-Gate sollte der Wert 1 bleiben.
-        std::printf("IRQ-Inject: max-depth=%lu\n",
-                    static_cast<unsigned long>(irq_inject::inject_depth_max()));
+        std::printf("IRQ-Inject: max-depth=%lu live=%lu\n",
+                    static_cast<unsigned long>(irq_inject::inject_depth_max()),
+                    static_cast<unsigned long>(irq_inject::inject_depth_live()));
+    }
+    {
+        // CT-Timer-Diagnose: pro Timer Konfiguration + Match-IRQ-Pend-Zaehler.
+        // Ein Timer mit sehr hohem 'pends' bei kurzer Periode (kleiner MR0, pre=0)
+        // = IRQ-Sturm -> Gast-Thread-Starvation. Nur belegte Timer zeigen.
+        static const char* ctname[4] = { "CT16B0", "CT16B1", "CT32B0", "CT32B1" };
+        for (int i = 0; i < 4; ++i) {
+            bool en; uint32_t pre, mr0, mcr, tc, ir, pends;
+            peripherals::ct_debug(i, en, pre, mr0, mcr, tc, ir, pends);
+            if (!en && pends == 0u) continue;
+            std::printf("%s: %s pre=%lu MR0=0x%lx MCR=0x%lx TC=0x%lx IR=0x%lx pends=%lu\n",
+                        ctname[i], en ? "an" : "aus",
+                        static_cast<unsigned long>(pre),
+                        static_cast<unsigned long>(mr0),
+                        static_cast<unsigned long>(mcr),
+                        static_cast<unsigned long>(tc),
+                        static_cast<unsigned long>(ir),
+                        static_cast<unsigned long>(pends));
+        }
     }
     {
         uint32_t ui_enter, ui_exit;

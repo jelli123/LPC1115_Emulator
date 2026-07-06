@@ -48,6 +48,11 @@ void note_injected_return();
 // >1 = ein injizierter Handler wurde (frueher) rekursiv preemptet.
 uint32_t inject_depth_max();
 
+// AKTUELLE (live) Injektions-Verschachtelungstiefe. 1 = Gast steckt gerade in
+// GENAU einem injizierten Handler; >1 = Verschachtelung; bleibt es dauerhaft 1,
+// haengt der Gast in einer ISR (z. B. Timer-IRQ-Sturm).
+uint32_t inject_depth_live();
+
 // Injektions-Verschachtelungstiefe auf 0 zuruecksetzen. MUSS bei jedem Gast-
 // (Neu)start gerufen werden: nach einem fatalen Fault innerhalb eines injizierten
 // Handlers bleibt g_inject_depth>0 stehen (der Handler kehrt nie zurueck); ohne
