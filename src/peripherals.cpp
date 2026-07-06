@@ -23,6 +23,8 @@
 #include "hardware/structs/clocks.h"
 #include "hardware/structs/scb.h"
 #include "hardware/structs/systick.h"
+#include "hardware/structs/resets.h"
+#include "hardware/regs/resets.h"
 #include "hardware/regs/powman.h"
 #include "pico/stdlib.h"
 
@@ -777,6 +779,11 @@ uint32_t g_clk_sys_hz    = 0;
 uint32_t g_clk_peri_hz   = 0;
 uint32_t g_clk_peri_ctrl = 0;
 uint32_t g_uart0_init_ret = 0xFFFFFFFFu;
+// uart0->cr / ->lcr_h DIREKT nach uart_init(uart0) im Boot (Core0). Trennt die
+// Diagnose: sind sie hier 0x301/0x70, aber in 'stats' spaeter 0 -> etwas RESETtet
+// uart0 nach dem Boot. Sind sie schon hier 0 -> uart_init-Writes greifen nicht.
+uint32_t g_uart0_cr_boot   = 0xDEAD;
+uint32_t g_uart0_lcrh_boot = 0xDEAD;
 
 // Letzter getrappter MMIO-Zugriff (via 'uart status'). Die Adresse identifiziert
 // das zuletzt beruehrte LPC-Peripherie-Register -> zeigt, wo der Gast haengt,
@@ -964,6 +971,8 @@ void uart_hw_boot_init() {
     g_clk_peri_hz   = clock_get_hz(clk_peri);
     g_clk_peri_ctrl = clocks_hw->clk[clk_peri].ctrl;
     g_uart0_init_ret = uart_init(uart0, 115200);
+    g_uart0_cr_boot   = uart_get_hw(uart0)->cr;
+    g_uart0_lcrh_boot = uart_get_hw(uart0)->lcr_h;
     uart_init(uart1, 115200);
     ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
 }
@@ -2726,6 +2735,12 @@ void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit,
     clk_peri_hz    = g_clk_peri_hz;
     clk_peri_ctrl  = g_clk_peri_ctrl;
     uart0_init_ret = g_uart0_init_ret;
+}
+
+void uart0_boot_regs(uint32_t& cr_boot, uint32_t& lcrh_boot, uint32_t& resets_now) {
+    cr_boot    = g_uart0_cr_boot;
+    lcrh_boot  = g_uart0_lcrh_boot;
+    resets_now = resets_hw->reset;   // Bit26=uart0, Bit27=uart1 (1=IM RESET gehalten)
 }
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-

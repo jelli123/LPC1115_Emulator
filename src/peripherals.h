@@ -114,6 +114,11 @@ void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit,
                       uint32_t& clk_sys_hz, uint32_t& clk_peri_hz,
                       uint32_t& clk_peri_ctrl, uint32_t& uart0_init_ret);
 
+// uart0->cr / ->lcr_h wie sie DIREKT nach uart_init(uart0) im Boot waren, plus
+// das LIVE RESETS-Register (Bit26=uart0, Bit27=uart1; 1 = Block wird IM RESET
+// gehalten -> Registerschreibzugriffe verpuffen, cr/lcr_h lesen 0).
+void uart0_boot_regs(uint32_t& cr_boot, uint32_t& lcrh_boot, uint32_t& resets_now);
+
 // Live-RX-Zustand der LPC-UART0 (LSR.DR): true = meldet gerade Empfangsdaten.
 // Zeigt, ob eine haengende serial.begin()-Drain-Schleife echte Bytes sieht.
 bool uart0_rx_live();
