@@ -187,7 +187,8 @@ uint32_t read_cluster_chain(uint16_t first_cluster, uint32_t size,
     return copied;
 }
 
-bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size) {
+bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size,
+                    uint32_t* out_idx = nullptr) {
     const uint8_t* root = g_disk +
         (RESERVED_SECTORS + SECTORS_PER_FAT) * SECTOR_SIZE;
     char want[11];
@@ -214,9 +215,59 @@ bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size) {
                   (static_cast<uint32_t>(e[29]) << 8) |
                   (static_cast<uint32_t>(e[30]) << 16) |
                   (static_cast<uint32_t>(e[31]) << 24);
+        if (out_idx) *out_idx = i;
         return true;
     }
     return false;
+}
+
+// VFAT-Pruefsumme des 8.3-Namens (11 Byte). Verbindet die LFN-Teileintraege mit
+// ihrem Short-Entry (Byte[13] jedes LFN-Eintrags traegt genau diese Summe).
+uint8_t lfn_checksum(const uint8_t* name11) {
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; ++i)
+        sum = static_cast<uint8_t>((((sum & 1u) ? 0x80u : 0u) +
+                                    (sum >> 1) + name11[i]) & 0xFFu);
+    return sum;
+}
+
+// Rekonstruiert den VFAT-Langnamen (LFN) zum 8.3-Eintrag an Index `short_idx`.
+// Die LFN-Teileintraege stehen unmittelbar VOR dem Short-Entry (kleinere
+// Indizes), jeweils Attribut 0x0F; Byte[0]&0x3F = 1-basierte Teilnummer, Bit
+// 0x40 = letzter logischer Teil; Byte[13] = 8.3-Pruefsumme (Zugehoerigkeit).
+// Jeder Teil traegt 13 UTF-16-Zeichen (Offsets 1..10, 14..25, 28..31). Fuer die
+// Log-Ausgabe auf ASCII reduziert (Nicht-ASCII -> '?'). Liefert false, wenn kein
+// gueltiger LFN vorliegt -> der Aufrufer nutzt dann den 8.3-Namen.
+bool read_long_name(uint32_t short_idx, char* out, std::size_t cap) {
+    if (!out || cap < 2u || short_idx == 0u) return false;
+    const uint8_t* root = g_disk +
+        (RESERVED_SECTORS + SECTORS_PER_FAT) * SECTOR_SIZE;
+    const uint8_t sum = lfn_checksum(root + short_idx * 32);
+    static const uint8_t POS[13] = {1,3,5,7,9, 14,16,18,20,22,24, 28,30};
+
+    std::size_t written = 0;
+    bool done = false;
+    for (uint32_t n = 1; n <= 20u && short_idx >= n && !done; ++n) {
+        const uint8_t* le = root + (short_idx - n) * 32;
+        if (le[11] != 0x0F)       return false;   // kein LFN -> kein Langname
+        if (le[13] != sum)        return false;   // gehoert nicht zu diesem Short
+        if ((le[0] & 0x3Fu) != n) return false;   // Reihenfolge gestoert
+        std::size_t base = static_cast<std::size_t>(n - 1u) * 13u;
+        for (int k = 0; k < 13; ++k) {
+            uint16_t ch = static_cast<uint16_t>(le[POS[k]] | (le[POS[k] + 1] << 8));
+            if (ch == 0x0000) { done = true; break; }   // Namensende
+            if (ch == 0xFFFF) continue;                  // Padding
+            std::size_t idx = base + static_cast<std::size_t>(k);
+            if (idx < cap - 1u) {
+                out[idx] = (ch >= 0x20 && ch < 0x80) ? static_cast<char>(ch) : '?';
+                if (idx + 1u > written) written = idx + 1u;
+            }
+        }
+        if (le[0] & 0x40u) done = true;              // letzter logischer Teil
+    }
+    if (written == 0u) return false;
+    out[written] = '\0';
+    return true;
 }
 
 // Sucht eine ladbare HEX-Datei im Root-Verzeichnis. Bevorzugt BOOT.HEX,
@@ -224,10 +275,16 @@ bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size) {
 // kann der Anwender die Datei unter ihrem Originalnamen ablegen, ohne sie
 // vorher in BOOT.HEX umbenennen zu muessen. 'out_name' (>=13 Byte) erhaelt
 // den gefundenen 8.3-Namen ("NAME.HEX") fuer die Log-Ausgabe.
-bool find_hex_entry(uint16_t& cluster, uint32_t& size, char* out_name) {
+bool find_hex_entry(uint16_t& cluster, uint32_t& size,
+                    char* out_name, std::size_t out_cap) {
     // 1) Bevorzugt BOOT.HEX (eindeutiges, bewusst gewaehltes Ziel).
-    if (find_dir_entry("BOOT.HEX", cluster, size) && size > 0) {
-        if (out_name) std::strcpy(out_name, "BOOT.HEX");
+    uint32_t bidx = 0;
+    if (find_dir_entry("BOOT.HEX", cluster, size, &bidx) && size > 0) {
+        if (out_name && out_cap > 0) {
+            // Langnamen bevorzugen (falls per LFN abgelegt), sonst 8.3.
+            if (!read_long_name(bidx, out_name, out_cap))
+                std::snprintf(out_name, out_cap, "BOOT.HEX");
+        }
         return true;
     }
     // 2) Erste beliebige *.HEX-Datei im Root-Verzeichnis.
@@ -248,14 +305,18 @@ bool find_hex_entry(uint16_t& cluster, uint32_t& size, char* out_name) {
                   (static_cast<uint32_t>(e[30]) << 16) |
                   (static_cast<uint32_t>(e[31]) << 24);
         if (size == 0) continue;
-        if (out_name) {
+        if (out_name && out_cap > 0) {
+            // Zuerst den 8.3-Namen als Fallback bauen ...
             int p = 0;
-            for (int j = 0; j < 8 && e[j] != ' '; ++j)
+            for (int j = 0; j < 8 && e[j] != ' ' &&
+                            static_cast<std::size_t>(p) + 5u < out_cap; ++j)
                 out_name[p++] = static_cast<char>(
                     toupper(static_cast<unsigned char>(e[j])));
             out_name[p++] = '.';
             out_name[p++] = 'H'; out_name[p++] = 'E'; out_name[p++] = 'X';
             out_name[p]   = '\0';
+            // ... dann, falls vorhanden, den VFAT-Langnamen bevorzugen.
+            read_long_name(i, out_name, out_cap);
         }
         return true;
     }
@@ -769,10 +830,10 @@ void on_volume_ready() {
     static uint8_t hex_buf[64 * 1024 + 1024];
     uint32_t hex_len  = 0;
     bool     have_hex = false;
-    char     hex_name[16] = {0};
+    char     hex_name[64] = {0};
     {
         uint16_t hcl; uint32_t hsz;
-        if (find_hex_entry(hcl, hsz, hex_name) && hsz > 0) {
+        if (find_hex_entry(hcl, hsz, hex_name, sizeof hex_name) && hsz > 0) {
             hex_len  = read_cluster_chain(hcl, hsz, hex_buf, sizeof hex_buf);
             have_hex = true;
         }
