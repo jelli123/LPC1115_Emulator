@@ -237,11 +237,15 @@ void cmd_status() {
                     static_cast<unsigned long long>(ct_mt));
     }
     {
-        uint32_t ui_enter, ui_exit;
-        peripherals::uart0_init_debug(ui_enter, ui_exit);
-        std::printf("UART-init: enter=%lu exit=%lu%s\n",
+        uint32_t ui_enter, ui_exit, cs_hz, cp_hz, cp_ctrl, u0ret;
+        peripherals::uart0_init_debug(ui_enter, ui_exit, cs_hz, cp_hz, cp_ctrl, u0ret);
+        std::printf("UART-init: enter=%lu exit=%lu ret0=%lu clk_sys=%luHz clk_peri=%luHz ctrl=0x%08lx%s\n",
                     static_cast<unsigned long>(ui_enter),
                     static_cast<unsigned long>(ui_exit),
+                    static_cast<unsigned long>(u0ret),
+                    static_cast<unsigned long>(cs_hz),
+                    static_cast<unsigned long>(cp_hz),
+                    static_cast<unsigned long>(cp_ctrl),
                     (ui_enter != ui_exit) ? "  [HAENGT in uart_init!]" : "");
     }
     {

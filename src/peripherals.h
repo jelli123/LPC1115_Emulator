@@ -107,7 +107,12 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks);
 // Diagnose der HW-uart0-Initialisierung: Enter/Exit-Zaehler um den (potenziell
 // blockierenden) SDK-uart_init(). init_enter>init_exit = uart_init haengt gerade
 // (Busy-Wait im Fault-Handler-Kontext -> Core1 blockiert, SysTick-Shim steht).
-void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit);
+// Zusaetzlich reale Boot-Taktwerte + uart_init-Rueckgabe, um den cr=0x000-Fall
+// (UART HW-deaktiviert) zu erklaeren: clk_peri_hz/ctrl (Bit11 ENABLE) zeigen, ob
+// der UART-Takt real laeuft; uart0_init_ret=0 = uart_init nahm den Early-Return.
+void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit,
+                      uint32_t& clk_sys_hz, uint32_t& clk_peri_hz,
+                      uint32_t& clk_peri_ctrl, uint32_t& uart0_init_ret);
 
 // Live-RX-Zustand der LPC-UART0 (LSR.DR): true = meldet gerade Empfangsdaten.
 // Zeigt, ob eine haengende serial.begin()-Drain-Schleife echte Bytes sieht.

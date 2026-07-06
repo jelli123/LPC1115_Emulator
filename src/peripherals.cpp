@@ -767,6 +767,17 @@ uint32_t g_uart0_tx_writes    = 0;
 uint32_t g_uart_init_enter = 0;
 uint32_t g_uart_init_exit  = 0;
 
+// Boot-Takt-Diagnose (via 'stats' UART-init-Zeile): reale Werte, um den cr=0x000-
+// Fall (UART bleibt HW-deaktiviert) datengetrieben zu erklaeren, statt zu raten.
+//   g_clk_sys_hz / g_clk_peri_hz: clock_get_hz() NACH clk_peri-Setup.
+//   g_clk_peri_ctrl: clocks_hw->clk[clk_peri].ctrl (Bit11 ENABLE). clock_get_hz
+//     spiegelt NUR die konfigurierte Freq, NICHT das Enable-Bit -> hier direkt lesen.
+//   g_uart0_init_ret: Rueckgabe von uart_init(uart0) (0 = Early-Return, Takt war 0).
+uint32_t g_clk_sys_hz    = 0;
+uint32_t g_clk_peri_hz   = 0;
+uint32_t g_clk_peri_ctrl = 0;
+uint32_t g_uart0_init_ret = 0xFFFFFFFFu;
+
 // Letzter getrappter MMIO-Zugriff (via 'uart status'). Die Adresse identifiziert
 // das zuletzt beruehrte LPC-Peripherie-Register -> zeigt, wo der Gast haengt,
 // wenn er in einer Nicht-MMIO-Schleife steht (Adresse aendert sich dann nicht).
@@ -940,17 +951,19 @@ void uart_hw_boot_init() {
     ++g_uart_init_enter;                 // vor dem (auf Core0 unkritischen) SDK-Call
     // clk_peri MUSS laufen, sonst kehrt uart_init() SOFORT zurueck (Early-Return
     // bei uart_clock_get_hz(uart)==0 -> clock_get_hz(clk_peri)==0) OHNE das
-    // Control-Register zu setzen -> die UART bleibt HW-deaktiviert (cr=0x000, per
-    // 'stats' UART0-PAD gemessen: TX/RX korrekt auf FUNC_UART, RX-Pegel HIGH,
-    // aber cr=0 -> kein Loopback). In diesem Emulator ist clk_peri beim Boot 0
-    // (der Gast-Takt-Pfad konfiguriert nur clk_sys; clk_peri wird bewusst nicht
-    // angefasst). Daher hier EINMALIG clk_peri auf clk_sys aufsetzen (immer !=0).
-    if (clock_get_hz(clk_peri) == 0) {
-        clock_configure(clk_peri, 0,
-                        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
-                        clock_get_hz(clk_sys), clock_get_hz(clk_sys));
-    }
-    uart_init(uart0, 115200);
+    // Control-Register zu setzen + OHNE den Block aus dem Reset zu holen -> die
+    // UART bleibt HW-deaktiviert, spaetere cr/lcr_h-Schreibzugriffe verpuffen
+    // (per 'stats' gemessen: cr=0x000 lcr_h=0x00 trotz korrektem Pin-Routing).
+    // UNBEDINGT neu konfigurieren: clock_get_hz() liefert nur die zuletzt
+    // KONFIGURIERTE Frequenz, NICHT den realen Enable-Zustand -> ein bedingtes
+    // "nur wenn ==0" kann faelschlich ueberspringen, obwohl der Takt real steht.
+    clock_configure(clk_peri, 0,
+                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                    clock_get_hz(clk_sys), clock_get_hz(clk_sys));
+    g_clk_sys_hz    = clock_get_hz(clk_sys);
+    g_clk_peri_hz   = clock_get_hz(clk_peri);
+    g_clk_peri_ctrl = clocks_hw->clk[clk_peri].ctrl;
+    g_uart0_init_ret = uart_init(uart0, 115200);
     uart_init(uart1, 115200);
     ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
 }
@@ -2704,9 +2717,15 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks) {
     max_ticks        = g_ct_max_ticks;
 }
 
-void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit) {
-    init_enter = g_uart_init_enter;
-    init_exit  = g_uart_init_exit;
+void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit,
+                      uint32_t& clk_sys_hz, uint32_t& clk_peri_hz,
+                      uint32_t& clk_peri_ctrl, uint32_t& uart0_init_ret) {
+    init_enter     = g_uart_init_enter;
+    init_exit      = g_uart_init_exit;
+    clk_sys_hz     = g_clk_sys_hz;
+    clk_peri_hz    = g_clk_peri_hz;
+    clk_peri_ctrl  = g_clk_peri_ctrl;
+    uart0_init_ret = g_uart0_init_ret;
 }
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-
