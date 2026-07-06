@@ -254,6 +254,19 @@ void cmd_status() {
                     static_cast<unsigned long>(mmio_addr),
                     mmio_wr ? "Write" : "Read");
     }
+    {
+        // LPC-UART0-Aktivitaet (immer sichtbar, HW- wie CDC-Modus). rbr_reads
+        // steigt = Gast liest echte Empfangsbytes; rx-live = LSR.DR gerade gesetzt.
+        uint8_t u_ier; bool u_nvic;
+        uint32_t u_pends, u_rbr, u_tx;
+        peripherals::uart0_debug(u_ier, u_nvic, u_pends, u_rbr, u_tx);
+        std::printf("UART0: IER=0x%02x NVIC=%s RX-live=%s | RX-IRQ-pends=%lu RBR-reads=%lu THR-writes=%lu\n",
+                    u_ier, u_nvic ? "an" : "aus",
+                    peripherals::uart0_rx_live() ? "JA" : "nein",
+                    static_cast<unsigned long>(u_pends),
+                    static_cast<unsigned long>(u_rbr),
+                    static_cast<unsigned long>(u_tx));
+    }
     std::printf("MMIO R=%llu W=%llu  GPIO=%llu  PLL-cfg=%llu  NVIC-W=%llu\n",
                 static_cast<unsigned long long>(s.mmio_reads),
                 static_cast<unsigned long long>(s.mmio_writes),

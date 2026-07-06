@@ -2618,6 +2618,14 @@ void uart0_debug(uint8_t& ier, bool& nvic_en, uint32_t& rx_irq_pends,
     tx_writes    = g_uart0_tx_writes;
 }
 
+// Live-RX-Zustand: meldet die LPC-UART0 GERADE Empfangsdaten (LSR.DR)? Zeigt, ob
+// eine haengende serial.begin()-Drain-Schleife echte Bytes sieht (HW/Leitung)
+// oder faelschlich dauerhaft "readable" ist. Nebenwirkungsfrei (kein RBR-pop).
+bool uart0_rx_live() {
+    if (config::uart0_cdc_enabled()) return !ring_empty(g_uart0_rx);
+    return g_uart0.hw && uart_is_readable(g_uart0.hw);
+}
+
 void last_mmio(uint32_t& addr, bool& is_write) {
     addr     = g_last_mmio_addr;
     is_write = g_last_mmio_write;

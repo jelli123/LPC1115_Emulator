@@ -109,4 +109,8 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks);
 // (Busy-Wait im Fault-Handler-Kontext -> Core1 blockiert, SysTick-Shim steht).
 void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit);
 
+// Live-RX-Zustand der LPC-UART0 (LSR.DR): true = meldet gerade Empfangsdaten.
+// Zeigt, ob eine haengende serial.begin()-Drain-Schleife echte Bytes sieht.
+bool uart0_rx_live();
+
 } // namespace peripherals
