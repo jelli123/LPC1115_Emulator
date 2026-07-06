@@ -6,6 +6,7 @@
 #include "emulator.h"
 #include "config.h"
 #include "vnvic.h"
+#include "irq_inject.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -124,6 +125,7 @@ bool try_injected_irq_return(uint32_t* frame) {
     psp += 32u;                                                   // Fault-Frame ueberspringen
     __asm volatile ("msr psp, %0" :: "r"(psp));
     __ISB();
+    irq_inject::note_injected_return();   // Injektionstiefe -- + Tail-Chaining
     ++faultsys::g_stats.mem_traps;
     return true;
 }

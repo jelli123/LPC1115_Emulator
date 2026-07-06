@@ -14,6 +14,7 @@
 #include "led.h"
 #include "xmodem.h"
 #include "debug_bridge.h"
+#include "irq_inject.h"
 #include "usb_descriptors.h"
 
 extern "C" void usb_stdio_task(void);
@@ -235,6 +236,13 @@ void cmd_status() {
         std::printf("CT-Advance: underflow-guards=%lu max-ticks=%llu\n",
                     static_cast<unsigned long>(ct_ug),
                     static_cast<unsigned long long>(ct_mt));
+    }
+    {
+        // Groesste IRQ-Injektions-Verschachtelung. 1 = keine Reentrancy (gesund);
+        // >1 = ein injizierter Handler wurde rekursiv preemptet (frueherer
+        // UART0-RX-Storm). Nach dem Reentrancy-Gate sollte der Wert 1 bleiben.
+        std::printf("IRQ-Inject: max-depth=%lu\n",
+                    static_cast<unsigned long>(irq_inject::inject_depth_max()));
     }
     {
         uint32_t ui_enter, ui_exit;

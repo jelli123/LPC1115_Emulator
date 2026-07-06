@@ -7,6 +7,7 @@
 #include "hex_patcher.h"
 #include "vnvic.h"
 #include "target_halt.h"   // on_guest_reset() bei Core-Reset
+#include "irq_inject.h"    // reset_inject_depth() bei Core-Reset
 
 #include <atomic>
 #include <cstdio>
@@ -590,6 +591,7 @@ void core1_reset_and_relaunch(State target) {
     g_state.store(State::Idle);          // core1_main soll zunaechst warten
     mpu_setup::disable();
     target_halt::on_guest_reset();       // stehengebliebene Halt-Flags loeschen
+    irq_inject::reset_inject_depth();    // Injektionstiefe nach evtl. Fault nullen
     boot_core1();
     if (fifo_irq) irq_set_enabled(SIO_IRQ_FIFO, true);
     if (target == State::Running) {

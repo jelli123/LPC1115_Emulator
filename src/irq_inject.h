@@ -37,4 +37,21 @@ void poll();
 // Vom PendSV-Asm-Wrapper gerufen: führt eine Iteration der Injektion durch.
 extern "C" void pendsv_inject_c();
 
+// Vom Fault-Handler (try_injected_irq_return) beim Ruecksprung eines injizierten
+// Handlers aufgerufen: dekrementiert die Injektions-Verschachtelungstiefe und
+// liefert (Tail-Chaining) einen noch pendenden IRQ nach. Verhindert zusammen mit
+// dem Tiefen-Gate in pendsv_inject_c die rekursive Selbst-Preemption eines im
+// Thread-Mode laufenden Handlers (z. B. UART0-RX, der sich im RBR-Read neu pendet).
+void note_injected_return();
+
+// Groesste je erreichte Injektions-Verschachtelungstiefe (Diagnose via 'stats').
+// >1 = ein injizierter Handler wurde (frueher) rekursiv preemptet.
+uint32_t inject_depth_max();
+
+// Injektions-Verschachtelungstiefe auf 0 zuruecksetzen. MUSS bei jedem Gast-
+// (Neu)start gerufen werden: nach einem fatalen Fault innerhalb eines injizierten
+// Handlers bleibt g_inject_depth>0 stehen (der Handler kehrt nie zurueck); ohne
+// Reset wuerde das Tiefen-Gate nach dem Neustart JEDE IRQ-Injektion blockieren.
+void reset_inject_depth();
+
 } // namespace irq_inject

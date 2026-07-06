@@ -72,6 +72,16 @@ uint32_t lookup_handler(uint8_t lpc_irq) {
 // Vorrang vor den NVIC-IRQs konsumiert.
 std::atomic<bool> g_systick_pending{false};
 
+// Verschachtelungstiefe der injizierten Handler (nur auf Core1 veraendert:
+// inject_frame ++ / note_injected_return --). Injizierte Frames laufen im
+// THREAD-Mode und haben KEINEN HW-"active"-Schutz wie echte Exceptions -> ohne
+// dieses Gate koennte ein sich selbst neu pendender IRQ (UART0-RX im RBR-Read)
+// seinen eigenen, noch laufenden Handler rekursiv preempten (ein Frame pro Byte)
+// -> PSP-Stack-Overflow -> Gast-RAM-Korruption -> UNDEFINSTR. g_inject_depth_max
+// nur fuer die 'stats'-Diagnose (Core0 liest lesend).
+int g_inject_depth = 0;
+std::atomic<uint32_t> g_inject_depth_max{0};
+
 // Synthetisiert einen Exception-Frame fuer 'handler' oben auf den Gast-PSP,
 // sodass beim PendSV-EXC_RETURN der Gast-Handler im Thread-Mode anlaeuft. Der
 // Ruecksprung (LR=0xFFFFFFFD) wird vom Fault-Handler (try_injected_irq_return)
@@ -92,6 +102,10 @@ void inject_frame(uint32_t handler) {
                     != (reinterpret_cast<uintptr_t>(psp) & 4u))
                    ? (1u << 9) : 0u);
     write_guest_psp(reinterpret_cast<uint32_t*>(frame));
+    ++g_inject_depth;
+    uint32_t d = static_cast<uint32_t>(g_inject_depth);
+    if (d > g_inject_depth_max.load(std::memory_order_relaxed))
+        g_inject_depth_max.store(d, std::memory_order_relaxed);
 }
 
 // Atomar: nimm das nächste pending+enabled IRQ und claime es.
@@ -168,8 +182,17 @@ extern "C" void pendsv_inject_c() {
     }
 
     // Solange Pending+Enabled vorliegt, einen Frame synthetisieren.
-    // Wir injizieren maximal einen IRQ pro PendSV-Lauf, um Tail-Chaining
-    // dem Hardware-Mechanismus zu überlassen.
+    // RE-ENTRANCY-GATE: Injizierte Handler laufen im THREAD-Mode und haben KEINEN
+    // HW-"active"-Schutz wie echte Exceptions. Laeuft bereits ein injizierter
+    // Handler (g_inject_depth>0), darf KEIN weiterer Frame injiziert werden —
+    // sonst preemptet z. B. der UART0-RX-IRQ (der sich im RBR-Read selbst neu
+    // pendet) seinen eigenen, noch laufenden Handler: pro empfangenem Byte ein
+    // neuer Frame auf dem PSP -> unbeschraenkte Rekursion -> PSP-Stack-Overflow
+    // -> Gast-RAM-Korruption -> UNDEFINSTR (bei FT12/knxd-Dauerstrom reproduziert).
+    // Der IRQ bleibt im vNVIC pending und wird beim Ruecksprung des laufenden
+    // Handlers (note_injected_return) nachgeliefert = Tail-Chaining wie in HW.
+    if (g_inject_depth > 0) return;
+
     int8_t n = take_next_irq();
     if (n < 0) return;
 
@@ -180,18 +203,25 @@ extern "C" void pendsv_inject_c() {
     }
 
     inject_frame(handler);
+    // KEIN sofortiges Tail-Chain-Re-Pend hier: weitere pending IRQs werden erst
+    // beim Ruecksprung DIESES Handlers (note_injected_return) geliefert. Ein
+    // sofortiges PENDSVSET wuerde jetzt ohnehin am Tiefen-Gate abprallen.
+}
 
-    // Mehrere LPC-IRQs koennen GLEICHZEITIG pending sein (z. B. mehrere CT-Timer
-    // matchen im selben Host-Tick). Wir injizieren nur EINEN Frame pro PendSV-
-    // Lauf; die uebrigen wuerden sonst bis zum naechsten Ausloeser (Alarm-Tick/
-    // MMIO-Trap) haengen — und stuenden gar, wenn der Gast kein SysTick nutzt und
-    // keine weiteren Matches anstehen. Daher PendSV erneut takten, sobald noch
-    // ein pending+enabled IRQ vorliegt: PendSV (niedrigste Prio) feuert dann
-    // NACH Rueckkehr des gerade injizierten Handlers und liefert den naechsten.
-    // take_next_irq() hat den aktuellen bereits geclaimt -> keine Doppel-
-    // injektion, die Kette terminiert, wenn alle ausgeliefert sind.
-    if (vnvic::irq_pending())
+void note_injected_return() {
+    if (g_inject_depth > 0) --g_inject_depth;
+    // Beim Verlassen des aeussersten injizierten Handlers einen evtl. noch
+    // pendenden IRQ nachliefern (Tail-Chaining). PENDSVSET ist atomar/kontextfrei.
+    if (g_inject_depth == 0 && vnvic::irq_pending())
         SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+}
+
+uint32_t inject_depth_max() {
+    return g_inject_depth_max.load(std::memory_order_relaxed);
+}
+
+void reset_inject_depth() {
+    g_inject_depth = 0;
 }
 
 } // namespace irq_inject
