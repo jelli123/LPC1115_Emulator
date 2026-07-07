@@ -1310,7 +1310,8 @@ void run() {
     const bool cli_on = config::cli_enabled();
     char line[LINE_MAX];
     std::size_t len = 0;
-    int hist_browse = 0;   // 0 = aktuelle Eingabe; >0 = n Schritte zurueck
+    int  hist_browse = 0;    // 0 = aktuelle Eingabe; >0 = n Schritte zurueck
+    bool last_cr     = false; // fuer CRLF-Entprellung (siehe Enter-Behandlung)
     if (cli_on) std::printf("emu> ");
     while (true) {
         usb_stdio_task();
@@ -1337,7 +1338,28 @@ void run() {
         }
         int c = getchar_timeout_us(1'000);
         if (c == PICO_ERROR_TIMEOUT) continue;
-        if (c == '\r') continue;
+
+        // --- Enter: terminal-unabhaengig. PuTTY/serielle Terminals senden bei
+        // Enter oft NUR CR ('\r'), andere LF ('\n'), manche CRLF. Alle drei als
+        // Zeilenende akzeptieren; ein LF unmittelbar nach CR (das CRLF-Paar) wird
+        // entprellt, damit nicht zwei Kommandos ausgeloest werden.
+        if (c == '\r' || c == '\n') {
+            if (c == '\n' && last_cr) { last_cr = false; continue; }
+            last_cr = (c == '\r');
+            std::putchar('\n');
+            line[len] = '\0';
+            if (g_in_hex_upload) process_hex_line(line);
+            else { history_push(line); handle_command(line); }
+            len = 0;
+            hist_browse = 0;
+            std::printf("emu> ");
+            // Ausgabe des Kommandos sofort ueber USB rausschieben, damit die
+            // Antwort nicht erst beim naechsten Tastendruck sichtbar wird.
+            std::fflush(stdout);
+            usb_stdio_task();
+            continue;
+        }
+        last_cr = false;   // jedes Nicht-CR-Zeichen beendet ein evtl. CRLF-Paar
 
         // --- ESC-Sequenzen (Pfeiltasten): ESC '[' 'A'/'B' = History hoch/runter.
         // Nur im Nicht-Upload-Modus; die Folgebytes kommen zusammen (kurzer poll).
@@ -1366,20 +1388,6 @@ void run() {
             continue;
         }
 
-        if (c == '\n') {
-            std::putchar('\n');
-            line[len] = '\0';
-            if (g_in_hex_upload) process_hex_line(line);
-            else { history_push(line); handle_command(line); }
-            len = 0;
-            hist_browse = 0;
-            std::printf("emu> ");
-            // Ausgabe des Kommandos sofort ueber USB rausschieben, damit die
-            // Antwort nicht erst beim naechsten Tastendruck sichtbar wird.
-            std::fflush(stdout);
-            usb_stdio_task();
-            continue;
-        }
         if (c == 0x7F /* DEL */ || c == 0x08 /* BS */) {
             if (len) { --len; std::printf("\b \b"); }
             continue;
