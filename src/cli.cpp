@@ -148,24 +148,25 @@ void cmd_xmodem() {
 
 void cmd_help() {
     static const char* lines[] = {
-        "Befehle:",
+        "Befehle (abkuerzbar auf eindeutiges Praefix, z.B. 'cf sh' = 'cfg show'):",
         "  help                       diese Hilfe",
         "  version                    Build-Info",
-        "  stats / status             Emulatorstatus & Zaehler",
+        "  stats                      Emulatorstatus & Zaehler",
         "  dbg [clear]                Gast-Debug-Ausgabe zeigen/loeschen",
         "  dbg save                   Debug-Ausgabe als DEBUG.TXT aufs Laufwerk",
-        "  dbg auto <sek|off>         DEBUG.TXT automatisch alle N s aktualisieren",        "  reset                      Emulator-Core neu starten",
+        "  dbg auto <sek|off>         DEBUG.TXT automatisch alle N s aktualisieren",
+        "  reset                      Emulator-Core neu starten",
         "",
         "  upload                     Intel-Hex-Stream starten (alias: flash hex)",
         "  xmodem                     Intel-Hex per XMODEM-CRC/1K empfangen",
         "  info                       Reset-Vektor, Stack, Groesse, CRC",
         "  erase                      Firmware-Slot loeschen (alias: flash erase)",
         "  run                        Guest starten",
-        "  halt / stop                Guest anhalten",
+        "  halt                       Guest anhalten",
         "  step                       ein Befehl, dann halten",
         "  autostart on|off           nach Reset automatisch starten",
         "",
-        "  cfg list                   alle KV-Paare ausgeben",
+        "  cfg show                   alle KV-Paare ausgeben",
         "  cfg get <key>              Wert lesen",
         "  cfg set <key> <value>      Wert setzen",
         "  cfg save                   RAM-Snapshot in Flash schreiben",
@@ -199,6 +200,9 @@ void cmd_help() {
         "  flash hex                  Intel-Hex-Stream (alias fuer upload)",
         "  flash erase                Firmware-Slot loeschen",
         "  flash finalize <bytes>     Firmware abschliessen + CRC-Marker",
+        "",
+        "Aliase: show=list=dump, stats=status, run=start, halt=stop, cfg=config,",
+        "pinmap=pin. Unbekannte/mehrdeutige Eingaben zeigen passende Vorschlaege.",
         nullptr
     };
     for (int i = 0; lines[i]; ++i) std::puts(lines[i]);
@@ -435,6 +439,106 @@ bool parse_port_pin(const char* s, long& out) {
 
 void emit_line(const char* l) { std::puts(l); }
 
+// ===========================================================================
+// CLI-Komfort: Praefix-Aufloesung, Alias-Kanonisierung, Vorschlaege.
+//
+// - Befehle UND Optionen duerfen auf ihr kuerzestes EINDEUTIGES Praefix
+//   abgekuerzt werden ('cf sh' -> 'cfg show').
+// - Aliase (list/dump=show, status=stats, config=cfg, pin=pinmap, ...) werden
+//   auf ihren kanonischen Namen abgebildet; die Hilfe zeigt nur den kanonischen.
+// - Unbekannter/mehrdeutiger Befehl -> passende Kandidaten in EINER Zeile.
+// - Unbekannte/mehrdeutige Option -> moegliche Optionen des Befehls in EINER Zeile.
+//
+// Umsetzung: Vor der eigentlichen Dispatch-Kette werden tokens[0] (Befehl) und
+// ggf. tokens[1] (Option) auf ihre kanonische Form umgeschrieben. Die bestehende
+// strcmp-Kette bleibt dadurch unveraendert nutzbar.
+// ===========================================================================
+struct Word { const char* w; const char* canon; };   // w=Eingabewort, canon=kanonisch
+
+// Top-Level-Befehle (inkl. Aliase). w==canon markiert den kanonischen Eintrag.
+constexpr Word TOP[] = {
+    {"help","help"}, {"version","version"},
+    {"stats","stats"}, {"status","stats"},
+    {"dbg","dbg"}, {"reset","reset"},
+    {"upload","upload"}, {"xmodem","xmodem"}, {"info","info"},
+    {"erase","erase"},
+    {"run","run"}, {"start","run"},
+    {"halt","halt"}, {"stop","halt"},
+    {"step","step"}, {"autostart","autostart"},
+    {"cfg","cfg"}, {"config","cfg"},
+    {"pinmap","pinmap"}, {"pin","pinmap"},
+    {"freq","freq"}, {"flash","flash"},
+    {"gdb","gdb"}, {"bp","bp"}, {"regs","regs"}, {"mem","mem"},
+    {"pio","pio"}, {"swd","swd"}, {"cdc","cdc"},
+    {"uart","uart"}, {"i2c","i2c"},
+};
+
+// Sub-Optionen je Befehl (kanonisch + Aliase).
+constexpr Word SUB_DBG[]    = {{"clear","clear"},{"save","save"},{"auto","auto"}};
+constexpr Word SUB_CFG[]    = {{"show","show"},{"list","show"},{"dump","show"},
+                               {"get","get"},{"set","set"},{"save","save"},{"clear","clear"}};
+constexpr Word SUB_PINMAP[] = {{"show","show"},{"list","show"},{"set","set"},{"reset","reset"}};
+constexpr Word SUB_GDB[]    = {{"on","on"},{"off","off"},{"status","status"}};
+constexpr Word SUB_SWD[]    = {{"start","start"},{"stop","stop"},{"status","status"}};
+constexpr Word SUB_CDC[]    = {{"start","start"},{"stop","stop"},{"status","status"}};
+constexpr Word SUB_UART[]   = {{"pins","pins"},{"cdc","cdc"},{"status","status"}};
+constexpr Word SUB_I2C[]    = {{"on","on"},{"off","off"},{"status","status"}};
+constexpr Word SUB_PIO[]    = {{"capture","capture"}};
+constexpr Word SUB_FLASH[]  = {{"hex","hex"},{"erase","erase"},{"finalize","finalize"}};
+constexpr Word SUB_BP[]     = {{"clr","clr"}};   // blosse Adresse = Breakpoint setzen
+
+template <int N> constexpr int wcount(const Word (&)[N]) { return N; }
+
+// Liefert die Sub-Optionstabelle eines (kanonischen) Befehls, sonst false.
+bool get_subtable(const char* cmd, const Word*& tbl, int& cnt) {
+    if (!std::strcmp(cmd, "dbg"))    { tbl = SUB_DBG;    cnt = wcount(SUB_DBG);    return true; }
+    if (!std::strcmp(cmd, "cfg"))    { tbl = SUB_CFG;    cnt = wcount(SUB_CFG);    return true; }
+    if (!std::strcmp(cmd, "pinmap")) { tbl = SUB_PINMAP; cnt = wcount(SUB_PINMAP); return true; }
+    if (!std::strcmp(cmd, "gdb"))    { tbl = SUB_GDB;    cnt = wcount(SUB_GDB);    return true; }
+    if (!std::strcmp(cmd, "swd"))    { tbl = SUB_SWD;    cnt = wcount(SUB_SWD);    return true; }
+    if (!std::strcmp(cmd, "cdc"))    { tbl = SUB_CDC;    cnt = wcount(SUB_CDC);    return true; }
+    if (!std::strcmp(cmd, "uart"))   { tbl = SUB_UART;   cnt = wcount(SUB_UART);   return true; }
+    if (!std::strcmp(cmd, "i2c"))    { tbl = SUB_I2C;    cnt = wcount(SUB_I2C);    return true; }
+    if (!std::strcmp(cmd, "pio"))    { tbl = SUB_PIO;    cnt = wcount(SUB_PIO);    return true; }
+    if (!std::strcmp(cmd, "flash"))  { tbl = SUB_FLASH;  cnt = wcount(SUB_FLASH);  return true; }
+    if (!std::strcmp(cmd, "bp"))     { tbl = SUB_BP;     cnt = wcount(SUB_BP);     return true; }
+    return false;
+}
+
+// Loest ein Eingabewort gegen eine Tabelle auf: exakter Treffer ODER eindeutiges
+// Praefix. Aliase, die auf DENSELBEN kanonischen Namen zeigen, gelten NICHT als
+// mehrdeutig. Rueckgabe: kanonischer Name oder nullptr. 'distinct' = Anzahl
+// verschiedener kanonischer Treffer (0=keiner, 1=eindeutig, >1=mehrdeutig).
+const char* resolve_word(const char* in, const Word* tbl, int cnt, int& distinct) {
+    for (int i = 0; i < cnt; ++i)
+        if (!std::strcmp(in, tbl[i].w)) { distinct = 1; return tbl[i].canon; }
+    const std::size_t len = std::strlen(in);
+    const char* canon = nullptr;
+    distinct = 0;
+    for (int i = 0; i < cnt; ++i) {
+        if (std::strncmp(in, tbl[i].w, len) != 0) continue;
+        if (!canon)                              { canon = tbl[i].canon; distinct = 1; }
+        else if (std::strcmp(canon, tbl[i].canon) != 0) ++distinct;
+    }
+    return (distinct == 1) ? canon : nullptr;
+}
+
+// Gibt die (deduplizierten) kanonischen Namen einer Tabelle in EINER Zeile aus,
+// optional gefiltert auf ein Praefix (nullptr = alle).
+void print_matches(const Word* tbl, int cnt, const char* prefix) {
+    const char* shown[40]; int ns = 0;
+    const std::size_t len = prefix ? std::strlen(prefix) : 0;
+    for (int i = 0; i < cnt && ns < 40; ++i) {
+        if (prefix && std::strncmp(tbl[i].w, prefix, len) != 0) continue;
+        bool dup = false;
+        for (int j = 0; j < ns; ++j)
+            if (!std::strcmp(shown[j], tbl[i].canon)) { dup = true; break; }
+        if (!dup) shown[ns++] = tbl[i].canon;
+    }
+    for (int i = 0; i < ns; ++i) std::printf("%s%s", i ? " " : "", shown[i]);
+    std::putchar('\n');
+}
+
 void handle_command(char* line) {
     while (*line == ' ' || *line == '\t') ++line;
     if (!*line) return;
@@ -449,6 +553,42 @@ void handle_command(char* line) {
     }
 
     if (n == 0) return;
+
+    // --- Praefix-/Alias-Aufloesung: Befehl (tokens[0]) und ggf. Option
+    // (tokens[1]) auf ihre kanonische Form bringen, bevor die Dispatch-Kette
+    // laeuft. Ermoeglicht Abkuerzungen ('cf sh' -> 'cfg show') und liefert bei
+    // Unbekanntem/Mehrdeutigem hilfreiche Vorschlaege in einer Zeile.
+    {
+        int distinct = 0;
+        const char* cmd = resolve_word(tokens[0], TOP, wcount(TOP), distinct);
+        if (!cmd) {
+            if (distinct > 1) {
+                std::printf("mehrdeutig '%s' — passt auf: ", tokens[0]);
+                print_matches(TOP, wcount(TOP), tokens[0]);
+            } else {
+                std::printf("unbekannt '%s'. Befehle: ", tokens[0]);
+                print_matches(TOP, wcount(TOP), nullptr);
+            }
+            return;
+        }
+        tokens[0] = const_cast<char*>(cmd);
+
+        const Word* sub = nullptr; int subn = 0;
+        if (n >= 2 && get_subtable(cmd, sub, subn)) {
+            int sd = 0;
+            const char* opt = resolve_word(tokens[1], sub, subn, sd);
+            if (opt) {
+                tokens[1] = const_cast<char*>(opt);
+            } else if (!std::strcmp(cmd, "bp")) {
+                // 'bp <addr>': tokens[1] ist eine Adresse, keine Option -> lassen.
+            } else {
+                if (sd > 1) std::printf("mehrdeutige Option '%s' fuer '%s': ", tokens[1], cmd);
+                else        std::printf("unbekannte Option '%s' fuer '%s'. Moeglich: ", tokens[1], cmd);
+                print_matches(sub, subn, sd > 1 ? tokens[1] : nullptr);
+                return;
+            }
+        }
+    }
 
     // --- Allgemein ---
     if (std::strcmp(tokens[0], "help") == 0)    { cmd_help(); return; }
@@ -610,10 +750,9 @@ void handle_command(char* line) {
         return;
     }
 
-    // --- Konfiguration: cfg list/get/set/save (USERGUIDE-kompatibel) ---
+    // --- Konfiguration: cfg show/get/set/save/clear (USERGUIDE-kompatibel) ---
     if (std::strcmp(tokens[0], "cfg") == 0 && n >= 2) {
-        if (std::strcmp(tokens[1], "list") == 0 ||
-            std::strcmp(tokens[1], "dump") == 0) {
+        if (std::strcmp(tokens[1], "show") == 0) {
             storage::config_dump(emit_line);
             return;
         }
@@ -649,33 +788,6 @@ void handle_command(char* line) {
             return;
         }
     }
-    // Legacy-Alias: "config" = "cfg"
-    if (std::strcmp(tokens[0], "config") == 0 && n >= 2) {
-        if (std::strcmp(tokens[1], "get") == 0 && n >= 3) {
-            char buf[96];
-            if (storage::config_get(tokens[2], buf, sizeof buf))
-                std::printf("%s=%s\n", tokens[2], buf);
-            else std::puts("(unset)");
-            return;
-        }
-        if (std::strcmp(tokens[1], "set") == 0 && n >= 4) {
-            bool ok = storage::config_set(tokens[2], tokens[3]);
-            if (ok) apply_live_config_key(tokens[2], tokens[3]);
-            std::puts(ok ? "ok" : "err");
-            return;
-        }
-        if (std::strcmp(tokens[1], "save") == 0) {
-            emulator::FlashPauseGuard _fp;   // XIP-Schutz; Gast laeuft danach weiter
-            bool ok = config::save();
-            usb_msc::note_config_persisted();  // deferred-Flush erledigt
-            std::puts(ok ? "saved" : "err");
-            return;
-        }
-        if (std::strcmp(tokens[1], "dump") == 0) {
-            storage::config_dump(emit_line);
-            return;
-        }
-    }
 
     // --- Pinmap: pinmap show/set/reset (USERGUIDE) ---
     if (std::strcmp(tokens[0], "pinmap") == 0 && n >= 2) {
@@ -705,32 +817,6 @@ void handle_command(char* line) {
         if (std::strcmp(tokens[1], "reset") == 0) {
             config::apply_default_pinmap();
             std::puts("pinmap defaults restored");
-            return;
-        }
-    }
-    // Legacy-Alias: "pin" = "pinmap"
-    if (std::strcmp(tokens[0], "pin") == 0 && n >= 2) {
-        if (std::strcmp(tokens[1], "set") == 0 && n >= 4) {
-            long lpc, rp;
-            if (!parse_port_pin(tokens[2], lpc) ||
-                !parse_int(tokens[3], -1, 47, rp)) {
-                std::puts("err: pin set <port_pin|idx> <rp-gpio>"); return;
-            }
-            if (!config::set_pin_map(static_cast<uint8_t>(lpc), static_cast<int>(rp))) {
-                std::puts("err"); return;
-            }
-            persist_pinmap_change();
-            return;
-        }
-        if (std::strcmp(tokens[1], "show") == 0) {
-            const auto& m = config::pin_map();
-            for (std::size_t i = 0; i < config::LPC_PIN_COUNT; ++i) {
-                if (m.lpc_to_rp[i] >= 0)
-                    std::printf("LPC P%u_%u -> GP%d\n",
-                                static_cast<unsigned>(i / 12),
-                                static_cast<unsigned>(i % 12),
-                                m.lpc_to_rp[i]);
-            }
             return;
         }
     }
@@ -1020,7 +1106,17 @@ void handle_command(char* line) {
         }
     }
 
-    std::puts("unknown command — try 'help'");
+    // Befehl wurde erkannt (tokens[0] ist kanonisch), aber es fehlt eine Option
+    // oder ein Argument. Hat der Befehl Sub-Optionen, diese in einer Zeile zeigen.
+    {
+        const Word* sub = nullptr; int subn = 0;
+        if (get_subtable(tokens[0], sub, subn)) {
+            std::printf("Optionen fuer '%s': ", tokens[0]);
+            print_matches(sub, subn, nullptr);
+        } else {
+            std::puts("unvollstaendig — 'help' fuer die Syntax");
+        }
+    }
 }
 
 void process_hex_line(const char* line) {
