@@ -41,6 +41,11 @@ std::atomic<bool> g_dirty{false};
 std::atomic<bool> g_boot_pending{false};
 std::atomic<bool> g_volume_processed{false};
 std::atomic<bool> g_eject_pending{false};
+// One-shot: erster Host-Schreibzugriff seit Ruhe erkannt -> poll() gibt EINEN
+// CLI-Hinweis aus ("Schreibzugriff erkannt"), damit auch beim Kopieren einer
+// neuen BOOT.HEX/CONFIG.INI sofort auf der Konsole sichtbar ist, dass das
+// Geraet die Datei empfaengt (Verarbeitung/Flash erfolgt beim Auswerfen).
+std::atomic<bool> g_write_hint{false};
 Stats             g_stats{};
 
 // Wird beim Parsen von CONFIG.INI (flash_erase=on) gesetzt und in
@@ -81,11 +86,6 @@ uint32_t g_last_config_hash = 0;
 bool     g_have_config_hash = false;
 uint32_t g_last_hex_hash    = 0;
 bool     g_have_hex_hash    = false;
-
-// Name der zuletzt via MSC geflashten HEX-Datei (Langname, fuer 'stats'/'info').
-// Leer = seit Boot keine Datei ueber das Laufwerk geladen (z. B. Autostart aus
-// dem persistierten Flash-Slot -> Originalname unbekannt).
-char     g_loaded_hex_name[64] = {0};
 
 // FNV-1a ueber einen Byte-Bereich (fuer die Datei-Inhalts-Dedup).
 uint32_t content_hash(const uint8_t* p, uint32_t n) {
@@ -904,6 +904,10 @@ void on_volume_ready() {
     if (g_erase_request) {
         storage::firmware_erase();
         g_have_hex_hash = false;   // erzwingt Neu-Flash der HEX
+        // Firmware-Name leeren (persistiert). Folgt gleich eine neue HEX, wird der
+        // Name dort wieder gesetzt+gespeichert; ohne HEX bleibt er korrekt leer.
+        config::set_firmware_name("");
+        config::save();
         std::printf("[MSC] flash_erase=on -> Firmware-Slot geloescht\n");
     }
 
@@ -951,6 +955,10 @@ void on_volume_ready() {
             g_last_hex_hash = hex_hash;
             g_have_hex_hash = true;
             hex_flashed = true;           // -> Laufwerk ohne HEX neu aufbauen
+            // Firmware-Namen persistieren, damit 'info'/'stats' auch nach einem
+            // Reboot/Autostart zeigen, welches Programm im Flash-Slot liegt.
+            config::set_firmware_name(hex_name);
+            config::save();
             std::printf("[MSC] %s %lu B → flash\n", hex_name,
                         static_cast<unsigned long>(ctx.total));
         }
@@ -987,7 +995,7 @@ void on_volume_ready() {
 
 } // namespace
 
-void refresh_config_volume() {
+void refresh_config_volume(bool trigger_host_reread) {
     // Definiert im oeffentlichen Namespace, ruft aber die internen Volume-
     // Helfer (format_blank/build_info_files/volume_hash, g_dirty ...) — diese
     // liegen im anonymen Namespace derselben Uebersetzungseinheit und sind hier
@@ -1005,13 +1013,15 @@ void refresh_config_volume() {
     mark_config_processed();
     g_last_volume_hash = volume_hash();
     g_have_volume_hash = true;
-    // KRITISCH: Medienwechsel ausloesen. Ein gemounteter Host hat die ALTE
+    if (!trigger_host_reread) return;
+    // Medienwechsel ausloesen. Ein gemounteter Host hat die ALTE
     // CONFIG.INI gecached und wuerde sie sonst (a) weiter anzeigen und (b) beim
     // naechsten Schreibzugriff in die RAM-Disk zurueckschreiben -> das
     // ueberschriebe die gerade per CLI gesetzte Zuordnung und startete den Gast
     // neu (unregelmaessiges Blinken). Der Medienwechsel zwingt den Host, die
     // frische CONFIG.INI neu zu lesen und seinen Cache zu verwerfen -> Anzeige
-    // aktuell UND kein Revert mehr.
+    // aktuell UND kein Revert mehr. NUR im Datei-Workflow: der 700-ms-Wechsel
+    // stoert einen interaktiven CLI-Eingabestrom (siehe trigger_host_reread).
     trigger_media_change();
 }
 
@@ -1051,6 +1061,15 @@ bool consume_pending_boot_request() {
 }
 
 void poll() {
+    // Erster Host-Schreibzugriff seit Ruhe -> einmaligen CLI-Hinweis ausgeben.
+    // Zeigt beim Kopieren einer neuen BOOT.HEX/CONFIG.INI sofort, dass das Geraet
+    // die Datei empfaengt; die eigentliche Verarbeitung/der Flash erfolgt beim
+    // Auswerfen (Eject) bzw. nach dem Schreib-Idle-Timeout.
+    if (g_write_hint.exchange(false)) {
+        std::printf("\n[MSC] Schreibzugriff erkannt - Datei wird empfangen "
+                    "(Verarbeitung beim Auswerfen)\n");
+    }
+
     // Fatal-Fault vom Gast (Core1): kompletten [FAULT]-Report als FAULT.TXT auf
     // das Laufwerk legen und den Host zum Neueinlesen zwingen, damit ein Fehler
     // auch ohne CLI/Serial analysierbar ist. Hat Vorrang; einmal pro Fault.
@@ -1117,7 +1136,7 @@ bool read_text_config(const char* /*n*/) { return false; /* ungenutzt */ }
 
 Stats stats() { return g_stats; }
 
-const char* loaded_hex_name() { return g_loaded_hex_name; }
+const char* loaded_hex_name() { return config::firmware_name(); }
 
 } // namespace usb_msc
 
@@ -1190,6 +1209,10 @@ int32_t tud_msc_write10_cb(uint8_t /*lun*/, uint32_t lba, uint32_t offset,
     uint32_t addr = lba * usb_msc::SECTOR_SIZE + offset;
     if (addr + bufsize > usb_msc::VOLUME_BYTES) return -1;
     std::memcpy(usb_msc::g_disk + addr, buffer, bufsize);
+    // Erster Schreibzugriff seit Ruhe? -> CLI-Hinweis anstossen (poll() gibt ihn
+    // aus; hier im USB-Callback nur das Flag setzen, kein printf).
+    if (!usb_msc::g_dirty.load(std::memory_order_relaxed))
+        usb_msc::g_write_hint.store(true, std::memory_order_relaxed);
     usb_msc::g_dirty.store(true);
     usb_msc::g_volume_processed.store(false);
     usb_msc::g_last_write_ms = to_ms_since_boot(get_absolute_time());

@@ -44,7 +44,14 @@ void poll();
 // aufzurufen, damit die CONFIG.INI den Live-Zustand widerspiegelt und ein
 // spaeteres on_volume_ready() (durch Host-Metadaten ausgeloest) die gerade
 // gesetzte Zuordnung NICHT aus einer veralteten CONFIG.INI zuruecksetzt.
-void refresh_config_volume();
+//   trigger_host_reread=true  : zusaetzlich Medienwechsel ausloesen (gemounteter
+//     Host verwirft Cache + liest frisch). Noetig fuer den Datei-Workflow.
+//   trigger_host_reread=false : KEIN Medienwechsel. Fuer CLI-Aenderungen, wo der
+//     700-ms-Medienwechsel den interaktiven CDC-Eingabestrom stoert (dropte das
+//     zweite 'pinmap set ... -1' auf '-'). Anti-Revert-Schutz (Hash/processed)
+//     bleibt erhalten; der Host sieht die frische CONFIG.INI beim naechsten
+//     regulaeren Mount/Refresh.
+void refresh_config_volume(bool trigger_host_reread = true);
 
 // Baut die RAM-Disk neu auf (inkl. frischer DEBUG.TXT aus der Debug-Bridge) und
 // zwingt den Host per Medienwechsel zum Neu-Einlesen. Fuer 'dbg save' — macht

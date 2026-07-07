@@ -59,6 +59,10 @@ inline constexpr const char* KEY_PRIMASK_SHADOW  = "primask_shadow";   // "0"/"1
 inline constexpr const char* KEY_APP_START       = "app_start";        // Flash-Adresse der Applikation (Default 0x3000)
 inline constexpr const char* KEY_DESC_ADDR       = "desc_addr";        // Adresse des Boot-Descriptors (Default app_start-0x100)
 inline constexpr const char* KEY_AUTODESC        = "autodesc";         // "0"/"1": Descriptor automatisch erzeugen (Default 1)
+// Name der zuletzt geladenen Firmware-Datei (Langname der via USB-MSC geflashten
+// HEX). Rein informativ (fuer 'info'/'stats'), persistiert damit nach einem
+// Reboot/Autostart sichtbar ist, WELCHES Programm im Flash-Slot liegt.
+inline constexpr const char* KEY_FW_NAME         = "fw_name";
 
 // Pin-Mapping LPC1115 -> RP2350 GPIO. -1 = nicht zugeordnet.
 constexpr std::size_t LPC_PIN_COUNT = 64;
@@ -71,6 +75,12 @@ bool save();
 
 bool        autostart();
 void        set_autostart(bool v);
+
+// Name der geladenen Firmware-Datei (persistent, fuer 'info'/'stats'). Leerer
+// String = unbekannt (z. B. nie via MSC geladen). set_firmware_name persistiert
+// NICHT selbst — der Aufrufer ruft danach save().
+const char* firmware_name();
+void        set_firmware_name(const char* name);
 
 // USB-CDC-Praesenz (wirkt beim Boot: baut den USB-Deskriptor entsprechend).
 bool        cli_enabled();

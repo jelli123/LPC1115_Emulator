@@ -40,6 +40,7 @@ bool     g_primask_shadow  = false;
 uint32_t g_app_start       = 0x3000;
 uint32_t g_desc_addr       = 0;       // 0 = automatisch app_start - 0x100
 bool     g_autodesc        = true;
+char     g_firmware_name[64] = {0};   // Langname der geladenen Firmware-Datei
 
 // Timer-Capture-/Match-Pin-Bindung (4 Timer, je 1 Capture + 4 Match).
 // -1 = nicht gebunden.
@@ -305,6 +306,9 @@ bool load() {
     if (storage::config_get(KEY_AUTODESC, buf, sizeof buf)) {
         g_autodesc = (buf[0] == '1');
     }
+    if (!storage::config_get(KEY_FW_NAME, g_firmware_name, sizeof g_firmware_name)) {
+        g_firmware_name[0] = '\0';   // kein persistierter Name -> unbekannt
+    }
     {
         char key[24];
         for (int t = 0; t < 4; ++t) {
@@ -418,6 +422,9 @@ bool save() {
     if (!storage::config_set(KEY_DESC_ADDR, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_autodesc ? 1 : 0));
     if (!storage::config_set(KEY_AUTODESC, buf)) return false;
+    if (g_firmware_name[0] != '\0') {
+        if (!storage::config_set(KEY_FW_NAME, g_firmware_name)) return false;
+    }
     {
         char key[24];
         for (int t = 0; t < 4; ++t) {
@@ -466,6 +473,12 @@ void reset_pin_mappings() {
 
 bool        autostart()                    { return g_autostart; }
 void        set_autostart(bool v)          { g_autostart = v; }
+
+const char* firmware_name()                { return g_firmware_name; }
+void        set_firmware_name(const char* name) {
+    if (!name) { g_firmware_name[0] = '\0'; return; }
+    std::snprintf(g_firmware_name, sizeof g_firmware_name, "%s", name);
+}
 bool        cli_enabled()                  { return g_cli_enable; }
 void        set_cli_enabled(bool v)        { g_cli_enable = v; }
 bool        gdb_enabled()                  { return g_gdb_enable; }

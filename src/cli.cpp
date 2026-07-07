@@ -81,11 +81,12 @@ void persist_pinmap_change() {
     usb_stdio_task();
     bool saved;
     { emulator::FlashPauseGuard _fp; saved = config::save(); }
-    // Baut die RAM-Disk-CONFIG.INI neu auf UND loest einen Medienwechsel aus,
-    // damit der gemountete Host die frische CONFIG.INI liest und seine alte
-    // NICHT zurueckschreibt (was die Aenderung reverten + den Gast neu starten
-    // wuerde).
-    usb_msc::refresh_config_volume();
+    // RAM-Disk-CONFIG.INI neu aufbauen, ABER OHNE Medienwechsel: der 700-ms-
+    // Auswurf/Wiedereinlege-Zyklus stoert den interaktiven CLI-CDC-Eingabestrom
+    // (das zweite 'pinmap set .. -1' verlor sonst die '1' -> nur '-' kam an).
+    // Der Anti-Revert-Schutz (Hash/processed) bleibt erhalten; ein gemounteter
+    // Host sieht die frische CONFIG.INI beim naechsten regulaeren Refresh.
+    usb_msc::refresh_config_volume(/*trigger_host_reread=*/false);
     if (!saved)
         std::puts("[CFG] Flash-Speichern fehlgeschlagen (siehe 'stats')");
 }
@@ -522,7 +523,14 @@ void handle_command(char* line) {
         (std::strcmp(tokens[0], "flash") == 0 && n >= 2 &&
          std::strcmp(tokens[1], "erase") == 0)) {
         stop_guest_for_reflash();   // XIP-Schutz
-        std::puts(storage::firmware_erase() ? "erased" : "err");
+        bool ok = storage::firmware_erase();
+        if (ok) {
+            // Persistierten Firmware-Namen loeschen -> 'info'/'stats' zeigen nach
+            // dem Loeschen nicht mehr einen veralteten (nicht mehr geladenen) Namen.
+            config::set_firmware_name("");
+            config::save();
+        }
+        std::puts(ok ? "erased" : "err");
         return;
     }
     if (std::strcmp(tokens[0], "run") == 0 ||
