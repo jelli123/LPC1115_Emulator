@@ -985,6 +985,28 @@ void on_volume_ready() {
         return;
     }
 
+    // Nur CONFIG.INI geaendert (keine HEX): Volume ebenfalls neu aufbauen und
+    // neu einhaengen — SYMMETRISCH zum hex_flashed-Pfad oben. Ohne das blieb das
+    // Volume nach einem CONFIG.INI-Eject "ausgeworfen": der Host haengt es nicht
+    // von selbst wieder ein -> ein ZWEITES Auswerfen war unmoeglich und eine
+    // weitere CONFIG.INI-Aenderung kam nie an (wirkte, als "gewinne" der alte
+    // Flash-Wert / als werde die neue CONFIG.INI ignoriert). Der Re-Mount zeigt
+    // zudem die kanonische, aus dem frisch geparsten Live-Zustand generierte
+    // CONFIG.INI. Der Dedup-Hash wird in build_info_files/mark_config_processed
+    // aktualisiert -> das durch den Medienwechsel ausgeloeste erneute
+    // on_volume_ready() erkennt "unveraendert" und laeuft folgenlos aus.
+    if (cfg_changed) {
+        format_blank();
+        build_info_files();
+        g_dirty.store(false);
+        g_volume_processed.store(true);
+        mark_config_processed();
+        g_last_volume_hash = volume_hash();
+        g_have_volume_hash = true;
+        trigger_media_change();
+        return;
+    }
+
     // Verarbeiteten Volume-Zustand merken -> inhaltlich identische Re-Trigger
     // (Host-Re-Mount ohne echte Aenderung) werden ab jetzt uebersprungen. Der
     // Hash wird HIER frisch berechnet (nicht der am Funktionsanfang gebildete

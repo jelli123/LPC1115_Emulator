@@ -29,17 +29,12 @@ void poll() {
     auto st = emulator::state();
     switch (st) {
         case emulator::State::Running:
-            // Onboard-LED spiegelt die Gast-Blink-LED PIO0.7 (LPCxpresso-
-            // Konvention), damit ein Blink-Programm sichtbar auf der einzigen
-            // Bordschnittstelle blinkt. Treibt der Gast PIO0.7 nicht als
-            // Ausgang, bleibt es beim reinen "laeuft"-Dauerlicht.
-            {
-                bool lvl = false;
-                if (peripherals::guest_output_level(0, 7, lvl))
-                    set(lvl);
-                else
-                    set(true);
-            }
+            // Dauerlicht = "Gast laeuft". Die Onboard-LED spiegelt bewusst KEINEN
+            // Gast-Pin mehr (frueher PIO0.7): das war irrefuehrend, sobald der
+            // Gast diesen Pin anderweitig nutzt, und koppelte die Status-Anzeige
+            // an eine willkuerliche Gast-Konvention. Wer die Gast-LED sehen will,
+            // mappt den Pin per CONFIG.INI auf einen echten GPIO.
+            set(true);
             break;
 
         case emulator::State::Faulted: {
