@@ -41,11 +41,6 @@ std::atomic<bool> g_dirty{false};
 std::atomic<bool> g_boot_pending{false};
 std::atomic<bool> g_volume_processed{false};
 std::atomic<bool> g_eject_pending{false};
-// One-shot: erster Host-Schreibzugriff seit Ruhe erkannt -> poll() gibt EINEN
-// CLI-Hinweis aus ("Schreibzugriff erkannt"), damit auch beim Kopieren einer
-// neuen BOOT.HEX/CONFIG.INI sofort auf der Konsole sichtbar ist, dass das
-// Geraet die Datei empfaengt (Verarbeitung/Flash erfolgt beim Auswerfen).
-std::atomic<bool> g_write_hint{false};
 Stats             g_stats{};
 
 // Wird beim Parsen von CONFIG.INI (flash_erase=on) gesetzt und in
@@ -1061,15 +1056,6 @@ bool consume_pending_boot_request() {
 }
 
 void poll() {
-    // Erster Host-Schreibzugriff seit Ruhe -> einmaligen CLI-Hinweis ausgeben.
-    // Zeigt beim Kopieren einer neuen BOOT.HEX/CONFIG.INI sofort, dass das Geraet
-    // die Datei empfaengt; die eigentliche Verarbeitung/der Flash erfolgt beim
-    // Auswerfen (Eject) bzw. nach dem Schreib-Idle-Timeout.
-    if (g_write_hint.exchange(false)) {
-        std::printf("\n[MSC] Schreibzugriff erkannt - Datei wird empfangen "
-                    "(Verarbeitung beim Auswerfen)\n");
-    }
-
     // Fatal-Fault vom Gast (Core1): kompletten [FAULT]-Report als FAULT.TXT auf
     // das Laufwerk legen und den Host zum Neueinlesen zwingen, damit ein Fehler
     // auch ohne CLI/Serial analysierbar ist. Hat Vorrang; einmal pro Fault.
@@ -1209,10 +1195,6 @@ int32_t tud_msc_write10_cb(uint8_t /*lun*/, uint32_t lba, uint32_t offset,
     uint32_t addr = lba * usb_msc::SECTOR_SIZE + offset;
     if (addr + bufsize > usb_msc::VOLUME_BYTES) return -1;
     std::memcpy(usb_msc::g_disk + addr, buffer, bufsize);
-    // Erster Schreibzugriff seit Ruhe? -> CLI-Hinweis anstossen (poll() gibt ihn
-    // aus; hier im USB-Callback nur das Flag setzen, kein printf).
-    if (!usb_msc::g_dirty.load(std::memory_order_relaxed))
-        usb_msc::g_write_hint.store(true, std::memory_order_relaxed);
     usb_msc::g_dirty.store(true);
     usb_msc::g_volume_processed.store(false);
     usb_msc::g_last_write_ms = to_ms_since_boot(get_absolute_time());
