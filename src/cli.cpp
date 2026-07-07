@@ -72,23 +72,15 @@ void apply_live_config_key(const char* key, const char* val) {
 // veralteten CONFIG.INI wieder zuruecksetzen. FlashPauseGuard pausiert einen
 // laufenden Gast fuer den Flash-Schreibzugriff (und setzt ihn danach fort).
 void persist_pinmap_change() {
-    // Sofort-Feedback VOR dem (kurz blockierenden) Flash-Schreibzugriff. Der
-    // Flash-Commit + evtl. Gast-Neustart + Medienwechsel brauchen einige ms,
-    // waehrend der die USB-CDC-Ausgabe nicht bedient wird -> ohne dieses
-    // Vorab-"ok" wirkte die CLI, als muesse man Enter zweimal druecken.
+    // Sofort-Feedback; die eigentliche (schwere, Flash-blockierende) Persistenz
+    // laeuft DEFERRED in usb_msc::poll(). Wuerde sie hier synchron laufen
+    // (config::save + Volume-Rebuild, ~10-50 ms mit IRQs aus), blockierte sie den
+    // interaktiven Pfad VOR dem naechsten USB-RX-Pump -> das direkt folgende CLI-
+    // Kommando verlor ein Byte (aus 'pinmap set 0_1 -1' wurde 'pinmap set 0_1 -').
+    // Durch das Deferren pumpt der run()-Loop erst usb_stdio_task (holt das evtl.
+    // schon getippte Folgekommando sicher in die SW-FIFO), DANN persistiert poll().
     std::puts("ok");
-    std::fflush(stdout);
-    usb_stdio_task();
-    bool saved;
-    { emulator::FlashPauseGuard _fp; saved = config::save(); }
-    // RAM-Disk-CONFIG.INI neu aufbauen, ABER OHNE Medienwechsel: der 700-ms-
-    // Auswurf/Wiedereinlege-Zyklus stoert den interaktiven CLI-CDC-Eingabestrom
-    // (das zweite 'pinmap set .. -1' verlor sonst die '1' -> nur '-' kam an).
-    // Der Anti-Revert-Schutz (Hash/processed) bleibt erhalten; ein gemounteter
-    // Host sieht die frische CONFIG.INI beim naechsten regulaeren Refresh.
-    usb_msc::refresh_config_volume(/*trigger_host_reread=*/false);
-    if (!saved)
-        std::puts("[CFG] Flash-Speichern fehlgeschlagen (siehe 'stats')");
+    usb_msc::request_config_persist();
 }
 
 // --- XMODEM-Empfang in den HEX-Parser ---

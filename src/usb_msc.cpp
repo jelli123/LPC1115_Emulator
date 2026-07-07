@@ -41,6 +41,14 @@ std::atomic<bool> g_dirty{false};
 std::atomic<bool> g_boot_pending{false};
 std::atomic<bool> g_volume_processed{false};
 std::atomic<bool> g_eject_pending{false};
+// Deferred CLI-Config-Persist: eine CLI-Aenderung (z. B. 'pinmap set') setzt nur
+// dieses Flag; das schwere config::save() (Flash, IRQs aus) + Volume-Rebuild
+// (256-KB-memset + HTML) erledigt poll() im NAECHSTEN Loop-Durchlauf, NACHDEM der
+// getchar/usb_stdio_task-Loop den bereits getippten naechsten Befehl aus dem
+// USB-Endpoint in die SW-FIFO gepumpt hat. Sonst lief die ~10-50-ms-Blockade
+// MITTEN im Kommandopfad (vor dem RX-Pump) -> das direkt folgende Kommando
+// verlor ein Byte (aus 'pinmap set 0_1 -1' wurde 'pinmap set 0_1 -').
+std::atomic<bool> g_config_persist_pending{false};
 Stats             g_stats{};
 
 // Wird beim Parsen von CONFIG.INI (flash_erase=on) gesetzt und in
@@ -1055,7 +1063,23 @@ bool consume_pending_boot_request() {
     return g_boot_pending.exchange(false);
 }
 
+void request_config_persist() {
+    g_config_persist_pending.store(true, std::memory_order_relaxed);
+}
+
 void poll() {
+    // Deferred CLI-Config-Persist (aus 'pinmap set' o. ae.): das schwere
+    // config::save() (Flash) + Volume-Rebuild hier ausfuehren, NICHT im
+    // interaktiven Kommandopfad. Dieser Loop-Durchlauf hat oben bereits
+    // usb_stdio_task() gerufen -> ein evtl. schon getipptes Folgekommando wurde
+    // aus dem USB-Endpoint in die SW-FIFO gezogen und ist damit vor der Blockade
+    // sicher (kein Byte-Verlust mehr).
+    if (g_config_persist_pending.exchange(false)) {
+        { emulator::FlashPauseGuard _fp; config::save(); }
+        refresh_config_volume(/*trigger_host_reread=*/false);
+        return;
+    }
+
     // Fatal-Fault vom Gast (Core1): kompletten [FAULT]-Report als FAULT.TXT auf
     // das Laufwerk legen und den Host zum Neueinlesen zwingen, damit ein Fehler
     // auch ohne CLI/Serial analysierbar ist. Hat Vorrang; einmal pro Fault.
