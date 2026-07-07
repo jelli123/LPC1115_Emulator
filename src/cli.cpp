@@ -146,66 +146,70 @@ void cmd_xmodem() {
     }
 }
 
+// Hilfe-Zeilen (file-scope, damit 'help' UND 'help <cmd>' darauf zugreifen).
+// Eine Befehlszeile beginnt nach dem Einzug mit dem kanonischen Befehlsnamen;
+// 'help <cmd>' filtert genau diese Zeilen heraus.
+const char* const HELP_LINES[] = {
+    "Befehle (abkuerzbar auf eindeutiges Praefix, z.B. 'cf sh' = 'cfg show'):",
+    "  help [cmd]                 diese Hilfe / Hilfe zu einem Befehl ('?' = help)",
+    "  version                    Build-Info",
+    "  stats                      Emulatorstatus & Zaehler",
+    "  dbg [clear]                Gast-Debug-Ausgabe zeigen/loeschen",
+    "  dbg save                   Debug-Ausgabe als DEBUG.TXT aufs Laufwerk",
+    "  dbg auto <sek|off>         DEBUG.TXT automatisch alle N s aktualisieren",
+    "  reset                      Emulator-Core neu starten",
+    "",
+    "  upload                     Intel-Hex-Stream starten (alias: flash hex)",
+    "  xmodem                     Intel-Hex per XMODEM-CRC/1K empfangen",
+    "  info                       Reset-Vektor, Stack, Groesse, CRC",
+    "  erase                      Firmware-Slot loeschen (alias: flash erase)",
+    "  run                        Guest starten",
+    "  halt                       Guest anhalten",
+    "  step                       ein Befehl, dann halten",
+    "  autostart on|off           nach Reset automatisch starten",
+    "",
+    "  cfg show                   alle KV-Paare ausgeben",
+    "  cfg get <key>              Wert lesen",
+    "  cfg set <key> <value>      Wert setzen",
+    "  cfg save                   RAM-Snapshot in Flash schreiben",
+    "  cfg clear                  alle Einstellungen auf Default zuruecksetzen",
+    "  pinmap show                Tabelle LPC-Pin -> RP2350-GPIO",
+    "  pinmap set <port_pin> <rp> Pin zuweisen (z.B. pinmap set 1_8 17)",
+    "  pinmap reset               Default-Tabelle wiederherstellen",
+    "",
+    "  gdb on|off|status          GDB-Stub auf der GDB-CDC",
+    "  bp <addr>                  SW-Breakpoint setzen",
+    "  bp clr <addr>              Breakpoint loeschen",
+    "  regs                       Register anzeigen (r0-r15, xPSR)",
+    "  mem <addr> <len>           Hex-Dump Guest-Adressraum",
+    "",
+    "  swd start <swdio> <swclk>  SWD-Target aktivieren",
+    "  swd stop                   SWD-Target deaktivieren",
+    "  pio capture <pin> <count>  Edge-Capture-Trace (Zyklen)",
+    "",
+    "  cdc start <tx> <rx>        USB-Serial-Konverter (Serial-CDC <-> PIO-UART)",
+    "  cdc stop                   CDC-Serial-Konverter stoppen",
+    "  cdc status                 Pins, Baudrate, Datenfluss",
+    "  uart pins <tx> <rx>|off    LPC-UART0 auf RP-UART-Pads routen",
+    "  uart cdc on|off            LPC-UART0 virtuell an Serial-CDC koppeln",
+    "  uart status                LPC-UART0-Routing anzeigen",
+    "",
+    "  i2c on <inst> <sda> <scl> [hz]  I2C-Bridge auf RP2350-HW (Neustart noetig)",
+    "  i2c off                    I2C-Bridge deaktivieren",
+    "  i2c status                 Instanz/Pins/Takt anzeigen",
+    "",
+    "  freq <Hz>                  Ziel-CPU-Frequenz",
+    "  flash hex                  Intel-Hex-Stream (alias fuer upload)",
+    "  flash erase                Firmware-Slot loeschen",
+    "  flash finalize <bytes>     Firmware abschliessen + CRC-Marker",
+    "",
+    "Komfort: TAB vervollstaendigt, Pfeil-hoch/runter = History (nur im Terminal).",
+    "Aliase: show=list=dump, stats=status, run=start, halt=stop, cfg=config, pinmap=pin.",
+    nullptr
+};
+
 void cmd_help() {
-    static const char* lines[] = {
-        "Befehle (abkuerzbar auf eindeutiges Praefix, z.B. 'cf sh' = 'cfg show'):",
-        "  help                       diese Hilfe",
-        "  version                    Build-Info",
-        "  stats                      Emulatorstatus & Zaehler",
-        "  dbg [clear]                Gast-Debug-Ausgabe zeigen/loeschen",
-        "  dbg save                   Debug-Ausgabe als DEBUG.TXT aufs Laufwerk",
-        "  dbg auto <sek|off>         DEBUG.TXT automatisch alle N s aktualisieren",
-        "  reset                      Emulator-Core neu starten",
-        "",
-        "  upload                     Intel-Hex-Stream starten (alias: flash hex)",
-        "  xmodem                     Intel-Hex per XMODEM-CRC/1K empfangen",
-        "  info                       Reset-Vektor, Stack, Groesse, CRC",
-        "  erase                      Firmware-Slot loeschen (alias: flash erase)",
-        "  run                        Guest starten",
-        "  halt                       Guest anhalten",
-        "  step                       ein Befehl, dann halten",
-        "  autostart on|off           nach Reset automatisch starten",
-        "",
-        "  cfg show                   alle KV-Paare ausgeben",
-        "  cfg get <key>              Wert lesen",
-        "  cfg set <key> <value>      Wert setzen",
-        "  cfg save                   RAM-Snapshot in Flash schreiben",
-        "  cfg clear                  alle Einstellungen auf Default zuruecksetzen",
-        "  pinmap show                Tabelle LPC-Pin -> RP2350-GPIO",
-        "  pinmap set <port_pin> <rp> Pin zuweisen (z.B. pinmap set 1_8 17)",
-        "  pinmap reset               Default-Tabelle wiederherstellen",
-        "",
-        "  gdb on|off|status          GDB-Stub auf der GDB-CDC",
-        "  bp <addr>                  SW-Breakpoint setzen",
-        "  bp clr <addr>              Breakpoint loeschen",
-        "  regs                       Register anzeigen (r0-r15, xPSR)",
-        "  mem <addr> <len>           Hex-Dump Guest-Adressraum",
-        "",
-        "  swd start <swdio> <swclk>  SWD-Target aktivieren",
-        "  swd stop                   SWD-Target deaktivieren",
-        "  pio capture <pin> <count>  Edge-Capture-Trace (Zyklen)",
-        "",
-        "  cdc start <tx> <rx>        USB-Serial-Konverter (Serial-CDC <-> PIO-UART)",
-        "  cdc stop                   CDC-Serial-Konverter stoppen",
-        "  cdc status                 Pins, Baudrate, Datenfluss",
-        "  uart pins <tx> <rx>|off    LPC-UART0 auf RP-UART-Pads routen",
-        "  uart cdc on|off            LPC-UART0 virtuell an Serial-CDC koppeln",
-        "  uart status                LPC-UART0-Routing anzeigen",
-        "",
-        "  i2c on <inst> <sda> <scl> [hz]  I2C-Bridge auf RP2350-HW (Neustart noetig)",
-        "  i2c off                    I2C-Bridge deaktivieren",
-        "  i2c status                 Instanz/Pins/Takt anzeigen",
-        "",
-        "  freq <Hz>                  Ziel-CPU-Frequenz",
-        "  flash hex                  Intel-Hex-Stream (alias fuer upload)",
-        "  flash erase                Firmware-Slot loeschen",
-        "  flash finalize <bytes>     Firmware abschliessen + CRC-Marker",
-        "",
-        "Aliase: show=list=dump, stats=status, run=start, halt=stop, cfg=config,",
-        "pinmap=pin. Unbekannte/mehrdeutige Eingaben zeigen passende Vorschlaege.",
-        nullptr
-    };
-    for (int i = 0; lines[i]; ++i) std::puts(lines[i]);
+    for (int i = 0; HELP_LINES[i]; ++i) std::puts(HELP_LINES[i]);
 }
 
 void cmd_status() {
@@ -457,7 +461,7 @@ struct Word { const char* w; const char* canon; };   // w=Eingabewort, canon=kan
 
 // Top-Level-Befehle (inkl. Aliase). w==canon markiert den kanonischen Eintrag.
 constexpr Word TOP[] = {
-    {"help","help"}, {"version","version"},
+    {"help","help"}, {"?","help"}, {"version","version"},
     {"stats","stats"}, {"status","stats"},
     {"dbg","dbg"}, {"reset","reset"},
     {"upload","upload"}, {"xmodem","xmodem"}, {"info","info"},
@@ -539,6 +543,137 @@ void print_matches(const Word* tbl, int cnt, const char* prefix) {
     std::putchar('\n');
 }
 
+// Kontexthilfe zu einem Befehl: filtert aus HELP_LINES die Zeilen, deren erstes
+// Wort (nach dem Einzug) dem kanonischen Befehl entspricht.
+void cmd_help_topic(const char* cmd) {
+    int d = 0;
+    const char* canon = resolve_word(cmd, TOP, wcount(TOP), d);
+    if (!canon) canon = cmd;
+    const std::size_t cl = std::strlen(canon);
+    bool any = false;
+    for (int i = 0; HELP_LINES[i]; ++i) {
+        const char* p = HELP_LINES[i];
+        while (*p == ' ') ++p;
+        if (std::strncmp(p, canon, cl) == 0 && (p[cl] == ' ' || p[cl] == '\0')) {
+            std::puts(HELP_LINES[i]);
+            any = true;
+        }
+    }
+    if (!any) std::printf("keine Hilfe zu '%s' — 'help' fuer alle Befehle\n", cmd);
+}
+
+// --- TAB-Completion + History (nur im interaktiven Terminal nutzbar) --------
+
+// Zeichnet die aktuelle Eingabezeile neu (Prompt + Inhalt). Nutzt ANSI
+// "\r\033[K" (Zeilenanfang + bis Zeilenende loeschen) — von Terminals wie PuTTY
+// unterstuetzt. TAB/Pfeiltasten funktionieren ohnehin nur mit solchen Terminals.
+void redraw_line(const char* line, std::size_t len) {
+    std::printf("\r\033[Kemu> ");
+    for (std::size_t i = 0; i < len; ++i) std::putchar(line[i]);
+    std::fflush(stdout);
+}
+
+// TAB-Vervollstaendigung auf dem aktuellen Eingabepuffer (immer am Zeilenende).
+// Vervollstaendigt das Befehlswort (Feld 0) bzw. die Option (Feld 1) gegen die
+// passende Tabelle: eindeutig -> ganz einsetzen (+Space); mehrere -> laengstes
+// gemeinsames Praefix einsetzen und (falls kein Fortschritt) Kandidaten zeigen.
+void complete_input(char* line, std::size_t& len) {
+    const bool trailing = (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t'));
+    char cp[LINE_MAX];
+    std::memcpy(cp, line, len); cp[len] = '\0';
+    char* toks[6]; int nt = 0; char* p = cp;
+    while (*p && nt < 6) {
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+        toks[nt++] = p;
+        while (*p && *p != ' ' && *p != '\t') ++p;
+        if (*p) *p++ = '\0';
+    }
+
+    const Word* tbl = nullptr; int cnt = 0;
+    const char* frag = "";
+    std::size_t frag_off = len;
+    if (nt == 0) {
+        tbl = TOP; cnt = wcount(TOP); frag = ""; frag_off = len;
+    } else if (nt == 1 && !trailing) {
+        tbl = TOP; cnt = wcount(TOP); frag = toks[0];
+        frag_off = static_cast<std::size_t>(toks[0] - cp);
+    } else {
+        int d = 0;
+        const char* canon = resolve_word(toks[0], TOP, wcount(TOP), d);
+        if (!canon || !get_subtable(canon, tbl, cnt)) return;   // keine Completion
+        if (trailing) { frag = ""; frag_off = len; }
+        else { frag = toks[nt-1]; frag_off = static_cast<std::size_t>(toks[nt-1] - cp); }
+    }
+
+    const std::size_t fl = std::strlen(frag);
+    const char* matches[40]; int nm = 0;
+    for (int i = 0; i < cnt && nm < 40; ++i) {
+        if (std::strncmp(tbl[i].w, frag, fl) != 0) continue;
+        bool dup = false;
+        for (int j = 0; j < nm; ++j)
+            if (!std::strcmp(matches[j], tbl[i].canon)) { dup = true; break; }
+        if (!dup) matches[nm++] = tbl[i].canon;
+    }
+    if (nm == 0) return;
+
+    if (nm == 1) {
+        const std::size_t ml = std::strlen(matches[0]);
+        if (frag_off + ml + 2 >= LINE_MAX) return;
+        std::memcpy(line + frag_off, matches[0], ml);
+        len = frag_off + ml;
+        line[len++] = ' ';
+        line[len] = '\0';
+        redraw_line(line, len);
+        return;
+    }
+
+    // Mehrere: laengstes gemeinsames Praefix bestimmen.
+    std::size_t lcp = std::strlen(matches[0]);
+    for (int i = 1; i < nm; ++i) {
+        std::size_t k = 0;
+        while (k < lcp && matches[i][k] == matches[0][k]) ++k;
+        lcp = k;
+    }
+    if (lcp > fl) {
+        if (frag_off + lcp >= LINE_MAX) return;
+        std::memcpy(line + frag_off, matches[0], lcp);
+        len = frag_off + lcp;
+        line[len] = '\0';
+        redraw_line(line, len);
+    } else {
+        std::putchar('\n');
+        for (int i = 0; i < nm; ++i) std::printf("%s%s", i ? " " : "", matches[i]);
+        std::putchar('\n');
+        redraw_line(line, len);
+    }
+}
+
+// --- Kommando-History (Ringpuffer; Pfeil-hoch/runter im Terminal) ----------
+constexpr int HIST_N = 8;
+char g_hist[HIST_N][LINE_MAX];
+int  g_hist_count = 0;   // Anzahl gueltiger Eintraege (<= HIST_N)
+int  g_hist_head  = 0;   // naechster Schreibindex (Ring)
+
+void history_push(const char* s) {
+    if (!s || !*s) return;
+    // Duplikat des zuletzt gespeicherten Kommandos nicht erneut ablegen.
+    if (g_hist_count > 0) {
+        int last = (g_hist_head - 1 + HIST_N) % HIST_N;
+        if (!std::strcmp(g_hist[last], s)) return;
+    }
+    std::snprintf(g_hist[g_hist_head], LINE_MAX, "%s", s);
+    g_hist_head = (g_hist_head + 1) % HIST_N;
+    if (g_hist_count < HIST_N) ++g_hist_count;
+}
+
+// Liefert den Eintrag 'back' Schritte zurueck (1 = neuester), sonst nullptr.
+const char* history_get(int back) {
+    if (back < 1 || back > g_hist_count) return nullptr;
+    int idx = (g_hist_head - back + HIST_N) % HIST_N;
+    return g_hist[idx];
+}
+
 void handle_command(char* line) {
     while (*line == ' ' || *line == '\t') ++line;
     if (!*line) return;
@@ -591,7 +726,11 @@ void handle_command(char* line) {
     }
 
     // --- Allgemein ---
-    if (std::strcmp(tokens[0], "help") == 0)    { cmd_help(); return; }
+    if (std::strcmp(tokens[0], "help") == 0)    {
+        if (n >= 2) cmd_help_topic(tokens[1]);
+        else        cmd_help();
+        return;
+    }
     if (std::strcmp(tokens[0], "version") == 0) { cmd_version(); return; }
     if (std::strcmp(tokens[0], "stats") == 0 ||
         std::strcmp(tokens[0], "status") == 0)  { cmd_status(); return; }
@@ -1171,6 +1310,7 @@ void run() {
     const bool cli_on = config::cli_enabled();
     char line[LINE_MAX];
     std::size_t len = 0;
+    int hist_browse = 0;   // 0 = aktuelle Eingabe; >0 = n Schritte zurueck
     if (cli_on) std::printf("emu> ");
     while (true) {
         usb_stdio_task();
@@ -1198,12 +1338,41 @@ void run() {
         int c = getchar_timeout_us(1'000);
         if (c == PICO_ERROR_TIMEOUT) continue;
         if (c == '\r') continue;
+
+        // --- ESC-Sequenzen (Pfeiltasten): ESC '[' 'A'/'B' = History hoch/runter.
+        // Nur im Nicht-Upload-Modus; die Folgebytes kommen zusammen (kurzer poll).
+        if (c == 27) {
+            int c1 = getchar_timeout_us(3'000);
+            int c2 = (c1 == '[') ? getchar_timeout_us(3'000) : PICO_ERROR_TIMEOUT;
+            if (!g_in_hex_upload && c1 == '[' && (c2 == 'A' || c2 == 'B')) {
+                if (c2 == 'A') {                       // hoch: aelter
+                    if (hist_browse < g_hist_count) ++hist_browse;
+                } else {                               // runter: neuer
+                    if (hist_browse > 0) --hist_browse;
+                }
+                const char* h = (hist_browse > 0) ? history_get(hist_browse) : "";
+                len = 0;
+                for (const char* q = h; q && *q && len + 1 < sizeof line; ++q)
+                    line[len++] = *q;
+                line[len] = '\0';
+                redraw_line(line, len);
+            }
+            continue;   // andere ESC-Sequenzen ignorieren
+        }
+
+        // --- TAB: Befehl/Option vervollstaendigen (nicht im Upload-Modus).
+        if (c == '\t') {
+            if (!g_in_hex_upload) complete_input(line, len);
+            continue;
+        }
+
         if (c == '\n') {
             std::putchar('\n');
             line[len] = '\0';
             if (g_in_hex_upload) process_hex_line(line);
-            else                 handle_command(line);
+            else { history_push(line); handle_command(line); }
             len = 0;
+            hist_browse = 0;
             std::printf("emu> ");
             // Ausgabe des Kommandos sofort ueber USB rausschieben, damit die
             // Antwort nicht erst beim naechsten Tastendruck sichtbar wird.
