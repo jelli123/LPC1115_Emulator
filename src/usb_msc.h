@@ -79,4 +79,8 @@ struct File {
 bool find_file(const char* name83, File& out);   // "BOOT    HEX"
 bool read_text_config(const char* name83);
 
+// Langname der zuletzt via MSC geflashten HEX-Datei ("" = keine seit Boot, z. B.
+// Autostart aus dem persistierten Flash-Slot). Fuer 'stats'/'info'.
+const char* loaded_hex_name();
+
 } // namespace usb_msc

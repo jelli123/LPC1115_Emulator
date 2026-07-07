@@ -481,14 +481,14 @@ void set_target_frequency_hz(uint32_t hz) {
 
 const PinMap& pin_map() { return g_pin_map; }
 
-bool set_pin_map(uint8_t lpc_pin, int rp2350_gpio) {
+bool set_pin_map(uint8_t lpc_pin, int rp2350_gpio, bool verbose) {
     if (lpc_pin >= LPC_PIN_COUNT) return false;
     if (rp2350_gpio < -1 || rp2350_gpio > MAX_GPIO) return false;
     // Eindeutigkeit erzwingen (siehe assign_pin_unique): ein physischer GPIO
     // kann nur EINEM LPC-Pin gehoeren. Eine kollidierende alte Zuordnung (z. B.
     // die Default-Belegung P1_3->GP17) wird geloest, damit die neue tatsaechlich
     // greift und `pinmap show` keine doppelte, mehrdeutige Belegung mehr zeigt.
-    assign_pin_unique(lpc_pin, rp2350_gpio, /*verbose=*/true);
+    assign_pin_unique(lpc_pin, rp2350_gpio, verbose);
     return true;
 }
 

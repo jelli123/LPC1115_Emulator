@@ -82,6 +82,11 @@ bool     g_have_config_hash = false;
 uint32_t g_last_hex_hash    = 0;
 bool     g_have_hex_hash    = false;
 
+// Name der zuletzt via MSC geflashten HEX-Datei (Langname, fuer 'stats'/'info').
+// Leer = seit Boot keine Datei ueber das Laufwerk geladen (z. B. Autostart aus
+// dem persistierten Flash-Slot -> Originalname unbekannt).
+char     g_loaded_hex_name[64] = {0};
+
 // FNV-1a ueber einen Byte-Bereich (fuer die Datei-Inhalts-Dedup).
 uint32_t content_hash(const uint8_t* p, uint32_t n) {
     uint32_t h = 2166136261u;
@@ -398,7 +403,11 @@ void parse_config(const char* buf, uint32_t len) {
             const char* p = nullptr;
             if (cfg_parse_int(line + 4, port, &p) && *p == '_' &&
                 cfg_parse_int(p + 1, pin) && cfg_parse_int(eq, rp)) {
-                config::set_pin_map(static_cast<uint8_t>(port * 12 + pin), rp);
+                // Still (verbose=false): CONFIG.INI ist autoritativ + wird als
+                // Batch neu eingelesen -> etwaige GPIO-Kollisionen sind kein
+                // Nutzer-Fehler, sondern werden deterministisch aufgeloest.
+                config::set_pin_map(static_cast<uint8_t>(port * 12 + pin), rp,
+                                    /*verbose=*/false);
             }
         } else if (std::strncmp(line, "tcap.", 5) == 0) {
             // tcap.<t>=<rp-gpio>
@@ -1107,6 +1116,8 @@ bool find_file(const char* name83, File& out) {
 bool read_text_config(const char* /*n*/) { return false; /* ungenutzt */ }
 
 Stats stats() { return g_stats; }
+
+const char* loaded_hex_name() { return g_loaded_hex_name; }
 
 } // namespace usb_msc
 

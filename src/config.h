@@ -84,7 +84,11 @@ uint32_t    target_frequency_hz();
 void        set_target_frequency_hz(uint32_t hz);
 
 const PinMap& pin_map();
-bool         set_pin_map(uint8_t lpc_pin, int rp2350_gpio);
+// verbose=true (CLI 'pinmap set'): meldet eine geloeste Kollision auf der Konsole.
+// verbose=false (autoritatives CONFIG.INI-Batch-Parsen): still, da intra-Batch-
+// GPIO-Kollisionen deterministisch (last-wins) aufgeloest werden und keine
+// Nutzer-Aktion sind (sonst Spam beim Neueinlesen einer generierten INI).
+bool         set_pin_map(uint8_t lpc_pin, int rp2350_gpio, bool verbose = true);
 void         apply_default_pinmap();
 
 // Setzt Pinmap + Timer-Capture/Match auf Default zurueck (fuer autoritatives

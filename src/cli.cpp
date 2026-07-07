@@ -30,6 +30,10 @@ namespace {
 
 constexpr std::size_t LINE_MAX = 192;
 
+// Emulator-Versionsnummer (Software-Reife). Wird in 'info' und 'version'
+// angezeigt. Semantik: 0.0x-alpha = fruehe, aktiv entwickelte Vorabstaende.
+constexpr const char* EMU_VERSION = "0.03-alpha";
+
 // Stateful Hex-Upload-Modus
 bool g_in_hex_upload = false;
 hex::Parser* g_hex_parser = nullptr;
@@ -206,6 +210,12 @@ void cmd_status() {
                 names[static_cast<int>(emulator::state())],
                 static_cast<unsigned long>(emulator::pc()),
                 static_cast<unsigned long long>(emulator::mem_traps()));
+    {
+        // Geladene Firmware-Datei (Langname der zuletzt via MSC geflashten HEX;
+        // "(unbekannt)" = Autostart aus persistiertem Flash-Slot ohne Dateiname).
+        const char* hexn = usb_msc::loaded_hex_name();
+        std::printf("Firmware: %s\n", (hexn && hexn[0]) ? hexn : "(unbekannt)");
+    }
     std::printf("Gast-Starts=%lu\n",
                 static_cast<unsigned long>(emulator::start_count()));
     // Gast-PC-Samples (SysTick-Shim). Zeigt, wo ein "Running, mmio-traps
@@ -381,10 +391,14 @@ bool parse_int(const char* s, long min_v, long max_v, long& out) {
 }
 
 void cmd_version() {
-    std::printf("LPC1115-Emu  RP2350  SDK=%s\n", PICO_SDK_VERSION_STRING);
+    std::printf("LPC1115-Emu  v%s  RP2350  SDK=%s\n",
+                EMU_VERSION, PICO_SDK_VERSION_STRING);
 }
 
 void cmd_info() {
+    std::printf("LPC1115-Emulator v%s\n", EMU_VERSION);
+    const char* hexn = usb_msc::loaded_hex_name();
+    std::printf("Firmware-Datei: %s\n", (hexn && hexn[0]) ? hexn : "(unbekannt)");
     std::size_t sz = storage::firmware_size();
     if (sz == 0) { std::puts("(kein Firmware-Image)"); return; }
     const uint8_t* fw = storage::firmware_data();
