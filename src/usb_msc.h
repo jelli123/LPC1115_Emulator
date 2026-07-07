@@ -35,11 +35,16 @@ void init();
 // anwenden? Wird vom Hauptloop gepollt.
 bool consume_pending_boot_request();
 
-// Fordert ein DEFERRED Persistieren des Live-Config-Zustands an (Flash-save +
-// CONFIG.INI-Volume-Rebuild). Fuer CLI-Aenderungen (z. B. 'pinmap set'): das
-// schwere, IRQ-blockierende save laeuft dann in poll() statt im interaktiven
-// Kommandopfad -> kein Byte-Verlust am direkt folgenden CLI-Kommando.
+// Fordert ein DEFERRED Persistieren des Live-Config-Zustands an (Flash-save).
+// Fuer CLI-Aenderungen (z. B. 'pinmap set'): die Aenderung ist sofort LIVE
+// wirksam; das schwere, einen laufenden Gast neu startende config::save() laeuft
+// erst, wenn der Gast ohnehin steht (poll) -> kein Neustall/Byte-Verlust. 'cfg
+// save' erzwingt es sofort (mit einmaligem Neustart).
 void request_config_persist();
+
+// Meldet, dass der Live-Config-Zustand bereits (per explizitem 'cfg save')
+// persistiert wurde -> loescht eine noch vorgemerkte deferred-Persistenz.
+void note_config_persisted();
 
 // Vom Hauptloop aufgerufen, wenn das Volume gerade nicht beschrieben
 // wird; persistiert Dirty-Sektoren in Storage.

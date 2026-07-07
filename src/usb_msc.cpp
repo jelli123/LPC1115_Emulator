@@ -1089,17 +1089,27 @@ void request_config_persist() {
     g_config_persist_pending.store(true, std::memory_order_relaxed);
 }
 
+void note_config_persisted() {
+    // Ein expliziter 'cfg save' hat den Live-Zustand bereits vollstaendig in den
+    // Flash geschrieben -> eine noch vorgemerkte deferred-Persistenz ist erledigt.
+    g_config_persist_pending.store(false, std::memory_order_relaxed);
+}
+
 void poll() {
-    // Deferred CLI-Config-Persist (aus 'pinmap set' o. ae.): das schwere
-    // config::save() (Flash) + Volume-Rebuild hier ausfuehren, NICHT im
-    // interaktiven Kommandopfad. Dieser Loop-Durchlauf hat oben bereits
-    // usb_stdio_task() gerufen -> ein evtl. schon getipptes Folgekommando wurde
-    // aus dem USB-Endpoint in die SW-FIFO gezogen und ist damit vor der Blockade
-    // sicher (kein Byte-Verlust mehr).
-    if (g_config_persist_pending.exchange(false)) {
-        { emulator::FlashPauseGuard _fp; config::save(); }
-        refresh_config_volume(/*trigger_host_reread=*/false);
-        return;
+    // Deferred CLI-Config-Persist (aus 'pinmap set' o. ae.): den Live-Config-
+    // Zustand in den Flash schreiben, ABER NUR wenn der Gast NICHT laeuft. Dann
+    // steht Core1 in der SDK-Spin-Schleife und der Flash-Write (FlashGuard sperrt
+    // Core1 per multicore_lockout aus) ist gefahrlos OHNE Gast-Neustart. Laeuft
+    // der Gast, bleibt die Anforderung vorgemerkt (die Aenderung ist bereits live
+    // wirksam) und wird beim naechsten Gast-Stop hier persistiert; 'cfg save'
+    // erzwingt sie sofort (mit bewusstem einmaligem Neustart). So verursacht ein
+    // 'pinmap set' bei laufendem Gast KEINEN Neustart -> kein CLI-Byte-Verlust.
+    if (g_config_persist_pending.load(std::memory_order_relaxed)) {
+        const auto st = emulator::state();
+        if (st != emulator::State::Running && st != emulator::State::Faulted) {
+            g_config_persist_pending.store(false, std::memory_order_relaxed);
+            config::save();
+        }
     }
 
     // Fatal-Fault vom Gast (Core1): kompletten [FAULT]-Report als FAULT.TXT auf

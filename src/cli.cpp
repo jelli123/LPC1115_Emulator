@@ -72,15 +72,23 @@ void apply_live_config_key(const char* key, const char* val) {
 // veralteten CONFIG.INI wieder zuruecksetzen. FlashPauseGuard pausiert einen
 // laufenden Gast fuer den Flash-Schreibzugriff (und setzt ihn danach fort).
 void persist_pinmap_change() {
-    // Sofort-Feedback; die eigentliche (schwere, Flash-blockierende) Persistenz
-    // laeuft DEFERRED in usb_msc::poll(). Wuerde sie hier synchron laufen
-    // (config::save + Volume-Rebuild, ~10-50 ms mit IRQs aus), blockierte sie den
-    // interaktiven Pfad VOR dem naechsten USB-RX-Pump -> das direkt folgende CLI-
-    // Kommando verlor ein Byte (aus 'pinmap set 0_1 -1' wurde 'pinmap set 0_1 -').
-    // Durch das Deferren pumpt der run()-Loop erst usb_stdio_task (holt das evtl.
-    // schon getippte Folgekommando sicher in die SW-FIFO), DANN persistiert poll().
-    std::puts("ok");
+    // Pinmap-Aenderung wirkt SOFORT live: config::set_pin_map() hat g_pin_map
+    // bereits aktualisiert, und der GPIO-/Peripherie-Pfad liest config::pin_map()
+    // bei jedem Zugriff -> ein laufender Gast nutzt die neue Zuordnung sofort.
+    //
+    // KEIN sofortiges config::save() hier: das liefe via FlashPauseGuard und
+    // wuerde einen laufenden Gast STOPPEN + NEU LADEN (Core1 fuehrt Emulator-
+    // Handler aus dem Flash aus + laeuft mit Gast-VTOR -> ein In-place-Freeze ist
+    // nicht moeglich, daher der volle Neustart). Dieser Neustart blockiert Core0
+    // kurz -> der CLI-CDC-Eingang verliert ein Zeichen am direkt folgenden
+    // Kommando (aus 'pinmap set 0_1 -1' wurde 'pinmap set 0_1 -'). Stattdessen:
+    // RAM-Disk-CONFIG.INI auf den Live-Zustand bringen (ohne Medienwechsel) und
+    // die Flash-Persistenz vormerken. Sie wird beim naechsten gefahrlosen Anlass
+    // geschrieben: wenn der Gast steht (usb_msc::poll, kein Neustall noetig),
+    // per 'cfg save' (bewusst mit einmaligem Neustart) oder beim CONFIG.INI-Eject.
+    usb_msc::refresh_config_volume(/*trigger_host_reread=*/false);
     usb_msc::request_config_persist();
+    std::puts("ok (live; dauerhaft per 'cfg save' oder beim Gast-Stop)");
 }
 
 // --- XMODEM-Empfang in den HEX-Parser ---
@@ -624,7 +632,9 @@ void handle_command(char* line) {
         }
         if (std::strcmp(tokens[1], "save") == 0) {
             emulator::FlashPauseGuard _fp;   // XIP-Schutz; Gast laeuft danach weiter
-            std::puts(config::save() ? "saved" : "err");
+            bool ok = config::save();
+            usb_msc::note_config_persisted();  // deferred-Flush erledigt
+            std::puts(ok ? "saved" : "err");
             return;
         }
         if (std::strcmp(tokens[1], "clear") == 0) {
@@ -656,7 +666,9 @@ void handle_command(char* line) {
         }
         if (std::strcmp(tokens[1], "save") == 0) {
             emulator::FlashPauseGuard _fp;   // XIP-Schutz; Gast laeuft danach weiter
-            std::puts(config::save() ? "saved" : "err");
+            bool ok = config::save();
+            usb_msc::note_config_persisted();  // deferred-Flush erledigt
+            std::puts(ok ? "saved" : "err");
             return;
         }
         if (std::strcmp(tokens[1], "dump") == 0) {
