@@ -21,6 +21,7 @@ void i2c_bridge_reinit();
 void spi_bridge_reinit();
 void adc_bridge_reinit();
 void ct_bridge_reinit();
+void ncn_bridge_reinit();
 
 // Vom Trap-Handler nach erfolgter Emulation aufgerufen — Stats/PLL-Folgen.
 void on_post_write_hook();

@@ -16,6 +16,7 @@
 #include "debug_bridge.h"
 #include "irq_inject.h"
 #include "usb_descriptors.h"
+#include "ncn5130.h"
 
 extern "C" void usb_stdio_task(void);
 #include <cstdio>
@@ -197,6 +198,11 @@ const char* const HELP_LINES[] = {
     "  i2c on <inst> <sda> <scl> [hz]  I2C-Bridge auf RP2350-HW (Neustart noetig)",
     "  i2c off                    I2C-Bridge deaktivieren",
     "  i2c status                 Instanz/Pins/Takt anzeigen",
+    "",
+    "  ncn on [ssp] [rx] [tx]     Virtuellen NCN5130 (KNX) aktivieren",
+    "  ncn off                    Virtuellen NCN5130 deaktivieren",
+    "  ncn loopback on|off        Selbsttest: TX-Frames als RX zurueckspiegeln",
+    "  ncn status                 NCN-Status/Zaehler anzeigen",
     "",
     "  freq <Hz>                  Ziel-CPU-Frequenz",
     "  flash hex                  Intel-Hex-Stream (alias fuer upload)",
@@ -474,7 +480,7 @@ constexpr Word TOP[] = {
     {"freq","freq"}, {"flash","flash"},
     {"gdb","gdb"}, {"bp","bp"}, {"regs","regs"}, {"mem","mem"},
     {"pio","pio"}, {"swd","swd"}, {"cdc","cdc"},
-    {"uart","uart"}, {"i2c","i2c"},
+    {"uart","uart"}, {"i2c","i2c"}, {"ncn","ncn"},
 };
 
 // Sub-Optionen je Befehl (kanonisch + Aliase).
@@ -487,6 +493,7 @@ constexpr Word SUB_SWD[]    = {{"start","start"},{"stop","stop"},{"status","stat
 constexpr Word SUB_CDC[]    = {{"start","start"},{"stop","stop"},{"status","status"}};
 constexpr Word SUB_UART[]   = {{"pins","pins"},{"cdc","cdc"},{"status","status"}};
 constexpr Word SUB_I2C[]    = {{"on","on"},{"off","off"},{"status","status"}};
+constexpr Word SUB_NCN[]    = {{"on","on"},{"off","off"},{"status","status"},{"loopback","loopback"}};
 constexpr Word SUB_PIO[]    = {{"capture","capture"}};
 constexpr Word SUB_FLASH[]  = {{"hex","hex"},{"erase","erase"},{"finalize","finalize"}};
 constexpr Word SUB_BP[]     = {{"clr","clr"}};   // blosse Adresse = Breakpoint setzen
@@ -503,6 +510,7 @@ bool get_subtable(const char* cmd, const Word*& tbl, int& cnt) {
     if (!std::strcmp(cmd, "cdc"))    { tbl = SUB_CDC;    cnt = wcount(SUB_CDC);    return true; }
     if (!std::strcmp(cmd, "uart"))   { tbl = SUB_UART;   cnt = wcount(SUB_UART);   return true; }
     if (!std::strcmp(cmd, "i2c"))    { tbl = SUB_I2C;    cnt = wcount(SUB_I2C);    return true; }
+    if (!std::strcmp(cmd, "ncn"))    { tbl = SUB_NCN;    cnt = wcount(SUB_NCN);    return true; }
     if (!std::strcmp(cmd, "pio"))    { tbl = SUB_PIO;    cnt = wcount(SUB_PIO);    return true; }
     if (!std::strcmp(cmd, "flash"))  { tbl = SUB_FLASH;  cnt = wcount(SUB_FLASH);  return true; }
     if (!std::strcmp(cmd, "bp"))     { tbl = SUB_BP;     cnt = wcount(SUB_BP);     return true; }
@@ -1241,6 +1249,68 @@ void handle_command(char* line) {
                         config::i2c_bridge_instance(),
                         config::i2c_bridge_sda_pin(), config::i2c_bridge_scl_pin(),
                         static_cast<unsigned long>(config::i2c_bridge_hz()));
+            return;
+        }
+    }
+
+    // --- Virtueller NCN5130 (KNX-Sekundaerinterface am LPC-SSP) ---
+    if (std::strcmp(tokens[0], "ncn") == 0 && n >= 2) {
+        if (std::strcmp(tokens[1], "on") == 0) {
+            long ssp = 0, rx = -1, tx = -1;
+            if (n >= 3 && !parse_int(tokens[2], 0, 1, ssp)) {
+                std::puts("err: ncn on [ssp 0|1] [rx-gpio] [tx-gpio]"); return;
+            }
+            if (n >= 4 && !parse_int(tokens[3], -1, 47, rx)) {
+                std::puts("err: ncn on [ssp 0|1] [rx-gpio] [tx-gpio]"); return;
+            }
+            if (n >= 5 && !parse_int(tokens[4], -1, 47, tx)) {
+                std::puts("err: ncn on [ssp 0|1] [rx-gpio] [tx-gpio]"); return;
+            }
+            config::set_ncn_ssp(static_cast<int>(ssp));
+            if (n >= 4) config::set_ncn_rx_pin(static_cast<int>(rx));
+            if (n >= 5) config::set_ncn_tx_pin(static_cast<int>(tx));
+            config::set_ncn_enabled(true);
+            peripherals::ncn_bridge_reinit();
+            std::puts("ok");
+            return;
+        }
+        if (std::strcmp(tokens[1], "off") == 0) {
+            config::set_ncn_enabled(false);
+            peripherals::ncn_bridge_reinit();
+            std::puts("ok");
+            return;
+        }
+        if (std::strcmp(tokens[1], "loopback") == 0) {
+            if (n < 3) {
+                std::printf("ncn loopback=%s\n", config::ncn_loopback() ? "on" : "off");
+                return;
+            }
+            bool on = std::strcmp(tokens[2], "on") == 0 || std::strcmp(tokens[2], "1") == 0;
+            config::set_ncn_loopback(on);
+            peripherals::ncn_bridge_reinit();
+            std::puts("ok");
+            return;
+        }
+        if (std::strcmp(tokens[1], "status") == 0) {
+            ncn5130::Debug d = ncn5130::debug();
+            std::printf("ncn5130=%s ssp=SSP%d rx=GP%d tx=GP%d loopback=%s\n",
+                        config::ncn_enabled() ? "on" : "off",
+                        config::ncn_ssp(), config::ncn_rx_pin(), config::ncn_tx_pin(),
+                        config::ncn_loopback() ? "on" : "off");
+            std::printf("  state=%u busmon=%u cfg=0x%02x phys=0x%04x tx_inflight=%u\n",
+                        static_cast<unsigned>(d.state), static_cast<unsigned>(d.busmon),
+                        static_cast<unsigned>(d.cfg), static_cast<unsigned>(d.phys_addr),
+                        static_cast<unsigned>(d.tx_inflight));
+            std::printf("  phy=%s (STKNX/Selfbus) tx=GP%d rx=GP%d\n",
+                        d.phy_active ? "aktiv" : "aus", d.phy_tx_pin, d.phy_rx_pin);
+            std::printf("  rx_frames=%lu tx_frames=%lu cmd_bytes=%lu rx_ready=%u\n",
+                        static_cast<unsigned long>(d.rx_frames),
+                        static_cast<unsigned long>(d.tx_frames),
+                        static_cast<unsigned long>(d.cmd_bytes),
+                        static_cast<unsigned>(d.rx_ready));
+            std::printf("  bus-ack: ok=%lu err=%lu\n",
+                        static_cast<unsigned long>(d.rx_ack_ok),
+                        static_cast<unsigned long>(d.rx_ack_err));
             return;
         }
     }

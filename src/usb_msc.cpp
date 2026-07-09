@@ -345,6 +345,11 @@ bool find_hex_entry(uint16_t& cluster, uint32_t& size,
 //   spi_bridge_sck=<rp-gpio>   spi_bridge_mosi=<rp-gpio>
 //   spi_bridge_miso=<rp-gpio>  spi_bridge_hz=<Hz>
 //   adc_bridge_en=on|off
+//   ncn_en=on|off            Virtueller NCN5130 (KNX-Sekundaerinterface)
+//   ncn_ssp=0|1              LPC-SSP, die als NCN modelliert wird
+//   ncn_rx_pin=<rp-gpio>     Sekundaerbus-RX (-1=aus)
+//   ncn_tx_pin=<rp-gpio>     Sekundaerbus-TX (-1=aus)
+//   ncn_loopback=on|off      Selbsttest: gesendete Frames als RX zurueckspiegeln
 //   tcap.<t>=<rp-gpio>        Timer-Capture-Eingang (KNX-RX), t=0..3
 //   tmat.<t>.<m>=<rp-gpio>    Timer-Match-Ausgang (KNX-TX), t=0..3, m=0..3
 //   tcap_pio=on|off          Capture flankengenau per PIO (opt-in)
@@ -483,6 +488,18 @@ void parse_config(const char* buf, uint32_t len) {
         } else if (std::strcmp(line, "adc_bridge_en") == 0) {
             config::set_adc_bridge_enabled(std::strcmp(eq, "on") == 0 ||
                                            std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "ncn_en") == 0) {
+            config::set_ncn_enabled(std::strcmp(eq, "on") == 0 ||
+                                    std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "ncn_ssp") == 0) {
+            config::set_ncn_ssp(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "ncn_rx_pin") == 0) {
+            config::set_ncn_rx_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "ncn_tx_pin") == 0) {
+            config::set_ncn_tx_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "ncn_loopback") == 0) {
+            config::set_ncn_loopback(std::strcmp(eq, "on") == 0 ||
+                                     std::strcmp(eq, "1")  == 0);
         } else if (std::strcmp(line, "tcap_pio") == 0) {
             config::set_tcap_pio(std::strcmp(eq, "on") == 0 ||
                                  std::strcmp(eq, "1")  == 0);
@@ -722,6 +739,19 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     A("# --- ADC-Bridge (LPC-ADC 0..3 -> RP2350 ADC an GP26..29) -------\n");
     A("adc_bridge_en=%s\n\n", config::adc_bridge_enabled() ? "on" : "off");
 
+    A("# --- Virtueller NCN5130 (KNX-Sekundaerinterface am LPC-SSP) -----\n");
+    A("# ncn_ssp: 0=SSP0,1=SSP1 (NCN=SPI-Master, LPC=Slave). rx/tx_pin: Bus-GPIOs.\n");
+    if (config::ncn_enabled()) {
+        A("ncn_en=on\n");
+        A("ncn_ssp=%d\n", config::ncn_ssp());
+        if (config::ncn_rx_pin() >= 0) A("ncn_rx_pin=%d\n", config::ncn_rx_pin());
+        if (config::ncn_tx_pin() >= 0) A("ncn_tx_pin=%d\n", config::ncn_tx_pin());
+        A("ncn_loopback=%s\n", config::ncn_loopback() ? "on" : "off");
+    } else {
+        A("#ncn_en=on\n#ncn_ssp=0\n#ncn_rx_pin=-1\n#ncn_tx_pin=-1\n#ncn_loopback=off\n");
+    }
+    A("\n");
+
     A("# --- KNX-Bus / Timer-Capture+Match (CT16/CT32 auf GPIOs) -------\n");
     A("# tcap.<t>=<gpio>   Capture-Eingang (Bus-RX), t: 0=CT16B0 1=CT16B1 2=CT32B0 3=CT32B1\n");
     A("# tmat.<t>.<m>=<gpio> Match-Ausgang (Bus-TX), m=0..3\n");
@@ -889,6 +919,7 @@ void on_volume_ready() {
         peripherals::spi_bridge_reinit();
         peripherals::adc_bridge_reinit();
         peripherals::ct_bridge_reinit();
+        peripherals::ncn_bridge_reinit();
         if (config::uart_bridge_enabled()) {
             uart_bridge::set_tx_pin(config::uart_bridge_tx_pin());
             uart_bridge::set_rx_pin(config::uart_bridge_rx_pin());

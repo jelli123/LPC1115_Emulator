@@ -6,6 +6,7 @@
 #include "emulator.h"
 #include "pio_glue.h"
 #include "debug_bridge.h"
+#include "ncn5130.h"
 
 #include <cstring>
 #include <cstdio>
@@ -1810,6 +1811,24 @@ void spi_bridge_init() {
     ssp_apply_format(static_cast<uint32_t>(g_spi_lpc));
 }
 
+// Virtueller NCN5130: aktiviert das NCN-Modell auf der konfigurierten LPC-SSP.
+// Die betroffene SSP-Instanz wird dadurch NICHT als HW-SPI-Bridge behandelt,
+// sondern von ncn5130::spi_exchange() bedient (siehe ssp_write_byte).
+void ncn_bridge_init() {
+    ncn5130::set_enabled(0, false);
+    ncn5130::set_enabled(1, false);
+    ncn5130::set_loopback(config::ncn_loopback());
+    // Reale KNX-PHY (STKNX/Selfbus) einrichten bzw. abschalten. Nur wenn NCN an
+    // UND beide Bus-Pins gesetzt sind; sonst bleibt der Software-Loopback-Pfad.
+    if (config::ncn_enabled() && config::ncn_tx_pin() >= 0 && config::ncn_rx_pin() >= 0) {
+        ncn5130::phy_init(config::ncn_tx_pin(), config::ncn_rx_pin());
+    } else {
+        ncn5130::phy_init(-1, -1);
+    }
+    if (!config::ncn_enabled()) return;
+    ncn5130::set_enabled(config::ncn_ssp(), true);
+}
+
 // Übernimmt Datenbreite (DSS) und SPI-Modus (CPOL/CPHA) aus CR0 in die HW.
 void ssp_apply_format(uint32_t idx) {
     if (!g_spi_ready || static_cast<int>(idx) != g_spi_lpc) return;
@@ -1874,7 +1893,12 @@ void ssp_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
             bool complete = (bits <= 8u) ? ((off & 3u) == 0u)
                                          : ((off & 3u) == 1u);
             if (!complete) break;
-            if (ssp_is_bridged(idx)) {
+            if (ncn5130::enabled(static_cast<int>(idx))) {
+                // Virtueller NCN5130 (KNX-Sekundaerinterface): byte-transparenter
+                // SPI-Austausch durch den NCN-Automaten statt HW-Bridge/Loopback.
+                // Nur 8-Bit-Frames (NCN5130 kommuniziert byteweise).
+                s.dr_rx = ncn5130::spi_exchange(static_cast<uint8_t>(s.tx & 0xFFu));
+            } else if (ssp_is_bridged(idx)) {
                 if (bits <= 8u) {
                     uint8_t tx = static_cast<uint8_t>(s.tx & 0xFFu), rx = 0;
                     spi_write_read_blocking(g_spi_hw, &tx, &rx, 1);
@@ -2145,12 +2169,15 @@ void init() {
     spi_bridge_init();
     adc_bridge_init();
     ct_bridge_init();
+    ncn5130::init();
+    ncn_bridge_init();
 }
 
 void i2c_bridge_reinit() { i2c_bridge_init(); }
 void spi_bridge_reinit() { spi_bridge_init(); }
 void adc_bridge_reinit() { adc_bridge_init(); }
 void ct_bridge_reinit()  { ct_bridge_init(); }
+void ncn_bridge_reinit() { ncn_bridge_init(); }
 
 void reset() {
     std::memset(g_gpio, 0, sizeof g_gpio);
@@ -2381,6 +2408,7 @@ void poll_timed_sources() {
     for (auto& c : g_ct) { ct_advance(c); ct_sample_capture(c); }
     wdt_advance();
     systick_advance();
+    ncn5130::poll();   // virtueller NCN5130: TX-Abschluss/L_Data.con (Core1)
     // UART0-RX-Interrupt (initialer Trigger): liegen Empfangsdaten vor und hat
     // der Gast den RBR-IRQ aktiviert (IER Bit0), UART0-IRQ penden. Laeuft auf
     // Core1 (via SysTick-Shim/WFI-Loop). Nach dem ersten Byte haelt sich die

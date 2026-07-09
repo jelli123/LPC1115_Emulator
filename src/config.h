@@ -45,6 +45,13 @@ inline constexpr const char* KEY_SPI_BRIDGE_MOSI = "spi_bridge_mosi";  // GPIO-N
 inline constexpr const char* KEY_SPI_BRIDGE_MISO = "spi_bridge_miso";  // GPIO-Nummer
 inline constexpr const char* KEY_SPI_BRIDGE_HZ   = "spi_bridge_hz";    // Bus-Takt in Hz
 inline constexpr const char* KEY_ADC_BRIDGE_EN   = "adc_bridge_en";    // "0"/"1"
+// Virtueller NCN5130 (KNX-Sekundaerinterface am LPC-SSP). Siehe
+// docs/NCN5130_EMULATION_SPEC.md. ncn_ssp = welcher LPC-SSP (0/1) der NCN ist.
+inline constexpr const char* KEY_NCN_EN          = "ncn_en";           // "0"/"1"
+inline constexpr const char* KEY_NCN_SSP         = "ncn_ssp";          // 0=SSP0, 1=SSP1
+inline constexpr const char* KEY_NCN_RX_PIN      = "ncn_rx_pin";       // Sekundaerbus RX-GPIO (-1=aus)
+inline constexpr const char* KEY_NCN_TX_PIN      = "ncn_tx_pin";       // Sekundaerbus TX-GPIO (-1=aus)
+inline constexpr const char* KEY_NCN_LOOPBACK    = "ncn_loopback";     // "0"/"1" Selbsttest
 // Timer-Capture-/Match-Pin-Bridges (für KNX-Bus-Empfang/-Senden via CT16/CT32).
 //   tcap.<t>=<gpio>        Capture-Eingang CAP0 von Timer t (0..3)
 //   tmat.<t>.<m>=<gpio>    Match-Ausgang MATm von Timer t (m=0..3)
@@ -157,6 +164,20 @@ void        set_spi_bridge_hz(uint32_t hz);
 // ADC-Pin und liefern weiterhin den Mittenwert. Nur Enable konfigurierbar.
 bool        adc_bridge_enabled();
 void        set_adc_bridge_enabled(bool v);
+
+// Virtueller NCN5130 (KNX-Sekundaerinterface). ncn_ssp = LPC-SSP-Instanz (0/1),
+// die als NCN5130 (SPI-Master, LPC=Slave) modelliert wird; die andere SSP bleibt
+// normaler Master fuer weitere SPI-Geraete. rx/tx_pin = Sekundaerbus-PHY-Pins.
+bool        ncn_enabled();
+void        set_ncn_enabled(bool v);
+int         ncn_ssp();
+void        set_ncn_ssp(int idx);
+int         ncn_rx_pin();
+void        set_ncn_rx_pin(int gpio);
+int         ncn_tx_pin();
+void        set_ncn_tx_pin(int gpio);
+bool        ncn_loopback();
+void        set_ncn_loopback(bool v);
 
 // Timer-Capture-/Match-Pin-Bridge (CT16B0/1, CT32B0/1 → echte RP2350-GPIOs).
 // Wird primär für den Selfbus-KNX-Buszugriff benötigt: Capture-Eingang =

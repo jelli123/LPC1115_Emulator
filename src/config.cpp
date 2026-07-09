@@ -35,6 +35,11 @@ int      g_spi_bridge_mosi = -1;
 int      g_spi_bridge_miso = -1;
 uint32_t g_spi_bridge_hz   = 1'000'000;
 bool     g_adc_bridge_en   = false;
+bool     g_ncn_en          = false;   // virtueller NCN5130
+int      g_ncn_ssp         = 0;       // 0=SSP0, 1=SSP1
+int      g_ncn_rx_pin      = -1;      // Sekundaerbus RX-GPIO
+int      g_ncn_tx_pin      = -1;      // Sekundaerbus TX-GPIO
+bool     g_ncn_loopback    = false;   // Loopback/Monitor-Selbsttest
 bool     g_wfi_pin_wakeup  = false;
 bool     g_primask_shadow  = false;
 uint32_t g_app_start       = 0x3000;
@@ -289,6 +294,19 @@ bool load() {
     if (storage::config_get(KEY_ADC_BRIDGE_EN, buf, sizeof buf)) {
         g_adc_bridge_en = (buf[0] == '1');
     }
+    if (storage::config_get(KEY_NCN_EN, buf, sizeof buf)) g_ncn_en = (buf[0] == '1');
+    if (storage::config_get(KEY_NCN_SSP, buf, sizeof buf)) {
+        uint32_t v; if (parse_uint32(buf, v) && v <= 1u) g_ncn_ssp = static_cast<int>(v);
+    }
+    if (storage::config_get(KEY_NCN_RX_PIN, buf, sizeof buf)) {
+        int v = static_cast<int>(std::atol(buf));
+        g_ncn_rx_pin = (v >= -1 && v <= MAX_GPIO) ? v : -1;
+    }
+    if (storage::config_get(KEY_NCN_TX_PIN, buf, sizeof buf)) {
+        int v = static_cast<int>(std::atol(buf));
+        g_ncn_tx_pin = (v >= -1 && v <= MAX_GPIO) ? v : -1;
+    }
+    if (storage::config_get(KEY_NCN_LOOPBACK, buf, sizeof buf)) g_ncn_loopback = (buf[0] == '1');
     if (storage::config_get(KEY_WFI_PIN_WAKEUP, buf, sizeof buf)) {
         g_wfi_pin_wakeup = (buf[0] == '1');
     }
@@ -412,6 +430,20 @@ bool save() {
     if (!storage::config_set(KEY_SPI_BRIDGE_HZ, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_adc_bridge_en ? 1 : 0));
     if (!storage::config_set(KEY_ADC_BRIDGE_EN, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_ncn_en ? 1 : 0));
+    if (!storage::config_set(KEY_NCN_EN, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%d", g_ncn_ssp);
+    if (!storage::config_set(KEY_NCN_SSP, buf)) return false;
+    if (g_ncn_rx_pin >= 0) {
+        std::snprintf(buf, sizeof buf, "%d", g_ncn_rx_pin);
+        if (!storage::config_set(KEY_NCN_RX_PIN, buf)) return false;
+    }
+    if (g_ncn_tx_pin >= 0) {
+        std::snprintf(buf, sizeof buf, "%d", g_ncn_tx_pin);
+        if (!storage::config_set(KEY_NCN_TX_PIN, buf)) return false;
+    }
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_ncn_loopback ? 1 : 0));
+    if (!storage::config_set(KEY_NCN_LOOPBACK, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_wfi_pin_wakeup ? 1 : 0));
     if (!storage::config_set(KEY_WFI_PIN_WAKEUP, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_primask_shadow ? 1 : 0));
@@ -550,6 +582,17 @@ void set_spi_bridge_hz(uint32_t hz)  { if (hz > 0 && hz <= 50'000'000) g_spi_bri
 
 bool adc_bridge_enabled()            { return g_adc_bridge_en; }
 void set_adc_bridge_enabled(bool v)  { g_adc_bridge_en = v; }
+
+bool ncn_enabled()                   { return g_ncn_en; }
+void set_ncn_enabled(bool v)         { g_ncn_en = v; }
+int  ncn_ssp()                       { return g_ncn_ssp; }
+void set_ncn_ssp(int idx)            { if (idx == 0 || idx == 1) g_ncn_ssp = idx; }
+int  ncn_rx_pin()                    { return g_ncn_rx_pin; }
+void set_ncn_rx_pin(int gpio)        { g_ncn_rx_pin = gpio; }
+int  ncn_tx_pin()                    { return g_ncn_tx_pin; }
+void set_ncn_tx_pin(int gpio)        { g_ncn_tx_pin = gpio; }
+bool ncn_loopback()                  { return g_ncn_loopback; }
+void set_ncn_loopback(bool v)        { g_ncn_loopback = v; }
 
 int  ct_capture_pin(int t) {
     return (t >= 0 && t < 4) ? g_ct_cap[t] : -1;

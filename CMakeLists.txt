@@ -59,6 +59,7 @@ add_executable(emulator
     src/fault.cpp
     src/emulator.cpp
     src/peripherals.cpp
+    src/ncn5130.cpp
     src/clock.cpp
     src/opcodes.cpp
     src/pio_glue.cpp
