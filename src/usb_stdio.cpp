@@ -7,6 +7,7 @@
 
 #include "tusb.h"
 #include "pico/stdlib.h"
+#include "hardware/sync.h"
 #include "pico/stdio/driver.h"
 #include "usb_descriptors.h"
 
@@ -17,8 +18,50 @@ extern "C" {
 // CDC-Instanz der CLI (dynamisch; -1 wenn CLI per Config deaktiviert).
 static inline int cli_cdc() { return usb_desc_cdc_cli(); }
 
+// Ausgaben von Core1 (Gast-Start, [FAULT]-Berichte, Peripherie-Meldungen aus
+// dem Trap-Handler) duerfen TinyUSB NICHT direkt anfassen: TinyUSB ist nicht
+// multicore-fest, und Core0 ruft parallel tud_task(). Core1 schreibt daher in
+// einen lock-freien SPSC-Ring (nie blockierend, Ueberlauf = Zeichen verworfen),
+// Core0 leert ihn in usb_stdio_task().
+#define CORE1_LOG_SIZE 2048u   /* Zweierpotenz */
+static char              s_c1_buf[CORE1_LOG_SIZE];
+static volatile uint32_t s_c1_head = 0;   // Producer: Core1
+static volatile uint32_t s_c1_tail = 0;   // Consumer: Core0
+
+static void core1_log_push(const char* buf, int length) {
+    uint32_t h = s_c1_head;
+    for (int i = 0; i < length; ++i) {
+        if (h - s_c1_tail >= CORE1_LOG_SIZE) break;   // voll -> Rest verwerfen
+        s_c1_buf[h & (CORE1_LOG_SIZE - 1u)] = buf[i];
+        ++h;
+    }
+    __dmb();
+    s_c1_head = h;
+}
+
+static void stdio_cdc_write_core0(const char* buf, int length);
+
+static void core1_log_drain(void) {
+    char tmp[64];
+    for (;;) {
+        uint32_t t = s_c1_tail, h = s_c1_head;
+        __dmb();
+        if (t == h) return;
+        int n = 0;
+        while (t != h && n < (int)sizeof tmp) tmp[n++] = s_c1_buf[t++ & (CORE1_LOG_SIZE - 1u)];
+        __dmb();
+        s_c1_tail = t;
+        stdio_cdc_write_core0(tmp, n);
+    }
+}
+
 // stdio -> CLI-CDC OUT
 static void stdio_cdc_out_chars(const char* buf, int length) {
+    if (get_core_num() != 0) { core1_log_push(buf, length); return; }
+    stdio_cdc_write_core0(buf, length);
+}
+
+static void stdio_cdc_write_core0(const char* buf, int length) {
     int itf = cli_cdc();
     if (itf < 0 || !tud_cdc_n_connected((uint8_t)itf)) return;
     int written = 0;
@@ -73,6 +116,7 @@ void usb_stdio_init(void) {
 
 void usb_stdio_task(void) {
     tud_task();
+    core1_log_drain();
 }
 
 bool usb_stdio_connected(void) {
