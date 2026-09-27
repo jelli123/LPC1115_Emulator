@@ -45,4 +45,7 @@ struct Stats {
 };
 Stats stats();
 
+// Eindeutige ID (4 Worte) wie IAP 58 / ISP 'N'.
+void read_uid(uint32_t w[4]);
+
 } // namespace iap

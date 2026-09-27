@@ -167,6 +167,9 @@ Der Emulator trennt sauber zwischen **zwei unabhängigen** Dingen:
 >
 > Ist die Serial-CDC per `serial_enable=off` deaktiviert, sind `cdc …` und
 > `uart cdc on` wirkungslos (kein USB-Endpunkt).
+>
+> Der ISP-Bootloader hat eine eigene, vierte CDC („LPC-Emu ISP“) und kollidiert
+> daher mit keiner der beiden Funktionen (siehe [Variante E](#variante-e-isp-bootloader-flashmagic-lpc21isp)).
 
 ---
 
@@ -398,6 +401,58 @@ arm-none-eabi-gdb fw.elf
 
 Die geladene Firmware landet sowohl im RAM-View des Emulators als auch im
 Wear-Leveling-Slot des QSPI-Flash (überlebt Power-Cycle wenn `autostart on`).
+
+### Variante E: ISP-Bootloader (FlashMagic, lpc21isp)
+
+Der Emulator bildet den UART-ISP-Bootloader des LPC1115 nach (Protokoll aus
+UM10398 Kap. 26, Part-ID `0x00050080` = LPC1115/303). Er lässt sich damit wie
+ein echter Chip programmieren. Während der ISP aktiv ist, ist der Gast gestoppt.
+
+**a) Virtuell über USB (keine Verdrahtung):** Die vierte USB-CDC
+„LPC-Emu ISP" (`isp_enable=on`, Default) ist ein eigener COM-Port nur für den ISP.
+
+* In FlashMagic Gerät **LPC1115/303**, den ISP-COM-Port und eine beliebige
+  Baudrate wählen, unter *Options → Advanced Options → Hardware Config*
+  **„Use DTR and RTS to control RST and ISP pin"** aktivieren.
+  DTR aktiv = RESET, RTS aktiv = ISP-Pin (`isp_dtr_rts=on`). FlashMagic setzt
+  damit den Gast in den ISP und startet ihn nach dem Programmieren neu.
+* Ohne diese Option genügt das erste `?` auf dem ISP-Port: der Gast wird
+  angehalten und der ISP gestartet (`isp_autosync=on`).
+* lpc21isp: `lpc21isp -control firmware.hex /dev/ttyACM3 115200 12000`
+  (bzw. ohne `-control` dank Autosync).
+
+> Hinweis: Mit `isp_dtr_rts=on` hält ein Terminal, das beim Öffnen des
+> ISP-Ports DTR setzt, den Gast im Reset, solange der Port offen ist – genau
+> wie ein echter LPC an einem so verdrahteten USB-Seriell-Adapter.
+
+**b) Über Pins wie am echten Chip (`isp_pins=on`):**
+
+| LPC-Funktion | Zuordnung | Bedeutung |
+|---|---|---|
+| RESET (P0_0) | `pinmap set 0_0 <gpio>` + `resetpin on` | low = Gast im Reset, Freigabe = Neustart |
+| ISP (P0_1)   | `pinmap set 0_1 <gpio>` | beim Reset low = ISP statt Anwendung |
+| RXD/TXD      | `uart pins <tx> <rx>` | ISP läuft über dieselben UART0-Pads wie der Gast |
+
+Die Baudrate wird wie beim LPC per `?` automatisch erkannt (`isp_baud=0`) oder
+fest vorgegeben (`isp baud 115200`). Ein USB-Seriell-Adapter mit DTR/RTS wird
+wie beim echten Chip an RESET/P0_1 angeschlossen.
+
+P0_1 wird bei **jedem** Reset ausgewertet: RESET-Pin, `reset`, Watchdog,
+`NVIC_SystemReset()` und beim Einschalten. Die IAP-Funktion „Reinvoke ISP" (57)
+startet den ISP ebenfalls (über die Pins, wenn `isp_pins=on`, sonst über die
+ISP-CDC). Die Leseschutz-Codes CRP1/2/3 und NO_ISP an 0x2FC werden beachtet.
+
+**RESET-Pin für andere Zwecke:** `resetpin on` funktioniert auch ohne ISP als
+Reset-Taster für den Gast. Schaltet die Firmware P0_0 per IOCON auf GPIO
+(PIO0_0) um, ist die RESET-Funktion wie am echten Chip abgeschaltet und der
+Pin ein normaler GPIO.
+
+CLI: `isp` (Status), `isp enter [cdc|uart]`, `isp exit`, `isp dtr|autosync|pins on|off`,
+`isp baud <n>|auto`, `isp usb on|off`, `resetpin on|off|status`.
+
+Einschränkungen: `G <addr>` startet den Gast immer regulär über den
+Reset-Vektor. Die „valid user code"-Prüfsumme (Vektor 7) wird nicht
+erzwungen, da die Selfbus-HEX-Dateien sie nicht enthalten.
 
 ### Variante D: Bootloader + Applikation (zweistufig, mit Auto-Descriptor)
 

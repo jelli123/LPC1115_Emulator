@@ -69,4 +69,13 @@ bool firmware_finalize(std::size_t total_len); // schreibt Längen-Marker
 // Fehler), damit Teil-Daten nicht beim naechsten Schreibzugriff im Flash landen.
 void firmware_discard();
 
+// Liest den aktuellen Slot-Inhalt inkl. noch nicht geflushter Puffer-Daten.
+bool firmware_read(std::size_t offset, void* dst, std::size_t len);
+// Schreibt den Sektor-Puffer ins Flash (ohne Marker).
+void firmware_flush();
+// Flusht und setzt den Marker auf die tatsaechliche Laenge (letztes Nicht-0xFF-
+// Byte + 1). Ist der Slot leer, wird der Marker geloescht (= keine Firmware).
+// Fuer den ISP, wo Loeschen/Programmieren die Laenge auch verkleinern kann.
+bool firmware_commit();
+
 } // namespace storage

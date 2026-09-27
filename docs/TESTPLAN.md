@@ -121,7 +121,23 @@ Jeweils HEX laden (Weg aus Abschnitt C) und `run`.
 | U1 | GDB-CDC aus | `cli_enable=on`, `gdb_enable=off` in CONFIG.INI, auswerfen, Reset | ein COM-Port weniger; `status` zeigt `\| aus: GDB` | ⬜ |
 | U2 | Serial-CDC aus | `serial_enable=off`, Reset | Serial-Adapter-Port verschwindet; `cdc start` wirkungslos | ⬜ |
 | U3 | CLI aus | `cli_enable=off`, Reset | CLI-Port weg; Autostart/GDB/MSC laufen weiter (Bedienung über CONFIG.INI) | ⬜ |
-| U4 | Alles wieder an | alle `*_enable=on`, Reset | 3 COM-Ports + MSC wieder da | ⬜ |
+| U4 | Alles wieder an | alle `*_enable=on`, Reset | 4 COM-Ports + MSC wieder da | ⬜ |
+| U5 | ISP-CDC aus | `isp_enable=off`, Reset | ISP-Port verschwindet; `stats` zeigt `\| aus: ISP` | ⬜ |
+
+## H3 — ISP-Bootloader
+
+| # | Test | Schritte | Erwartung | Status |
+|---|------|----------|-----------|:------:|
+| P1 | FlashMagic über ISP-CDC | LPC1115/303, ISP-Port, „Use DTR and RTS“, Erase + Program HEX | Programmierung ok, Gast startet danach | ⬜ |
+| P2 | Autosync | FlashMagic ohne DTR/RTS-Option, „Read Device Signature“ | Part-ID 0x00050080, `isp` zeigt aktiv | ⬜ |
+| P3 | lpc21isp | `lpc21isp -control x.hex <isp-port> 115200 12000` | „Download Finished“, Gast läuft | ⬜ |
+| P4 | Verify | FlashMagic „Verify“ nach P1 | keine Abweichung | ⬜ |
+| P5 | Persistenz | nach P1 Power-Cycle, `info` | neue Firmware aktiv | ⬜ |
+| P6 | RESET-Pin | `pinmap set 0_0 <gp>`, `resetpin on`, Pin auf GND | `[RESET] … Gast im Reset`, Freigabe startet neu | ⬜ |
+| P7 | ISP-Pin | `isp pins on`, P0_1 low, RESET-Puls | `[ISP] aktiv ueber UART0-Pads`, FlashMagic über USB-Seriell-Adapter an `uart pins` | ⬜ |
+| P8 | Autobaud | P7 mit 9600 / 57600 / 115200 | `[ISP] Autobaud: <baud>` passend | ⬜ |
+| P9 | P0_0 als GPIO | Firmware setzt IOCON_RESET_PIO0_0 auf PIO | Pin low löst keinen Reset mehr aus | ⬜ |
+| P10 | CRP | Firmware mit CRP1 an 0x2FC, `R 0 4` per ISP | Antwort 19 (Leseschutz) | ⬜ |
 
 ## I — PIO Edge-Capture
 

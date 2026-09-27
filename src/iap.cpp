@@ -1,12 +1,15 @@
 #include "iap.h"
 #include "emulator.h"
 #include "storage.h"
+#include "isp.h"
 
 #include <cstdio>
 #include <cstring>
 #include "pico/unique_id.h"
 
 namespace iap {
+
+void read_uid(uint32_t w[4]);
 
 namespace {
 
@@ -174,19 +177,21 @@ uint32_t cmd_compare(uint32_t* p, uint32_t* r) {
     return CMD_SUCCESS;
 }
 
-void put_uid(uint32_t* r) {
-    pico_unique_board_id_t id{};
-    pico_get_unique_board_id(&id);
-    // 8 RP2350-Bytes -> 4×32-Bit (LPC liefert 4 Words).
-    for (int i = 0; i < 4; ++i) {
-        r[1 + i] = static_cast<uint32_t>(id.id[(i * 2) % 8]) |
-                   (static_cast<uint32_t>(id.id[(i * 2 + 1) % 8]) << 8) |
-                   (static_cast<uint32_t>(id.id[(i + 4) % 8]) << 16) |
-                   (static_cast<uint32_t>(id.id[(i + 1) % 8]) << 24);
-    }
-}
+void put_uid(uint32_t* r) { read_uid(r + 1); }
 
 } // namespace
+
+void read_uid(uint32_t w[4]) {
+    pico_unique_board_id_t id{};
+    pico_get_unique_board_id(&id);
+    // 8 RP2350-Bytes -> 4x32-Bit (LPC liefert 4 Words).
+    for (int i = 0; i < 4; ++i) {
+        w[i] = static_cast<uint32_t>(id.id[(i * 2) % 8]) |
+               (static_cast<uint32_t>(id.id[(i * 2 + 1) % 8]) << 8) |
+               (static_cast<uint32_t>(id.id[(i + 4) % 8]) << 16) |
+               (static_cast<uint32_t>(id.id[(i + 1) % 8]) << 24);
+    }
+}
 
 void init() {
     g_stats = {};
@@ -233,7 +238,10 @@ void dispatch(uint32_t* param, uint32_t* result) {
             break;
         case 56: result[0] = cmd_compare(param, result);           break;
         case 57:
-            // Reinvoke ISP — im Emulator kein UART-Bootloader. Ignorieren.
+            // Reinvoke ISP: wie auf dem LPC kehrt der Aufruf nicht zurueck, wenn
+            // ein ISP-Transport verfuegbar ist (Core1 parkt, Core0 startet den
+            // ISP). Sonst: Erfolg melden und weiterlaufen.
+            if (isp::available()) emulator::request_isp_from_guest();
             result[0] = CMD_SUCCESS;
             break;
         case 58:

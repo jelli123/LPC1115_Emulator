@@ -56,6 +56,10 @@ void request_guest_reset();
 // angefordert hat (request_guest_reset von Core1). Fuehrt den Reset NICHT
 // selbst aus — der Aufrufer ruft danach request_guest_reset() auf Core0.
 bool guest_reset_pending();
+// IAP "Reinvoke ISP" vom Gast (Core1): Anforderung an Core0 stellen und parken.
+void request_isp_from_guest();
+// Von Core0 im Hauptloop konsumiert.
+bool guest_isp_pending();
 // Vom Fault-Handler (Core1) bei nicht-emulierbarem Gast-Fault aufgerufen:
 // Gast in State::Faulted halten statt das Silizium per Watchdog zu rebooten.
 void notify_guest_faulted();

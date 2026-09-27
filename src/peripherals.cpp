@@ -2743,6 +2743,19 @@ bool guest_output_level(uint8_t port, uint8_t pin, bool& level) {
 //   uart0_cdc_rx_push - ein von CDC#2 empfangenes Byte an den Gast-RX
 bool uart0_cdc_tx_pop(uint8_t& b) { return ring_pop(g_uart0_tx, b); }
 void uart0_cdc_rx_push(uint8_t b) { ring_push(g_uart0_rx, b); }
+bool uart0_isp_pads(uart_inst_t*& inst, int& rx_gpio) {
+    uart0_apply_pins();
+    if (!g_uart0.hw || g_uart0_rx_gpio < 0 || g_uart0_tx_gpio < 0) return false;
+    inst    = g_uart0.hw;
+    rx_gpio = g_uart0_rx_gpio;
+    return true;
+}
+
+bool reset_pin_is_reset_function() {
+    constexpr uint32_t IOCON_RESET_PIO0_0 = 0x00C;
+    return (g_iocon[IOCON_RESET_PIO0_0] & 0x7u) == 0u;
+}
+
 uint32_t uart0_cdc_rx_free() {
     const uint32_t used = (g_uart0_rx.head.load(std::memory_order_acquire) -
                            g_uart0_rx.tail.load(std::memory_order_acquire)) &

@@ -68,6 +68,8 @@ vom Laufwerk (Medienwechsel); die uebrigen Dateien bleiben.</div>
 <tr><td><code>swd start &lt;dio&gt; &lt;clk&gt;</code></td><td>externes SWD-Target (clk = dio+1)</td></tr>
 <tr><td><code>cdc start|stop|status</code></td><td>USB&harr;UART-Adapter (Serial-CDC &harr; PIO-UART, beliebige GPIOs)</td></tr>
 <tr><td><code>uart pins|cdc|status</code></td><td>LPC-UART0 des Gasts: echte RP-Pads bzw. virtuell an Serial-CDC</td></tr>
+<tr><td><code>isp</code>, <code>isp enter|exit</code></td><td>ISP-Bootloader (FlashMagic: ISP-COM-Port, Option &bdquo;Use DTR and RTS&ldquo;)</td></tr>
+<tr><td><code>resetpin on|off</code></td><td>P0_0 als RESET-Eingang des Gasts</td></tr>
 <tr><td><code>i2c on|off|status</code></td><td>I2C-Bridge auf echte RP2350-Hardware</td></tr>
 </table>
 

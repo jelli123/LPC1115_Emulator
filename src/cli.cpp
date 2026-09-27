@@ -16,6 +16,7 @@
 #include "debug_bridge.h"
 #include "irq_inject.h"
 #include "usb_descriptors.h"
+#include "isp.h"
 
 extern "C" void usb_stdio_task(void);
 #include <cstdio>
@@ -198,6 +199,16 @@ const char* const HELP_LINES[] = {
     "                             <-> PIO-UART an RP-GPIOs (nicht mit dem Gast verbunden)",
     "  cdc stop|status            USB-Seriell-Adapter stoppen / Zustand",
     "",
+    "  isp [status]               ISP-Bootloader (FlashMagic/lpc21isp) anzeigen",
+    "  isp enter [cdc|uart]       ISP sofort starten (Gast wird gestoppt)",
+    "  isp exit                   ISP beenden, Flash festschreiben, Gast starten",
+    "  isp dtr on|off             ISP-CDC: DTR=RESET, RTS=ISP-Pin",
+    "  isp autosync on|off        ISP-CDC: '?' startet den ISP automatisch",
+    "  isp pins on|off            beim Reset P0_1 abfragen -> ISP ueber UART0-Pads",
+    "  isp baud <n>|auto          Baudrate fuer ISP ueber Pins",
+    "  isp usb on|off             ISP-CDC am USB (wirkt nach RP2350-Neustart)",
+    "  resetpin on|off|status     P0_0 (pin.0_0) als RESET-Eingang des Gasts",
+    "",
     "  i2c on <inst> <sda> <scl> [hz]  I2C-Bridge auf RP2350-HW (Neustart noetig)",
     "  i2c off                    I2C-Bridge deaktivieren",
     "  i2c status                 Instanz/Pins/Takt anzeigen",
@@ -345,21 +356,24 @@ void cmd_status() {
         const int c_cli = usb_desc_cdc_cli();
         const int c_gdb = usb_desc_cdc_gdb();
         const int c_ser = usb_desc_cdc_serial();
+        const int c_isp = usb_desc_cdc_isp();
         char line[128]; int p = 0;
         p += std::snprintf(line + p, sizeof line - p, "USB-CDC:");
         for (int i = 0; i < usb_desc_cdc_count(); ++i) {
             const char* nm = (i == c_cli) ? "CLI"
                            : (i == c_gdb) ? "GDB"
-                           : (i == c_ser) ? "Serial-Adapter" : "?";
+                           : (i == c_ser) ? "Serial-Adapter"
+                           : (i == c_isp) ? "ISP" : "?";
             p += std::snprintf(line + p, sizeof line - p, " CDC#%d=%s", i, nm);
         }
         if (usb_desc_cdc_count() == 0)
             p += std::snprintf(line + p, sizeof line - p, " (keine)");
         // deaktivierte Rollen benennen
-        char off[48]; int op = 0;
+        char off[56]; int op = 0;
         if (c_cli < 0) op += std::snprintf(off + op, sizeof off - op, " CLI");
         if (c_gdb < 0) op += std::snprintf(off + op, sizeof off - op, " GDB");
         if (c_ser < 0) op += std::snprintf(off + op, sizeof off - op, " Serial");
+        if (c_isp < 0) op += std::snprintf(off + op, sizeof off - op, " ISP");
         if (op) std::snprintf(line + p, sizeof line - p, " | aus:%s", off);
         std::puts(line);
     }
@@ -473,7 +487,7 @@ constexpr Word TOP[] = {
     {"pinmap","pinmap"}, {"pin","pinmap"},
     {"gdb","gdb"}, {"bp","bp"}, {"regs","regs"}, {"mem","mem"},
     {"pio","pio"}, {"swd","swd"}, {"cdc","cdc"},
-    {"uart","uart"}, {"i2c","i2c"},
+    {"uart","uart"}, {"i2c","i2c"}, {"isp","isp"}, {"resetpin","resetpin"},
 };
 
 // Sub-Optionen je Befehl (kanonisch + Aliase).
@@ -489,6 +503,10 @@ constexpr Word SUB_I2C[]    = {{"on","on"},{"off","off"},{"status","status"}};
 constexpr Word SUB_PIO[]    = {{"capture","capture"}};
 constexpr Word SUB_BP[]     = {{"clr","clr"}};   // blosse Adresse = Breakpoint setzen
 constexpr Word SUB_ONOFF[]  = {{"on","on"},{"off","off"}};
+constexpr Word SUB_ISP[]    = {{"status","status"},{"enter","enter"},{"exit","exit"},
+                               {"dtr","dtr"},{"autosync","autosync"},{"pins","pins"},
+                               {"baud","baud"},{"usb","usb"}};
+constexpr Word SUB_RESETPIN[] = {{"on","on"},{"off","off"},{"status","status"}};
 
 template <int N> constexpr int wcount(const Word (&)[N]) { return N; }
 
@@ -505,6 +523,8 @@ bool get_subtable(const char* cmd, const Word*& tbl, int& cnt) {
     if (!std::strcmp(cmd, "pio"))    { tbl = SUB_PIO;    cnt = wcount(SUB_PIO);    return true; }
     if (!std::strcmp(cmd, "bp"))     { tbl = SUB_BP;     cnt = wcount(SUB_BP);     return true; }
     if (!std::strcmp(cmd, "autostart")) { tbl = SUB_ONOFF; cnt = wcount(SUB_ONOFF); return true; }
+    if (!std::strcmp(cmd, "isp"))    { tbl = SUB_ISP;    cnt = wcount(SUB_ISP);    return true; }
+    if (!std::strcmp(cmd, "resetpin")) { tbl = SUB_RESETPIN; cnt = wcount(SUB_RESETPIN); return true; }
     return false;
 }
 
@@ -803,7 +823,9 @@ void handle_command(char* line) {
         // Ist der Gast kooperativ gehaltet ('stop'/'halt'), fortsetzen statt neu
         // zu laden — sonst meldet load_and_start() "bereits gestartet" (State
         // bleibt beim Halt Running). Sonst regulaer laden + starten.
-        if (target_halt::is_halted()) {
+        if (isp::active()) {
+            std::puts("ISP aktiv - erst 'isp exit'");
+        } else if (target_halt::is_halted()) {
             target_halt::request_resume();
             std::puts("fortgesetzt");
         } else {
@@ -859,10 +881,12 @@ void handle_command(char* line) {
     if (std::strcmp(tokens[0], "reset") == 0) {
         // Frueher nur emulator::stop() -> Gast blieb stehen (entsprach 'halt').
         // Jetzt echtes Reset-Verhalten: stoppen und aus dem Flash-Slot neu starten.
+        // RESET gehalten oder P0_1 low (isp_pins) -> wie am echten Chip kein Start.
+        if (isp::active()) isp::leave(false);
         emulator::stop();
-        if (storage::firmware_size() == 0) { std::puts("reset: keine Firmware geladen"); return; }
-        emulator::load_and_start();
-        std::puts("reset: Gast neu gestartet");
+        isp::start_guest_if_possible();
+        std::puts(emulator::state() == emulator::State::Running
+                      ? "reset: Gast neu gestartet" : "reset: Gast nicht gestartet");
         return;
     }
     if (std::strcmp(tokens[0], "autostart") == 0 && n >= 2) {
@@ -1183,6 +1207,69 @@ void handle_command(char* line) {
         return;
     }
 
+    // --- ISP-Bootloader / RESET-Eingang ---
+    if (std::strcmp(tokens[0], "isp") == 0) {
+        auto onoff = [&](const char* v, bool& out) {
+            if (!std::strcmp(v, "on") || !std::strcmp(v, "1"))  { out = true;  return true; }
+            if (!std::strcmp(v, "off") || !std::strcmp(v, "0")) { out = false; return true; }
+            return false;
+        };
+        auto persist = []() {
+            usb_msc::refresh_config_volume(/*trigger_host_reread=*/false);
+            usb_msc::request_config_persist();
+        };
+        if (n < 2 || !std::strcmp(tokens[1], "status")) { isp::print_status(); return; }
+        if (!std::strcmp(tokens[1], "enter")) {
+            isp::Transport t = isp::Transport::Cdc;
+            if (n >= 3 && !std::strcmp(tokens[2], "uart")) t = isp::Transport::Uart;
+            else if (n >= 3 && std::strcmp(tokens[2], "cdc") != 0) {
+                std::puts("err: isp enter [cdc|uart]"); return;
+            }
+            isp::enter(t, "CLI");
+            return;
+        }
+        if (!std::strcmp(tokens[1], "exit")) {
+            if (!isp::active()) { std::puts("ISP nicht aktiv"); return; }
+            isp::leave(/*start_guest=*/true);
+            return;
+        }
+        if (!std::strcmp(tokens[1], "baud") && n >= 3) {
+            long b = 0;
+            if (std::strcmp(tokens[2], "auto") != 0 && !parse_int(tokens[2], 1200, 1000000, b)) {
+                std::puts("err: isp baud <1200..1000000>|auto"); return;
+            }
+            config::set_isp_baud(static_cast<uint32_t>(b));
+            persist();
+            std::printf("isp_baud=%ld%s\n", b, b ? "" : " (Autobaud)");
+            return;
+        }
+        bool v;
+        if (n >= 3 && onoff(tokens[2], v)) {
+            if      (!std::strcmp(tokens[1], "dtr"))      config::set_isp_dtr_rts(v);
+            else if (!std::strcmp(tokens[1], "autosync")) config::set_isp_autosync(v);
+            else if (!std::strcmp(tokens[1], "pins"))     config::set_isp_pins(v);
+            else if (!std::strcmp(tokens[1], "usb"))      config::set_isp_cdc_enabled(v);
+            else { std::puts("err: 'help isp'"); return; }
+            persist();
+            std::printf("isp %s=%s%s\n", tokens[1], v ? "on" : "off",
+                        !std::strcmp(tokens[1], "usb") ? " (wirkt nach 'cfg save' + RP2350-Neustart)" : "");
+            return;
+        }
+        std::puts("err: 'help isp' fuer die Syntax");
+        return;
+    }
+    if (std::strcmp(tokens[0], "resetpin") == 0) {
+        if (n >= 2 && (!std::strcmp(tokens[1], "on") || !std::strcmp(tokens[1], "off"))) {
+            config::set_reset_in(!std::strcmp(tokens[1], "on"));
+            usb_msc::refresh_config_volume(/*trigger_host_reread=*/false);
+            usb_msc::request_config_persist();
+        }
+        std::printf("resetpin=%s  P0_0 -> GP%d  (Zuordnung per 'pinmap set 0_0 <gpio>')\n",
+                    config::reset_in() ? "on" : "off",
+                    config::pin_map().lpc_to_rp[0]);
+        return;
+    }
+
     // --- I2C-Bridge (LPC-I2C-Master → RP2350-Hardware-I2C) ---
     if (std::strcmp(tokens[0], "i2c") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "on") == 0) {
@@ -1263,14 +1350,19 @@ void run() {
         usb_msc::poll();
         uart_bridge::poll();
         uart_bridge::uart0_cdc_poll();   // virtuelle LPC-UART0 <-> Serial-CDC
+        isp::poll();
         if (emulator::guest_reset_pending()) {
             // Vom Gast angeforderter Soft-Reset (NVIC_SystemReset/WDT). Core1
-            // hat geparkt; Core0 fuehrt den eigentlichen Core-Reset aus.
-            emulator::request_guest_reset();
+            // hat geparkt; Core0 fuehrt den eigentlichen Core-Reset aus. Wie am
+            // echten Chip wird dabei P0_1 (isp_pins) erneut ausgewertet.
+            if (isp::intercept_boot()) emulator::stop();
+            else                       emulator::request_guest_reset();
         }
+        if (emulator::guest_isp_pending()) isp::on_guest_reinvoke();
         if (usb_msc::consume_pending_boot_request()) {
             std::printf("\n[BOOT] BOOT.HEX ueber USB-MSC erkannt -> Start\n");
-            emulator::load_and_start();
+            if (isp::active()) isp::leave(false);
+            isp::start_guest_if_possible();
             if (cli_on) std::printf("emu> ");
         }
         if (!cli_on) {

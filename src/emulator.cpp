@@ -57,6 +57,7 @@ std::atomic<uint64_t>        g_shim_last_us{0};
 // multicore_reset_core1() VON Core1 aus wuerde sich selbst abschiessen und nie
 // relaunchen.
 std::atomic<bool>            g_guest_reset_req{false};
+std::atomic<bool>            g_guest_isp_req{false};
 
 // Basis der aktiven Guest-Vektortabelle (0 = noch nicht gesetzt -> load_base).
 // Wird beim Guest-Start auf load_base gesetzt und bei einem Bootloader-
@@ -640,6 +641,18 @@ void request_guest_reset() {
         for (;;) __asm volatile ("wfe");         // Core0 resettet diesen Core
     }
     core1_reset_and_relaunch(State::Running);
+}
+
+void request_isp_from_guest() {
+    if (get_core_num() == 0u) return;
+    g_guest_isp_req.store(true, std::memory_order_release);
+    __DSB();
+    (void) save_and_disable_interrupts();
+    for (;;) __asm volatile ("wfe");         // Core0 stoppt diesen Core
+}
+
+bool guest_isp_pending() {
+    return g_guest_isp_req.exchange(false, std::memory_order_acq_rel);
 }
 
 // Von Core0 im Loop konsumiert: fuehrt einen vom Gast angeforderten Reset aus.

@@ -378,6 +378,48 @@ bool firmware_write(std::size_t offset, const void* data, std::size_t len) {
     return true;
 }
 
+bool firmware_read(std::size_t offset, void* dst, std::size_t len) {
+    if (offset + len > FIRMWARE_SLOT_BYTES) return false;
+    auto* out = static_cast<uint8_t*>(dst);
+    while (len > 0) {
+        std::size_t sector_start = (offset / SECTOR_SIZE) * SECTOR_SIZE;
+        std::size_t sec_off = offset - sector_start;
+        std::size_t chunk   = SECTOR_SIZE - sec_off;
+        if (chunk > len) chunk = len;
+        const uint8_t* src = (fw_sector_base == sector_start)
+            ? fw_sector_buf + sec_off
+            : xip_ptr(firmware_region_offset + offset);
+        std::memcpy(out, src, chunk);
+        out += chunk; offset += chunk; len -= chunk;
+    }
+    return true;
+}
+
+void firmware_flush() { fw_flush_sector(); }
+
+bool firmware_commit() {
+    fw_flush_sector();
+    const uint8_t* img = xip_ptr(firmware_region_offset);
+    std::size_t len = FIRMWARE_SLOT_BYTES;
+    while (len > 0 && img[len - 1] == 0xFFu) --len;
+    if (len == 0) {
+        FlashGuard guard;
+        flash_range_erase(marker_offset, marker_region_size);
+        firmware_length = 0;
+        return true;
+    }
+    firmware_length = 0;               // Laengen-Merge in finalize() umgehen
+    FirmwareHeader hdr{};
+    hdr.magic    = MAGIC_FIRMWARE;
+    hdr.sequence = firmware_sequence + 1;
+    hdr.length   = static_cast<uint32_t>(len);
+    hdr.crc32    = crc32(img, len);
+    if (!sector_erase_and_write(marker_offset, &hdr, sizeof hdr)) return false;
+    firmware_length   = hdr.length;
+    firmware_sequence = hdr.sequence;
+    return true;
+}
+
 bool firmware_finalize(std::size_t total_len) {
     fw_flush_sector(); // Restlichen Sektor in Flash schreiben
     // Laengen-Merge: bereits vorhandene Firmware (z. B. Bootloader) kann

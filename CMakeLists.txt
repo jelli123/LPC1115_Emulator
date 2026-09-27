@@ -75,6 +75,7 @@ add_executable(emulator
     src/uart_bridge.cpp
     src/led.cpp
     src/debug_bridge.cpp
+    src/isp.cpp
 )
 
 target_include_directories(emulator PRIVATE src)

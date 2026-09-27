@@ -9,7 +9,7 @@ native Geschwindigkeit; Interpretation findet nicht statt.
 
 ```
 +-- Core 0 (privilegiert) ------+    +-- Core 1 (Gast) ----------+
-| USB-CDC CLI/GDB/Serial (dyn.) |    | unprivileged Thread Mode  |
+| USB-CDC CLI/GDB/Serial/ISP   |    | unprivileged Thread Mode  |
 | USB-MSC-Laufwerk (immer)      |    | PSP-Stack                 |
 | Storage (Wear-Leveling, CRC)  |    | Native LPC-Firmware in    |
 | peripherals::mmio_*           |    | RP2350-SRAM (aligned Array)|
@@ -163,9 +163,9 @@ Mapping LPC-Peripherie → IRQ-Index ist zentral in
 
 * Implementierung: [gdb_stub.cpp](src/gdb_stub.cpp).
 * USB: eigener CDC-Port via [usb_descriptors.cpp](src/usb_descriptors.cpp)
-  und [tusb_config.h](src/tusb_config.h) (`CFG_TUD_CDC = 3`). Der
+  und [tusb_config.h](src/tusb_config.h) (`CFG_TUD_CDC = 4`). Der
   Konfigurations-Deskriptor wird zur Bootzeit **dynamisch** aus der Config
-  gebaut: `cli_enable` / `gdb_enable` / `serial_enable` (CONFIG.INI, Default
+  gebaut: `cli_enable` / `gdb_enable` / `serial_enable` / `isp_enable` (CONFIG.INI, Default
   `on`) bestimmen, welche CDCs am USB erscheinen. Deaktivierte CDCs fallen
   komplett weg (ein COM-Port weniger); das MSC-Laufwerk ist immer aktiv.
 * Aktivierung in der CLI: `gdb on` / `gdb off` / `gdb status`.
@@ -274,6 +274,21 @@ gezogen. In dieser Arbeitskopie wird das von der Pico-VS-Code-Erweiterung
 verwaltete **SDK 2.2.0** benutzt; das Build-Artefakt ist `build/emulator.uf2`
 und wird per BOOTSEL aufs Board kopiert.
 
+## ISP-Bootloader (FlashMagic / lpc21isp)
+
+[isp.cpp](src/isp.cpp) bildet den UART-ISP-Bootloader des LPC1115 nach
+(eigene Implementierung des Protokolls aus UM10398 Kap. 26, kein NXP-ROM):
+Autobaud/Sync, `U A B W R P C E I J K M G N`, UU-Kodierung mit
+20-Zeilen-Prüfsummen, CRP1/2/3/NO_ISP. Transporte:
+
+* **USB:** vierte CDC „LPC-Emu ISP“; DTR = RESET, RTS = ISP-Pin (FlashMagic-
+  Option „Use DTR and RTS…“) oder direkter Start per `?`.
+* **Pins:** P0_1 (Pinmap) wird bei jedem Reset abgefragt; ISP dann über die
+  UART0-Pads mit Autobaud. P0_0 kann als RESET-Eingang dienen (`reset_in`),
+  auch ohne ISP; nutzt die Firmware PIO0_0 als GPIO, ist RESET aus.
+
+Details: [USERGUIDE, Variante E](docs/USERGUIDE.md#variante-e-isp-bootloader-flashmagic-lpc21isp).
+
 ## Zweistufiger Boot: Bootloader + Applikation (auto-Descriptor)
 
 Selfbus-Geräte bestehen aus zwei Teilen: einem **Bootloader** ab
@@ -329,6 +344,8 @@ KNX-Bus** in den emulierten Bootloader geschrieben werden (IAP-Pfad).
 | `gdb on/off/status`           | GDB-Stub auf USB-CDC #1                       |
 | `swd start <dio> <clk>`       | SWD-Target auf RP-GPIOs (clk = dio+1)         |
 | `swd stop` / `swd status`     | SWD-Target stoppen / Zustand                  |
+| `isp [status\|enter\|exit\|…]` | virtueller ISP-Bootloader (FlashMagic/lpc21isp) |
+| `resetpin on\|off\|status`   | P0_0 als RESET-Eingang des Gasts              |
 | `i2c on <inst> <sda> <scl> [hz]` | I²C-Bridge auf RP2350-HW (wirkt nach Reset)|
 | `i2c off` / `i2c status`      | I²C-Bridge deaktivieren / Zustand             |
 

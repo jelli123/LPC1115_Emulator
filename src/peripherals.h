@@ -90,6 +90,15 @@ bool uart0_cdc_tx_pop(uint8_t& b);   // Gast-TX-Byte holen (false = leer)
 void uart0_cdc_rx_push(uint8_t b);   // von CDC#2 empfangenes Byte an Gast-RX
 uint32_t uart0_cdc_rx_free();        // freie Plaetze im Gast-RX-Ring (Flusskontrolle)
 
+// ISP ueber Pins (Core0, Gast gestoppt): routet die konfigurierten UART0-Pads
+// (uart0_tx/uart0_rx) und liefert RP-UART-Instanz + RX-GPIO. false, wenn keine
+// gueltigen Pads konfiguriert sind.
+bool uart0_isp_pads(uart_inst_t*& inst, int& rx_gpio);
+
+// true, solange LPC-P0_0 seine RESET-Funktion hat (IOCON_RESET_PIO0_0.FUNC=0,
+// Reset-Default). Nutzt der Gast P0_0 als GPIO, ist der RESET-Eingang aus.
+bool reset_pin_is_reset_function();
+
 // UART0-Diagnose (via 'uart status'). Zeigt, WO der RX-Interrupt-Pfad bricht:
 //   ier        - aktueller IER-Schatten (Bit0=RBR-IRQ, Bit1=THRE-IRQ). 0 = Gast
 //                hat serial.begin() noch nicht erreicht.

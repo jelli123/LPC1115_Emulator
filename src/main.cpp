@@ -14,6 +14,7 @@
 #include "uart_bridge.h"
 #include "led.h"
 #include "debug_bridge.h"
+#include "isp.h"
 
 #include <cstdio>
 
@@ -76,6 +77,7 @@ int main() {
     iap::init();
     usb_msc::init();
     uart_bridge::init();
+    isp::init();
 
     // UART-Bridge aus Config starten, falls aktiviert
     if (config::uart_bridge_enabled()) {
@@ -94,7 +96,8 @@ int main() {
 
     cli::init();
 
-    if (config::autostart()) {
+    // Wie beim echten LPC: gehaltener RESET oder P0_1 low (isp_pins) hat Vorrang.
+    if (!isp::intercept_boot() && config::autostart()) {
         std::printf("[BOOT] autostart aktiv\n");
         emulator::load_and_start();
     }
