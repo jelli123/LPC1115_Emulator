@@ -93,7 +93,11 @@ uint32_t cmd_copy_ram_to_flash(uint32_t* p) {
     // Quelle muss im Gast-RAM liegen (UM10398: RAM-Adresse, word-aligned).
     const uint8_t* srcp = guest_ptr(src, bytes, /*allow_flash=*/false);
     if ((src & 3u) != 0 || !srcp) return CMD_SRC_ADDR_ERROR;
-    std::memmove(flash_image() + dst, srcp, bytes);
+    // Echtes Flash kann beim Programmieren nur Bits 1->0 setzen (Loeschen
+    // setzt auf 0xFF). Programmieren eines nicht geloeschten Bereichs ergibt
+    // daher das UND aus altem und neuem Inhalt — wie auf dem LPC1115.
+    uint8_t* d = flash_image() + dst;
+    for (uint32_t i = 0; i < bytes; ++i) d[i] &= srcp[i];
     persist(dst, bytes);
     g_prepared_mask &= ~static_cast<uint16_t>(((1u << (s_end + 1)) - 1u) &
                                               ~((1u << s_start) - 1u));
