@@ -327,9 +327,13 @@ void uart0_cdc_poll() {
     uint8_t itf = (uint8_t)itf_i;
 
     // Gast-TX (aus dem Ring) -> CDC an den PC.
+    // Nur so viele Bytes aus dem Ring holen, wie die CDC-FIFO aufnehmen kann —
+    // sonst gingen bei vollem USB-Puffer bereits entnommene Bytes verloren.
     uint8_t txbuf[64];
     uint32_t tn = 0;
-    while (tn < sizeof txbuf && peripherals::uart0_cdc_tx_pop(txbuf[tn])) ++tn;
+    uint32_t room = tud_cdc_n_write_available(itf);
+    if (room > sizeof txbuf) room = sizeof txbuf;
+    while (tn < room && peripherals::uart0_cdc_tx_pop(txbuf[tn])) ++tn;
     if (tn > 0) {
         tud_cdc_n_write(itf, txbuf, tn);
         tud_cdc_n_write_flush(itf);
@@ -337,9 +341,13 @@ void uart0_cdc_poll() {
     }
 
     // PC (CDC) -> Gast-RX-Ring.
-    if (tud_cdc_n_available(itf)) {
+    // Nur so viel lesen, wie der Gast-RX-Ring frei hat; der Rest bleibt in der
+    // TinyUSB-FIFO (USB-NAK = echte Flusskontrolle statt verworfener Bytes).
+    uint32_t rx_room = peripherals::uart0_cdc_rx_free();
+    if (rx_room > 64u) rx_room = 64u;
+    if (rx_room > 0 && tud_cdc_n_available(itf)) {
         uint8_t rxbuf[64];
-        uint32_t rn = tud_cdc_n_read(itf, rxbuf, sizeof rxbuf);
+        uint32_t rn = tud_cdc_n_read(itf, rxbuf, rx_room);
         for (uint32_t i = 0; i < rn; ++i)
             peripherals::uart0_cdc_rx_push(rxbuf[i]);
         g_cnt_u0_pc_to_guest += rn;

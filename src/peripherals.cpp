@@ -799,6 +799,10 @@ struct UartModel {
     uint16_t divisor;
     uart_inst_t* hw;
     bool     init_done;
+    // THRE-Interrupt-Quelle (16550): wird gesetzt, sobald THR leer ist und der
+    // THRE-IRQ aktiv ist (THR-Write -> sofort wieder leer; IER.THRE 0->1 bei
+    // leerem THR). Geloescht durch IIR-Read, der THRE meldet, oder THR-Write.
+    bool     thre_int;
 };
 UartModel g_uart0{};
 
@@ -1047,7 +1051,20 @@ uint8_t uart0_read_reg(uint32_t addr) {
         case UART0_IER:
             if (dlab) return static_cast<uint8_t>((g_uart0.divisor >> 8) & 0xFFu);
             return g_uart0.ier;
-        case UART0_IIR: return 0xC1;
+        case UART0_IIR: {
+            // Dynamische Interrupt-Identifikation (UM10398 Tab. 196), damit auch
+            // ISRs funktionieren, die per IIR dispatchen (NXP-Beispielcode).
+            // Prioritaet: RDA (0x4) vor THRE (0x2); Bit0=1: nichts pending.
+            const uint8_t fifo = (g_uart0.fcr & 0x01u) ? 0xC0u : 0x00u;
+            const bool rx = cdc ? !ring_empty(g_uart0_rx)
+                                : (g_uart0.hw && uart_is_readable(g_uart0.hw));
+            if ((g_uart0.ier & 0x01u) && rx) return static_cast<uint8_t>(fifo | 0x04u);
+            if ((g_uart0.ier & 0x02u) && g_uart0.thre_int) {
+                g_uart0.thre_int = false;           // IIR-Read quittiert THRE
+                return static_cast<uint8_t>(fifo | 0x02u);
+            }
+            return static_cast<uint8_t>(fifo | 0x01u);
+        }
         case UART0_LCR: return g_uart0.lcr;
         case UART0_MCR: return g_uart0.mcr;
         case UART0_LSR: {
@@ -1075,10 +1092,13 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
                 // Virtuell: Byte in den TX-Ring -> Core0 schiebt es nach CDC#2.
                 ring_push(g_uart0_tx, val);
                 ++g_uart0_tx_writes;
-                if (g_uart0.ier & 0x02u) irq_inject::pend(lpc_irq::UART0);
             } else if (g_uart0.hw) {
                 uart_putc_raw(g_uart0.hw, static_cast<char>(val));
                 ++g_uart0_tx_writes;
+            }
+            // THR ist im Modell sofort wieder leer -> THRE-Quelle neu setzen.
+            if (!dlab) {
+                g_uart0.thre_int = true;
                 if (g_uart0.ier & 0x02u) irq_inject::pend(lpc_irq::UART0);
             }
             break;
@@ -1088,7 +1108,17 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
                     (g_uart0.divisor & 0x00FFu) |
                     (static_cast<uint16_t>(val) << 8));
                 uart0_ensure_hw(g_current_hz);
-            } else g_uart0.ier = val;
+            } else {
+                // 16550: Aktivieren von IER.THRE bei leerem THR loest sofort den
+                // THRE-Interrupt aus. Treiber, die erst den Puffer fuellen und
+                // dann IER.THRE setzen, haengen sonst (kein erster TX-IRQ).
+                const bool thre_on = !(g_uart0.ier & 0x02u) && (val & 0x02u);
+                g_uart0.ier = val;
+                if (thre_on) {
+                    g_uart0.thre_int = true;
+                    irq_inject::pend(lpc_irq::UART0);
+                }
+            }
             break;
         case UART0_FCR: {
             g_uart0.fcr = val;
@@ -2808,6 +2838,12 @@ bool guest_output_level(uint8_t port, uint8_t pin, bool& level) {
 //   uart0_cdc_rx_push - ein von CDC#2 empfangenes Byte an den Gast-RX
 bool uart0_cdc_tx_pop(uint8_t& b) { return ring_pop(g_uart0_tx, b); }
 void uart0_cdc_rx_push(uint8_t b) { ring_push(g_uart0_rx, b); }
+uint32_t uart0_cdc_rx_free() {
+    const uint32_t used = (g_uart0_rx.head.load(std::memory_order_acquire) -
+                           g_uart0_rx.tail.load(std::memory_order_acquire)) &
+                          (UART0_RING - 1u);
+    return (UART0_RING - 1u) - used;
+}
 
 void uart0_debug(uint8_t& ier, bool& nvic_en, uint32_t& rx_irq_pends,
                  uint32_t& rbr_reads, uint32_t& tx_writes) {

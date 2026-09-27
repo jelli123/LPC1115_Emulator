@@ -82,6 +82,7 @@ bool guest_output_level(uint8_t port, uint8_t pin, bool& level);
 // USB-Seite (uart_bridge::uart0_cdc_poll auf Core0) aufgerufen.
 bool uart0_cdc_tx_pop(uint8_t& b);   // Gast-TX-Byte holen (false = leer)
 void uart0_cdc_rx_push(uint8_t b);   // von CDC#2 empfangenes Byte an Gast-RX
+uint32_t uart0_cdc_rx_free();        // freie Plaetze im Gast-RX-Ring (Flusskontrolle)
 
 // UART0-Diagnose (via 'uart status'). Zeigt, WO der RX-Interrupt-Pfad bricht:
 //   ier        - aktueller IER-Schatten (Bit0=RBR-IRQ, Bit1=THRE-IRQ). 0 = Gast
