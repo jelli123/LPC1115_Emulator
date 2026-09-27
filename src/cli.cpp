@@ -866,9 +866,11 @@ void handle_command(char* line) {
     }
     if (std::strcmp(tokens[0], "step") == 0) {
         if (target_halt::is_halted()) {
+            // Auf den NAECHSTEN Halt warten (halt_count), nicht nur auf is_halted()
+            // - das ist direkt nach dem Request noch vom alten Halt gesetzt.
+            const uint32_t before = target_halt::halt_count();
             target_halt::request_step();
-            // Warten bis erneut gehaltet
-            for (int w = 0; w < 200 && !target_halt::is_halted(); ++w)
+            for (int w = 0; w < 200 && target_halt::halt_count() == before; ++w)
                 sleep_ms(1);
             auto* s = target_halt::snapshot();
             std::printf("step -> PC=0x%08lX\n",

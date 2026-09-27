@@ -2,24 +2,22 @@
 //
 // GDB Remote Serial Protocol Stub für den emulierten LPC1115-Gast.
 //
-// HONESTY DISCLAIMER: Dies ist *kein* CMSIS-DAP. Echtes CMSIS-DAP setzt
-// einen externen SWD-Target voraus; wir wollen aber den Gast debuggen, der
-// als Code auf demselben M33 läuft. Stattdessen exponieren wir das
-// GDB-Remote-Serial-Protocol über einen zweiten USB-CDC-Endpoint, das
-// direkt von `arm-none-eabi-gdb` und der VSCode-Erweiterung
-// `cortex-debug` (mit servertype: external) konsumiert werden kann.
+// Dies ist *kein* CMSIS-DAP (das setzt ein externes SWD-Target voraus).
+// Stattdessen spricht der Stub das GDB-Remote-Serial-Protocol über die
+// GDB-USB-CDC, direkt nutzbar von `arm-none-eabi-gdb` und `cortex-debug`
+// (servertype: external).
 //
 // Unterstützte Pakete:
-//   ?   g  G  m  M  p  P  c  s  vCont?  vCont;c  vCont;s
-//   Z0  z0   (software breakpoints via BKPT-Insertion im Gast-RAM)
-//   qSupported  qC  qAttached  qfThreadInfo  qsThreadInfo
+//   ?  g  G  p  P  m  M  c  s  D  k  H  ^C  Z0/z0 (Software-Breakpoints)
+//   qSupported  qC  qAttached  qfThreadInfo  qsThreadInfo  (sonst leer)
 //
-// Halten/Fortsetzen funktioniert über einen kooperativen Mechanismus:
-//   - Bei BKPT-Hit landet der Gast im UsageFault-Handler (M33 trapt
-//     unprivileged BKPT). Der Handler ruft gdb_stub::on_breakpoint() auf
-//     und spinnt, bis GDB Continue schickt.
-//   - Bei einem ^C aus GDB setzen wir SCB->ICSR.PENDSVSET, der PendSV-
-//     Handler setzt Stop-Flag und wartet ebenfalls.
+// Adressen und Register in LPC-Sicht: Flash 0x00000000.., RAM 0x10000000..,
+// PC/LR/SP (und Register, die ins Image/RAM zeigen) werden zwischen der
+// relocierten RP2350-Position und dem LPC-Adressraum umgerechnet, damit GDB
+// mit der ELF-Datei der Firmware zusammenpasst.
+//
+// Anhalten/Schritt/Breakpoints laufen ueber target_halt (Halt im PendSV bzw.
+// DebugMonitor auf Core1). Der Stub selbst laeuft ausschliesslich auf Core0.
 //
 
 #include <cstdint>
@@ -27,17 +25,12 @@
 
 namespace gdb_stub {
 
-void init();                    // Setzt USB-CDC #1 auf, registriert Hooks
-void poll();                    // Im Host-Loop aufrufen (TinyUSB-Pump)
+void init();
+void poll();                    // Im Host-Loop (Core0) aufrufen
 
-// Vom Trap-Handler aufgerufen, wenn der Gast einen BKPT trifft oder
-// asynchroner Halt angefordert wurde.
-void on_breakpoint(uint32_t* exc_frame, uint32_t* r4_r11);
-
-// Vom CLI aufrufbar:
 void start();                   // GDB-Server aktivieren
 void stop();                    // deaktivieren
 bool active();
-uint16_t  port_index();         // Index des USB-CDC-Endpoints (0 oder 1)
+uint16_t  port_index();         // Index der GDB-USB-CDC
 
 } // namespace gdb_stub

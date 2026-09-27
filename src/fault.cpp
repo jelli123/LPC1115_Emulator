@@ -1,7 +1,7 @@
 #include "fault.h"
 #include "opcodes.h"
 #include "peripherals.h"
-#include "gdb_stub.h"
+#include "target_halt.h"
 #include "iap.h"
 #include "emulator.h"
 #include "config.h"
@@ -228,6 +228,9 @@ void print_exc_diag(const char* tag, const uint32_t* f, const uint32_t* r4_r11) 
 extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
                                   uint32_t* r4_r11_lr) {
     using namespace trap_decoder;
+
+    // Debugger-Halt-Anforderung von Core0 auf Core1 umsetzen (PendSV).
+    target_halt::core1_service();
 
     // Rueckkehr eines injizierten LPC-IRQ-Handlers (PC im EXC_RETURN-Bereich,
     // Thread-Mode): Original-Frame freilegen + transparent fortsetzen. Muss
@@ -746,19 +749,9 @@ extern "C" __attribute__((naked)) void isr_hardfault() {
     );
 }
 
-// Bei aktivem GDB-Stub fängt UsageFault BKPT-Instruktionen (Software-
-// Breakpoints) und delegiert an den Stub. Andernfalls Watchdog-Reset.
+// UsageFault ist fuer den Gast immer fatal. (Software-Breakpoints = BKPT
+// laufen bei gesetztem DEMCR.MON_EN ueber den DebugMonitor, nicht hierher.)
 extern "C" void usagefault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
-    if (SCB->CFSR & SCB_CFSR_UNDEFINSTR_Msk) {
-        uint16_t instr = *reinterpret_cast<uint16_t*>(exc_frame[6]);
-        if ((instr & 0xFF00) == 0xBE00) {            // BKPT
-            if (gdb_stub::active()) {
-                gdb_stub::on_breakpoint(exc_frame, r4_r11);
-                SCB->CFSR = SCB->CFSR;
-                return;
-            }
-        }
-    }
     print_exc_diag("UsageFault", exc_frame, r4_r11);
     enter_fatal_halt();
 }
@@ -783,12 +776,11 @@ extern "C" __attribute__((naked)) void isr_usagefault() {
 // Instruktion aus, sobald DEMCR.MON_EN=1 und MON_STEP=1 sind und
 // DHCSR.C_DEBUGEN=0 (kein DAP angehängt). Wir nutzen das für sauberes
 // GDB-Single-Step.
+// Auch Software-Breakpoints (BKPT, von CLI 'bp' oder GDB 'Z0') landen hier,
+// da der Loader DEMCR.MON_EN setzt. Der Halt selbst (Warten auf Resume/Step)
+// liegt in target_halt; der GDB-Stub bedient die CDC von Core0 aus.
 extern "C" void debugmon_c(uint32_t* exc_frame, uint32_t* r4_r11) {
-    // MON_STEP wieder löschen, sonst tritt die Exception erneut auf.
-    CoreDebug->DEMCR &= ~CoreDebug_DEMCR_MON_STEP_Msk;
-    if (gdb_stub::active()) {
-        gdb_stub::on_breakpoint(exc_frame, r4_r11);
-    }
+    target_halt::on_debug_event(exc_frame, r4_r11);
 }
 
 extern "C" __attribute__((naked)) void isr_debugmon() {

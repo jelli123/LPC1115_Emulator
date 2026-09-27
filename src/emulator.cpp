@@ -90,6 +90,7 @@ extern "C" void isr_memmanage();
 extern "C" void isr_hardfault();
 extern "C" void isr_usagefault();
 extern "C" void isr_pendsv();   // IRQ-Injektor (src/irq_inject.cpp)
+extern "C" void isr_debugmon(); // Einzelschritt/BKPT (src/fault.cpp)
 
 // --- WFI-Pin-Wakeup + PRIMASK-Schatten (beide opt-in) ----------------------
 //
@@ -174,6 +175,14 @@ void isr_svc() {
 // (tail-chained) in den Gast injiziert.
 extern "C" void isr_systick_shim() {
     g_shim_enter.fetch_add(1, std::memory_order_relaxed);
+    // Debugger-Halt: Anforderung umsetzen; ist der Gast angehalten (Halt im
+    // PendSV), weder Gast-Handler noch Zeitmodelle weiterlaufen lassen.
+    target_halt::core1_service();
+    if (target_halt::is_halted()) {
+        peripherals::systick_hw_rearm();
+        g_shim_exit.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     g_shim_last_us.store(time_us_64(), std::memory_order_relaxed);
     // PC-Sampler: der unterbrochene Gast lief in Thread-Mode auf PSP; die HW hat
     // dort {r0,r1,r2,r3,r12,lr,pc,xpsr} gestackt -> psp[6] = Gast-PC. Als
@@ -471,6 +480,7 @@ void core1_main() {
             dst[4]  = reinterpret_cast<uint32_t>(&isr_memmanage);
             dst[5]  = reinterpret_cast<uint32_t>(&isr_busfault);
             dst[6]  = reinterpret_cast<uint32_t>(&isr_usagefault);
+            dst[12] = reinterpret_cast<uint32_t>(&isr_debugmon);   // Step/BKPT
 
             // PendSV (Slot 14) gehört dem Host: Über PendSV werden emulierte
             // LPC-IRQs in den Gast injiziert (irq_inject.cpp). Die Firmware
@@ -564,6 +574,11 @@ void core1_main() {
                     static_cast<unsigned long>(reset_h),
                     static_cast<unsigned long>(load_base),
                     static_cast<unsigned>(sz));
+
+        // DebugMonitor aktivieren: BKPT (Software-Breakpoints) und Einzelschritt
+        // loesen dann die DebugMonitor-Exception aus statt eines HardFaults.
+        CoreDebug->DEMCR = (CoreDebug->DEMCR & ~CoreDebug_DEMCR_MON_STEP_Msk)
+                         | CoreDebug_DEMCR_MON_EN_Msk;
 
         // Sprung in den Gast — kommt nicht zurück.
         g_pc.store(reset_h);
@@ -796,6 +811,7 @@ void activate_bootloader_handover() {
     dst[4]  = reinterpret_cast<uint32_t>(&isr_memmanage);
     dst[5]  = reinterpret_cast<uint32_t>(&isr_busfault);
     dst[6]  = reinterpret_cast<uint32_t>(&isr_usagefault);
+    dst[12] = reinterpret_cast<uint32_t>(&isr_debugmon);
     dst[14] = reinterpret_cast<uint32_t>(&isr_pendsv);
     // SysTick (Slot 15): Host-Shim wie im Loader (treibt LPC-Timer + ruft den
     // Applikations-SysTick-Handler). Der relozierte App-Handler wird gemerkt.

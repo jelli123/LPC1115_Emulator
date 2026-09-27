@@ -1,5 +1,7 @@
 #include "gdb_stub.h"
 #include "emulator.h"
+#include "target_halt.h"
+#include "usb_descriptors.h"
 
 #include <atomic>
 #include <cstdio>
@@ -7,61 +9,44 @@
 #include <cstring>
 
 #include "tusb.h"
-#include "pico/multicore.h"
 #include "pico/time.h"
-#include "RP2350.h"
-#include "usb_descriptors.h"
-
-// GDB-Stub für 17 Register: r0..r12, sp, lr, pc, xpsr.
 
 namespace gdb_stub {
 namespace {
 
-// CDC-Instanz des GDB-Ports (dynamisch; -1 wenn per Config deaktiviert).
-inline int gdb_cdc() { return usb_desc_cdc_gdb(); }
-constexpr uint32_t MAX_BP           = 16;
-constexpr uint32_t MAX_PKT          = 1024;
+constexpr uint32_t MAX_PKT = 1024;
+constexpr uint32_t LPC_RAM = 0x1000'0000u;
 
-std::atomic<bool>     g_active{false};
-std::atomic<bool>     g_halted{false};
-std::atomic<bool>     g_continue{false};
-std::atomic<bool>     g_step{false};
+std::atomic<bool> g_active{false};
+bool     g_wait_stop  = false;   // 'c'/'s'/^C gesendet, Stop-Antwort ausstehend
+uint32_t g_seen_halts = 0;       // target_halt::halt_count() beim letzten Stop
+char     g_pkt[MAX_PKT];
+size_t   g_pkt_len = 0;
 
-uint32_t*             g_frame  = nullptr;     // exception-stacked frame
-uint32_t*             g_r4_r11 = nullptr;
-char                  g_pkt[MAX_PKT];
-size_t                g_pkt_len = 0;
-
-struct BP {
-    uint32_t addr;
-    uint16_t saved;
-    bool     used;
-};
-BP g_bp[MAX_BP]{};
-
-inline bool cdc_avail() { int i = gdb_cdc(); return i >= 0 && tud_cdc_n_connected((uint8_t)i); }
+int cdc() { return usb_desc_cdc_gdb(); }
 
 void cdc_write(const char* s, size_t n) {
-    if (!cdc_avail()) return;
-    uint8_t itf = (uint8_t)gdb_cdc();
+    const int i = cdc();
+    if (i < 0) return;
+    const uint8_t itf = static_cast<uint8_t>(i);
+    const absolute_time_t deadline = make_timeout_time_ms(500);
     while (n) {
-        size_t w = tud_cdc_n_write(itf, s, static_cast<uint32_t>(n));
+        uint32_t w = tud_cdc_n_write(itf, s, static_cast<uint32_t>(n));
         s += w; n -= w;
         tud_cdc_n_write_flush(itf);
-        tud_task();
+        if (n) { tud_task(); if (time_reached(deadline)) return; }
     }
 }
 
 void put_packet(const char* body, size_t len) {
     uint8_t sum = 0;
     for (size_t i = 0; i < len; ++i) sum = static_cast<uint8_t>(sum + body[i]);
-    char hdr[2] = {'$', 0};
-    char tail[4]; std::snprintf(tail, sizeof tail, "#%02x", sum);
-    cdc_write(hdr, 1);
+    char tail[4];
+    std::snprintf(tail, sizeof tail, "#%02x", sum);
+    cdc_write("$", 1);
     cdc_write(body, len);
     cdc_write(tail, 3);
 }
-
 void put_str(const char* s) { put_packet(s, std::strlen(s)); }
 
 int hexv(char c) {
@@ -71,12 +56,19 @@ int hexv(char c) {
     return -1;
 }
 
+// Liest eine Hex-Zahl ab p (bis zu einem Nicht-Hex-Zeichen); p wird verschoben.
+uint32_t parse_hex(const char*& p, const char* end) {
+    uint32_t v = 0;
+    while (p < end && hexv(*p) >= 0) v = (v << 4) | static_cast<uint32_t>(hexv(*p++));
+    return v;
+}
+
 uint32_t parse_hex_le(const char* s, size_t bytes) {
     uint32_t v = 0;
     for (size_t i = 0; i < bytes; ++i) {
-        int hi = hexv(s[i*2]); int lo = hexv(s[i*2+1]);
+        int hi = hexv(s[i*2]), lo = hexv(s[i*2+1]);
         if (hi < 0 || lo < 0) return v;
-        v |= static_cast<uint32_t>(((hi << 4) | lo) & 0xFF) << (i * 8);
+        v |= static_cast<uint32_t>((hi << 4) | lo) << (i * 8);
     }
     return v;
 }
@@ -84,297 +76,240 @@ uint32_t parse_hex_le(const char* s, size_t bytes) {
 void emit_hex_le(char* out, uint32_t v, size_t bytes) {
     static const char* hex = "0123456789abcdef";
     for (size_t i = 0; i < bytes; ++i) {
-        uint8_t b = static_cast<uint8_t>((v >> (i * 8)) & 0xFFu);
-        out[i*2]   = hex[b >> 4];
-        out[i*2+1] = hex[b & 0xF];
+        uint8_t b = static_cast<uint8_t>(v >> (i * 8));
+        out[i*2] = hex[b >> 4]; out[i*2+1] = hex[b & 0xF];
     }
 }
 
-uint32_t* reg_ptr(unsigned idx) {
-    if (!g_frame) return nullptr;
-    // Frame: r0,r1,r2,r3,r12,lr,pc,xpsr (Indizes 0..7)
-    // Wir bilden ab: 0..3=r0..r3, 4..11=r4..r11, 12=r12, 13=sp, 14=lr, 15=pc, 16=xpsr
-    static thread_local uint32_t sp_cache;
-    switch (idx) {
-        case 0: case 1: case 2: case 3: return &g_frame[idx];
-        case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 11:
-            return g_r4_r11 ? &g_r4_r11[idx - 4] : nullptr;
-        case 12: return &g_frame[4];
-        case 13: sp_cache = reinterpret_cast<uint32_t>(g_frame) + 0x20; return &sp_cache;
-        case 14: return &g_frame[5];
-        case 15: return &g_frame[6];
-        case 16: return &g_frame[7];
-    }
-    return nullptr;
+// --- LPC <-> Host-Adressen fuer Registerwerte -------------------------------
+uint32_t to_lpc(uint32_t v) {
+    const uint32_t img = emulator::load_base(), ram = emulator::guest_ram_base();
+    if (v >= img && v < img + emulator::LPC_LOAD_MAX_SIZE) return v - img;
+    if (v >= ram && v <= ram + emulator::LPC_GUEST_RAM_SIZE) return LPC_RAM + (v - ram);
+    return v;
+}
+uint32_t to_host(uint32_t v) {
+    if (v < emulator::LPC_LOAD_MAX_SIZE) return emulator::load_base() + v;
+    if (v >= LPC_RAM && v <= LPC_RAM + emulator::LPC_GUEST_RAM_SIZE)
+        return emulator::guest_ram_base() + (v - LPC_RAM);
+    return v;
 }
 
-bool addr_in_guest_ram(uint32_t a) {
-    uint32_t base = emulator::load_base();
-    return a >= base && a < base + emulator::LPC_LOAD_MAX_SIZE;
+// GDB-Registernummern (ARM): 0..15 = r0..r15, 25 = xPSR (bzw. 16 in 'g').
+bool reg_read(unsigned idx, uint32_t& v) {
+    if (idx == 25) idx = 16;
+    if (!target_halt::read_register(idx, v)) { v = 0; return false; }
+    if (idx <= 15) v = to_lpc(v);
+    return true;
+}
+bool reg_write(unsigned idx, uint32_t v) {
+    if (idx == 25) idx = 16;
+    if (idx == 13 || idx == 14 || idx == 15) v = to_host(v);
+    return target_halt::write_register(idx, v);
 }
 
-bool insert_breakpoint(uint32_t addr) {
-    if (!addr_in_guest_ram(addr)) return false;
-    for (auto& b : g_bp) if (b.used && b.addr == addr) return true;
-    for (auto& b : g_bp) if (!b.used) {
-        auto* p = reinterpret_cast<uint16_t*>(addr);
-        b.addr = addr; b.saved = *p; b.used = true;
-        *p = 0xBE00;                      // BKPT #0
-        __DSB(); __ISB();
-        return true;
-    }
-    return false;
-}
-
-bool remove_breakpoint(uint32_t addr) {
-    for (auto& b : g_bp) if (b.used && b.addr == addr) {
-        *reinterpret_cast<uint16_t*>(addr) = b.saved;
-        b.used = false;
-        __DSB(); __ISB();
-        return true;
-    }
-    return false;
+// Haelt den Gast an (fuer '?' beim Verbinden). Wartet kurz auf den Halt.
+void halt_sync() {
+    if (target_halt::is_halted() || emulator::state() != emulator::State::Running) return;
+    target_halt::request_halt();
+    const absolute_time_t deadline = make_timeout_time_ms(300);
+    while (!target_halt::is_halted() && !time_reached(deadline)) tud_task();
+    g_seen_halts = target_halt::halt_count();
 }
 
 void handle_packet(const char* p, size_t n) {
+    const char* end = p + n;
+    char rsp[520];
     if (n == 0) { put_str(""); return; }
-    char cmd = p[0];
-    char rsp[256];
 
-    switch (cmd) {
-        case '?':
-            put_str("S05");                     // SIGTRAP
-            return;
-        case 'g': {                             // read all regs
-            char* w = rsp;
-            for (unsigned i = 0; i < 17; ++i) {
-                uint32_t v = 0;
-                if (auto* r = reg_ptr(i)) v = *r;
-                emit_hex_le(w, v, 4); w += 8;
-            }
-            put_packet(rsp, static_cast<size_t>(w - rsp));
-            return;
+    switch (p[0]) {
+    case '?':
+        halt_sync();
+        g_wait_stop = false;
+        put_str("S05");
+        return;
+
+    case 'g': {
+        char* w = rsp;
+        for (unsigned i = 0; i < 17; ++i) {
+            uint32_t v; reg_read(i == 16 ? 25u : i, v);
+            emit_hex_le(w, v, 4); w += 8;
         }
-        case 'G': {                             // write all regs
-            for (unsigned i = 0; i < 17 && (1 + i*8 + 8) <= n; ++i) {
-                uint32_t v = parse_hex_le(p + 1 + i*8, 4);
-                if (auto* r = reg_ptr(i)) *r = v;
-            }
-            put_str("OK");
-            return;
-        }
-        case 'p': {                             // read single reg
-            unsigned idx = 0;
-            for (size_t i = 1; i < n; ++i) {
-                int v = hexv(p[i]); if (v < 0) break;
-                idx = (idx << 4) | static_cast<unsigned>(v);
-            }
-            uint32_t v = 0;
-            if (auto* r = reg_ptr(idx)) v = *r;
-            char buf[9]; emit_hex_le(buf, v, 4); put_packet(buf, 8);
-            return;
-        }
-        case 'P': {                             // write single reg
-            unsigned idx = 0; size_t i = 1;
-            for (; i < n && p[i] != '='; ++i) {
-                int v = hexv(p[i]); if (v < 0) break;
-                idx = (idx << 4) | static_cast<unsigned>(v);
-            }
-            if (i < n && p[i] == '=' && i + 8 < n) {
-                uint32_t val = parse_hex_le(p + i + 1, 4);
-                if (auto* r = reg_ptr(idx)) *r = val;
-                put_str("OK");
-            } else put_str("E01");
-            return;
-        }
-        case 'm': {                             // read mem: m<addr>,<len>
-            uint32_t addr = 0, len = 0;
-            size_t i = 1;
-            for (; i < n && p[i] != ','; ++i) {
-                int v = hexv(p[i]); if (v < 0) break;
-                addr = (addr << 4) | static_cast<uint32_t>(v);
-            }
-            if (i < n && p[i] == ',') {
-                for (++i; i < n; ++i) {
-                    int v = hexv(p[i]); if (v < 0) break;
-                    len = (len << 4) | static_cast<uint32_t>(v);
-                }
-            }
-            if (len > sizeof(rsp)/2) len = sizeof(rsp)/2;
-            const auto* src = reinterpret_cast<volatile uint8_t*>(addr);
-            for (uint32_t k = 0; k < len; ++k)
-                emit_hex_le(rsp + k*2, src[k], 1);
-            put_packet(rsp, len * 2);
-            return;
-        }
-        case 'M': {                             // write mem
-            uint32_t addr = 0, len = 0;
-            size_t i = 1;
-            for (; i < n && p[i] != ','; ++i) {
-                int v = hexv(p[i]); if (v < 0) break;
-                addr = (addr << 4) | static_cast<uint32_t>(v);
-            }
-            if (i < n && p[i] == ',') {
-                for (++i; i < n && p[i] != ':'; ++i) {
-                    int v = hexv(p[i]); if (v < 0) break;
-                    len = (len << 4) | static_cast<uint32_t>(v);
-                }
-            }
-            if (i < n && p[i] == ':') {
-                ++i;
-                auto* dst = reinterpret_cast<uint8_t*>(addr);
-                for (uint32_t k = 0; k < len && i + 1 < n; ++k, i += 2) {
-                    int hi = hexv(p[i]); int lo = hexv(p[i+1]);
-                    if (hi < 0 || lo < 0) break;
-                    dst[k] = static_cast<uint8_t>((hi << 4) | lo);
-                }
-                __DSB(); __ISB();
-                put_str("OK");
-            } else put_str("E01");
-            return;
-        }
-        case 'c':
-            g_continue.store(true);
-            // Antwort kommt erst beim nächsten Halt
-            return;
-        case 's':
-            g_step.store(true);
-            g_continue.store(true);
-            return;
-        case 'Z':
-        case 'z': {
-            // Z/z<type>,<addr>,<kind>
-            if (n >= 4 && p[1] == '0') {
-                uint32_t addr = 0;
-                size_t i = 3;
-                for (; i < n && p[i] != ','; ++i) {
-                    int v = hexv(p[i]); if (v < 0) break;
-                    addr = (addr << 4) | static_cast<uint32_t>(v);
-                }
-                bool ok = (cmd == 'Z') ? insert_breakpoint(addr)
-                                       : remove_breakpoint(addr);
-                put_str(ok ? "OK" : "E01");
-            } else put_str("");
-            return;
-        }
-        case 'q': {
-            if (n >= 10 && std::memcmp(p, "qSupported", 10) == 0) {
-                std::snprintf(rsp, sizeof rsp, "PacketSize=%lx;swbreak+", static_cast<unsigned long>(MAX_PKT));
-                put_str(rsp);
-            } else if (n >= 9 && std::memcmp(p, "qAttached", 9) == 0) {
-                put_str("1");
-            } else if (n >= 2 && std::memcmp(p, "qC", 2) == 0) {
-                put_str("QC1");
-            } else if (n >= 11 && std::memcmp(p, "qfThreadInfo", 11) == 0) {
-                put_str("m1");
-            } else if (n >= 11 && std::memcmp(p, "qsThreadInfo", 11) == 0) {
-                put_str("l");
-            } else {
-                put_str("");
-            }
-            return;
-        }
-        case 'v': {
-            if (n >= 6 && std::memcmp(p, "vCont?", 6) == 0) {
-                put_str("vCont;c;s");
-            } else if (n >= 7 && std::memcmp(p, "vCont;c", 7) == 0) {
-                g_continue.store(true);
-            } else if (n >= 7 && std::memcmp(p, "vCont;s", 7) == 0) {
-                g_step.store(true); g_continue.store(true);
-            } else {
-                put_str("");
-            }
-            return;
-        }
+        put_packet(rsp, static_cast<size_t>(w - rsp));
+        return;
     }
-    put_str("");
+    case 'G': {
+        for (unsigned i = 0; i < 17 && 1 + (i + 1) * 8 <= n; ++i)
+            reg_write(i == 16 ? 25u : i, parse_hex_le(p + 1 + i * 8, 4));
+        put_str(target_halt::is_halted() ? "OK" : "E01");
+        return;
+    }
+    case 'p': {
+        const char* q = p + 1;
+        unsigned idx = parse_hex(q, end);
+        uint32_t v;
+        if (idx > 25 || (idx > 15 && idx != 25)) { put_str("xxxxxxxx"); return; }
+        reg_read(idx, v);
+        char b[8]; emit_hex_le(b, v, 4); put_packet(b, 8);
+        return;
+    }
+    case 'P': {
+        const char* q = p + 1;
+        unsigned idx = parse_hex(q, end);
+        if (q < end && *q == '=' && end - q >= 9 && reg_write(idx, parse_hex_le(q + 1, 4))) put_str("OK");
+        else put_str("E01");
+        return;
+    }
+    case 'm': {
+        const char* q = p + 1;
+        uint32_t addr = parse_hex(q, end);
+        uint32_t len = (q < end && *q == ',') ? (++q, parse_hex(q, end)) : 0;
+        if (len > sizeof rsp / 2) len = sizeof rsp / 2;
+        uint8_t buf[sizeof rsp / 2];
+        if (!target_halt::read_memory(addr, buf, len)) { put_str("E01"); return; }
+        for (uint32_t k = 0; k < len; ++k) emit_hex_le(rsp + k * 2, buf[k], 1);
+        put_packet(rsp, len * 2);
+        return;
+    }
+    case 'M': {
+        const char* q = p + 1;
+        uint32_t addr = parse_hex(q, end);
+        uint32_t len = (q < end && *q == ',') ? (++q, parse_hex(q, end)) : 0;
+        if (q >= end || *q != ':' || static_cast<uint32_t>(end - q - 1) < len * 2 || len > 256) {
+            put_str("E01"); return;
+        }
+        ++q;
+        uint8_t buf[256];
+        for (uint32_t k = 0; k < len; ++k) buf[k] = static_cast<uint8_t>(parse_hex_le(q + k * 2, 1));
+        put_str(target_halt::write_memory(addr, buf, len) ? "OK" : "E01");
+        return;
+    }
+    case 'c':
+    case 's': {
+        if (n > 1) {                         // c<addr>/s<addr>: PC setzen
+            const char* q = p + 1;
+            reg_write(15, parse_hex(q, end));
+        }
+        g_seen_halts = target_halt::halt_count();
+        g_wait_stop = true;
+        if (target_halt::is_halted()) {
+            if (p[0] == 's') target_halt::request_step();
+            else             target_halt::request_resume();
+        }
+        return;                              // Antwort beim naechsten Halt
+    }
+    case 'D':
+        g_wait_stop = false;
+        if (target_halt::is_halted()) target_halt::request_resume();
+        put_str("OK");
+        return;
+    case 'k':
+        g_wait_stop = false;
+        if (target_halt::is_halted()) target_halt::request_resume();
+        return;
+    case 'H':
+    case 'T':
+        put_str("OK");
+        return;
+    case 'Z':
+    case 'z': {
+        if (n < 4 || p[1] != '0' || p[2] != ',') { put_str(""); return; }   // nur SW-Breakpoints
+        const char* q = p + 3;
+        uint32_t addr = parse_hex(q, end);
+        bool ok = (p[0] == 'Z') ? target_halt::set_breakpoint(addr)
+                                : target_halt::clear_breakpoint(addr);
+        put_str(ok || p[0] == 'z' ? "OK" : "E01");
+        return;
+    }
+    case 'q':
+        if (n >= 10 && !std::memcmp(p, "qSupported", 10)) {
+            std::snprintf(rsp, sizeof rsp, "PacketSize=%lx", static_cast<unsigned long>(MAX_PKT));
+            put_str(rsp);
+        } else if (n >= 9 && !std::memcmp(p, "qAttached", 9)) put_str("1");
+        else if (n == 2 && !std::memcmp(p, "qC", 2))            put_str("QC1");
+        else if (n >= 12 && !std::memcmp(p, "qfThreadInfo", 12)) put_str("m1");
+        else if (n >= 12 && !std::memcmp(p, "qsThreadInfo", 12)) put_str("l");
+        else put_str("");
+        return;
+    default:
+        put_str("");                         // unbekannt (auch vMustReplyEmpty, vCont?)
+        return;
+    }
 }
 
 void rx_byte(char c) {
     static enum { Idle, InPkt, CkHi, CkLo } st = Idle;
-    static uint8_t calc_sum = 0;
-    static uint8_t want_sum = 0;
-
+    static uint8_t calc = 0, want = 0;
     switch (st) {
-        case Idle:
-            if (c == '$') { g_pkt_len = 0; calc_sum = 0; st = InPkt; }
-            else if (c == 0x03) {                   // Ctrl-C async halt
-                SCB->ICSR = SCB_ICSR_PENDSVSET_Msk; // PendSV → Halt-Pfad
-            }
-            break;
-        case InPkt:
-            if (c == '#') { st = CkHi; }
-            else if (g_pkt_len < MAX_PKT - 1) {
-                g_pkt[g_pkt_len++] = c;
-                calc_sum = static_cast<uint8_t>(calc_sum + c);
-            }
-            break;
-        case CkHi: want_sum = static_cast<uint8_t>(hexv(c) << 4); st = CkLo; break;
-        case CkLo: {
-            want_sum = static_cast<uint8_t>(want_sum | hexv(c));
-            const char ack = (want_sum == calc_sum) ? '+' : '-';
-            cdc_write(&ack, 1);
-            if (ack == '+') handle_packet(g_pkt, g_pkt_len);
-            st = Idle;
-            break;
+    case Idle:
+        if (c == '$') { g_pkt_len = 0; calc = 0; st = InPkt; }
+        else if (c == 0x03) {                // ^C: asynchron anhalten
+            g_seen_halts = target_halt::halt_count();
+            g_wait_stop = true;
+            target_halt::request_halt();
         }
+        break;
+    case InPkt:
+        if (c == '#') st = CkHi;
+        else {
+            if (g_pkt_len < MAX_PKT - 1) g_pkt[g_pkt_len++] = c;
+            calc = static_cast<uint8_t>(calc + c);
+        }
+        break;
+    case CkHi: want = static_cast<uint8_t>(hexv(c) << 4); st = CkLo; break;
+    case CkLo: {
+        want = static_cast<uint8_t>(want | hexv(c));
+        const char ack = (want == calc) ? '+' : '-';
+        cdc_write(&ack, 1);
+        st = Idle;
+        if (ack == '+') handle_packet(g_pkt, g_pkt_len);
+        break;
+    }
     }
 }
 
 } // namespace
 
-void init() { /* USB-CDC #1 wird vom TinyUSB-Stack mitkonfiguriert */ }
+void init() {}
 
 void poll() {
-    tud_task();
-    if (!g_active.load()) return;
-    if (!cdc_avail())     return;
-    uint8_t itf = (uint8_t)gdb_cdc();
+    const int i = cdc();
+    if (i < 0) return;
+    const uint8_t itf = static_cast<uint8_t>(i);
+    if (!g_active.load()) {
+        // Inaktiv: Eingang verwerfen, sonst arbeitet ein spaeteres 'gdb on'
+        // veraltete Pakete einer frueheren Sitzung ab (verschobene Antworten).
+        char junk[64];
+        while (tud_cdc_n_available(itf)) tud_cdc_n_read(itf, junk, sizeof junk);
+        return;
+    }
+    // Stop-Antwort nachreichen, sobald der Gast (erneut) angehalten hat.
+    if (g_wait_stop && target_halt::is_halted() &&
+        target_halt::halt_count() != g_seen_halts) {
+        g_wait_stop = false;
+        g_seen_halts = target_halt::halt_count();
+        put_str("S05");
+    }
+    char buf[64];
     while (tud_cdc_n_available(itf)) {
-        char c;
-        if (tud_cdc_n_read(itf, &c, 1) == 1) rx_byte(c);
+        uint32_t r = tud_cdc_n_read(itf, buf, sizeof buf);
+        for (uint32_t k = 0; k < r; ++k) rx_byte(buf[k]);
     }
-}
-
-void on_breakpoint(uint32_t* exc_frame, uint32_t* r4_r11) {
-    if (!g_active.load()) return;
-    g_frame  = exc_frame;
-    g_r4_r11 = r4_r11;
-    g_halted.store(true);
-    g_continue.store(false);
-    g_step.store(false);
-
-    // Stop-Reason an GDB schicken
-    put_str("S05");
-
-    // Spinnen bis GDB continue / step kommandiert
-    while (!g_continue.load()) {
-        poll();
-        sleep_us(100);
-    }
-    g_continue.store(false);
-    g_halted.store(false);
-
-    // Bei Step: DEMCR.MON_EN+MON_STEP setzen — der Cortex-M33 löst nach
-    // genau einer ausgeführten Instruktion DebugMonitor aus, der wieder
-    // bei uns landet (sieht in fault.cpp::debugmon_c).
-    if (g_step.load()) {
-        CoreDebug->DEMCR |= CoreDebug_DEMCR_MON_EN_Msk
-                         |  CoreDebug_DEMCR_MON_STEP_Msk;
-        g_step.store(false);
-    }
-
-    g_frame = nullptr; g_r4_r11 = nullptr;
 }
 
 void start() {
-    int itf = gdb_cdc();
+    int itf = cdc();
     g_active.store(true);
+    g_wait_stop = false;
     if (itf >= 0) std::printf("[GDB] aktiviert (CDC #%d)\n", itf);
     else          std::printf("[GDB] aktiviert, aber GDB-CDC ist per Config deaktiviert\n");
 }
-void stop()  { g_active.store(false); std::printf("[GDB] deaktiviert\n"); }
+void stop()  {
+    g_active.store(false);
+    if (target_halt::is_halted()) target_halt::request_resume();
+    std::printf("[GDB] deaktiviert\n");
+}
 bool active() { return g_active.load(); }
-uint16_t port_index() { int i = gdb_cdc(); return i >= 0 ? (uint16_t)i : 0xFFFFu; }
+uint16_t port_index() { int i = cdc(); return i >= 0 ? static_cast<uint16_t>(i) : 0xFFFFu; }
 
 } // namespace gdb_stub

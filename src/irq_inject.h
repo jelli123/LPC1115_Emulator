@@ -35,7 +35,7 @@ void pend_systick();
 void poll();
 
 // Vom PendSV-Asm-Wrapper gerufen: führt eine Iteration der Injektion durch.
-extern "C" void pendsv_inject_c();
+extern "C" void pendsv_inject_c(uint32_t* r4_r11);
 
 // Vom Fault-Handler (try_injected_irq_return) beim Ruecksprung eines injizierten
 // Handlers aufgerufen: dekrementiert die Injektions-Verschachtelungstiefe und

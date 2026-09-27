@@ -104,6 +104,9 @@ Jeweils HEX laden (Weg aus Abschnitt C) und `run`.
 | G7 | SWD-Target | `swd start 14 15`, OpenOCD `lpc11xx.cfg` | DPIDR `0x0BB11477`, AHB-AP `0x04770031` | ⬜ |
 | G8 | SWD-Mem | OpenOCD `mdw 0x10000000` | liest Guest-RAM | ⬜ |
 
+| G9 | GDB mit ELF | `gdb on`, `arm-none-eabi-gdb fw.elf`, `target remote <gdb-port>` | Halt, `bt` mit Symbolen, LPC-Adressen | ⬜ |
+| G10 | Breakpoint | `break <zeile>`, `continue` (2×), `set var …`, `detach` | Treffer, Variable geschrieben, Gast läuft weiter | ⬜ |
+
 ## H — Serielle Schnittstellen (`cdc` / `uart`)
 
 | # | Test | Schritte | Erwartung | Status |

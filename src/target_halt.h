@@ -27,8 +27,22 @@ void init();
 // obsolet). Von jedem Core aus sicher (nur atomare Flags).
 void on_guest_reset();
 
-// Wird vom PendSV-Handler aufgerufen.
-void on_pendsv_check();
+// Wird vom PendSV-Handler (Core1) aufgerufen. r4_r11 zeigt auf die vom
+// Asm-Wrapper gesicherten Gast-Register r4..r11 (werden nach dem Halt von dort
+// zurueckgeladen -> Registeraenderungen des Debuggers wirken).
+void on_pendsv_check(uint32_t* r4_r11);
+
+// Core1 (SysTick-Shim, MMIO-Trap): liegt ein Halt-Request vor, PendSV auf
+// Core1 ausloesen. request_halt() laeuft auf Core0 und kann Core1s PendSV
+// nicht direkt setzen (SCB ist pro Kern).
+void core1_service();
+
+// DebugMonitor (Core1): BKPT-Treffer oder abgeschlossener Einzelschritt.
+// Haelt den Gast an, bis Resume/Step kommt.
+void on_debug_event(uint32_t* frame, uint32_t* r4_r11);
+
+// Zaehler der Halte-Ereignisse (GDB erkennt daran einen neuen Stop).
+uint32_t halt_count();
 
 // Asynchroner Halt-Request — wirkt nicht sofort, sondern beim nächsten
 // PendSV/Trap des Gastes.

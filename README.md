@@ -169,9 +169,13 @@ Mapping LPC-Peripherie → IRQ-Index ist zentral in
   `on`) bestimmen, welche CDCs am USB erscheinen. Deaktivierte CDCs fallen
   komplett weg (ein COM-Port weniger); das MSC-Laufwerk ist immer aktiv.
 * Aktivierung in der CLI: `gdb on` / `gdb off` / `gdb status`.
-* Software-Breakpoints: `Z0`/`z0` ersetzt 16-bit-Instruktion durch `BKPT`,
-  Hit landet im UsageFault-Handler → `gdb_stub::on_breakpoint()`,
-  spinnt bis `c`/`s` von GDB kommt.
+* Software-Breakpoints: `Z0`/`z0` ersetzt die 16-bit-Instruktion durch `BKPT`.
+  Da der Loader `DEMCR.MON_EN` setzt, landet der Treffer im DebugMonitor
+  (`target_halt::on_debug_event`), der Gast wartet dort auf `c`/`s`.
+* Adressen und PC/LR/SP erscheinen in **LPC-Sicht** (Flash ab 0, RAM ab
+  0x10000000) – GDB passt damit zur ELF-Datei der Firmware.
+* Der Stub läuft komplett auf Core0; Core1 hält nur an (kein USB-Zugriff
+  aus dem Gast-Kern).
 * GDB-Anbindung (Beispiel):
 
   ```

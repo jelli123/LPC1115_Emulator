@@ -201,17 +201,21 @@ real-zeit-skalierten CT16/CT32-Capture/Match-Modelle und bleibt korrekt.
 
 Auf der GDB-CDC (Instanz-Index dynamisch, siehe §16a), RSP-Subset:
 
-* `g` / `G` (Register), `m` / `M` (Memory)
-* `c` / `s` (Continue / Step), `?` (Stop-Reason)
+* `g` / `G` / `p` / `P` (Register), `m` / `M` (Memory, nur Flash-Image und Gast-RAM)
+* `c` / `s` (Continue / Step), `?` (hält den Gast an, Stop-Reason), `^C`
 * `Z0/z0` (SW-Breakpoint, max. 8 Slots, BKPT-Patching)
-* `Z2/z2` (Write-Watchpoint via DWT)
-* `qSupported`, `qXfer:features:read:target.xml` (Cortex-M0 Layout)
-* `vCont`, `vRun`, `D` (Detach)
+* `qSupported`, `qC`, `qAttached`, `qf/qsThreadInfo`, `H`, `D`, `k`
+* alles andere (z. B. `vMustReplyEmpty`, `vCont?`, `Z1`/`Z2`) → leere Antwort
+
+Register und Adressen werden in LPC-Sicht übersetzt (PC/LR/SP und Werte, die
+ins Image/RAM zeigen). Der Stub läuft nur auf Core0; inaktiv verwirft er
+eingehende Bytes, damit ein späteres `gdb on` keine veralteten Pakete abarbeitet.
 
 **Single-Step** ist über `DEMCR.MON_STEP` realisiert: Statt
 DHCSR-Halting wird die DebugMonitor-Exception (`isr_debugmon` in
-[src/fault.cpp](../src/fault.cpp)) genutzt, sodass das System
-weiterläuft.
+[src/fault.cpp](../src/fault.cpp), Vektor-Slot 12 der Gast-Tabelle) genutzt,
+sodass das System weiterläuft. `BKPT` landet wegen `DEMCR.MON_EN` ebenfalls
+dort (sonst HardFault).
 
 ---
 
@@ -234,10 +238,13 @@ weiterläuft.
 **Pin-Constraint**: `SWCLK == SWDIO + 1`, weil das PIO-Programm
 `wait pin 1` relativ adressiert.
 
-**Cooperative Halt**: `target_halt.cpp` löst per `SCB->ICSR.PENDSVSET`
-eine Halt-Anforderung aus. PendSV erfasst den Guest-Frame
-(`stmia/ldmia r4-r11`), spinnt bis `request_resume()`, schreibt
-zurück. So wirkt der externe Debugger zwischen zwei Guest-Instruktionen.
+**Cooperative Halt**: `request_halt()` (Core0) setzt nur ein Flag;
+Core1 setzt daraufhin im SysTick-Shim bzw. beim nächsten MMIO-Trap
+`PENDSVSET` (SCB ist pro Kern). PendSV erfasst den Guest-Frame samt den vom
+Asm-Wrapper gesicherten r4–r11, spinnt bis `request_resume()` und schreibt
+Registeränderungen zurück. So wirkt der Debugger zwischen zwei
+Guest-Instruktionen. Ein Gast ohne SysTick/Timer und ohne MMIO-Zugriffe kann
+nicht angehalten werden (CLI `halt` resettet ihn dann).
 
 ---
 

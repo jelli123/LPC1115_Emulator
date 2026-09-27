@@ -1,6 +1,5 @@
 #include "target_halt.h"
 #include "emulator.h"
-#include "gdb_stub.h"
 
 #include <atomic>
 #include <cstring>
@@ -8,6 +7,7 @@
 #include "RP2350.h"
 #include "hardware/sync.h"
 #include "pico/time.h"
+#include "pico/platform.h"
 
 namespace target_halt {
 namespace {
@@ -18,6 +18,8 @@ std::atomic<bool> g_halt_request{false};
 std::atomic<bool> g_resume_request{false};
 std::atomic<bool> g_step_request{false};
 std::atomic<bool> g_halted{false};
+std::atomic<bool> g_step_active{false};   // MON_STEP gesetzt, DebugMonitor erwartet
+std::atomic<uint32_t> g_halt_count{0};
 
 Snapshot g_snap{};
 
@@ -80,58 +82,64 @@ void on_guest_reset() {
     g_resume_request.store(false);
     g_step_request.store(false);
     g_halted.store(false);
+    g_step_active.store(false);
+    // Breakpoints gehoeren zum alten Image (wird beim Start neu kopiert) ->
+    // Tabelle verwerfen, sonst wuerde ein spaeteres Loeschen alte Befehle
+    // in das neue Image zurueckschreiben.
+    for (auto& b : g_bp) b = {};
 }
 
-void on_pendsv_check() {
-    if (!g_halt_request.load(std::memory_order_acquire)) return;
-
-    // Frame-Pointer aus PSP rekonstruieren — der gestackte Frame liegt
-    // am aktuellen PSP-Top.
-    uint32_t psp;
-    __asm volatile ("mrs %0, psp" : "=r"(psp));
-    auto* frame = reinterpret_cast<uint32_t*>(psp);
-
-    // r4..r11 wurden vom Asm-Wrapper auf den MSP gepushed (siehe
-    // irq_inject.cpp/isr_pendsv). Hier vereinfacht: wir kopieren aus
-    // den aktuellen Banked-Registern, was nur stimmt, wenn PendSV
-    // unmittelbar aus Gast-Code kommt. Für Step/Halt-Granularität ist
-    // das ausreichend.
-    uint32_t r4_r11[8];
-    __asm volatile ("stmia %0, {r4-r11}" :: "r"(r4_r11) : "memory");
-
+// Gemeinsamer Halt-Pfad (Core1, Handler-Mode): Snapshot nehmen, warten bis
+// Resume/Step, Registeraenderungen zurueckschreiben. Kein USB-/printf-Zugriff
+// hier - der GDB-Stub bedient die CDC ausschliesslich von Core0 aus.
+void enter_halt(uint32_t* frame, uint32_t* r4_r11) {
     g_halt_request.store(false);
-    g_halted.store(true);
     capture_frame(frame, r4_r11);
+    g_halt_count.fetch_add(1, std::memory_order_relaxed);
+    g_halted.store(true, std::memory_order_release);
 
-    // Stop-Reason an angeschlossene Stubs signalisieren.
-    if (gdb_stub::active()) gdb_stub::on_breakpoint(frame, r4_r11);
-
-    // Spin-Schleife bis Resume/Step.
-    while (!g_resume_request.load(std::memory_order_acquire)) {
-        gdb_stub::poll();
-        // SWD-Target wird im eigenen Polling über USB/Pin-IRQ behandelt.
-        sleep_us(50);
-    }
+    while (!g_resume_request.load(std::memory_order_acquire)) busy_wait_us(50);
 
     writeback_frame();
-
     g_resume_request.store(false);
-    g_halted.store(false);
+    g_halted.store(false, std::memory_order_release);
 
-    // r4..r11 zurückschreiben — der Asm-Wrapper popt sie als Nächstes.
-    __asm volatile ("ldmia %0, {r4-r11}" :: "r"(r4_r11) : "memory");
-
-    if (g_step_request.load()) {
-        g_step_request.store(false);
-        // Single-Step über DEMCR.MON_STEP — landet wieder im DebugMonitor.
-        CoreDebug->DEMCR |= CoreDebug_DEMCR_MON_EN_Msk
-                         |  CoreDebug_DEMCR_MON_STEP_Msk;
+    if (g_step_request.exchange(false)) {
+        // Einzelschritt: nach genau einer Instruktion DebugMonitor.
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_MON_EN_Msk | CoreDebug_DEMCR_MON_STEP_Msk;
+        g_step_active.store(true);
     }
 }
 
+void on_pendsv_check(uint32_t* r4_r11) {
+    if (!g_halt_request.load(std::memory_order_acquire)) return;
+    uint32_t psp;
+    __asm volatile ("mrs %0, psp" : "=r"(psp));
+    enter_halt(reinterpret_cast<uint32_t*>(psp), r4_r11);
+}
+
+void core1_service() {
+    if (g_halt_request.load(std::memory_order_relaxed) && !g_halted.load())
+        SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+}
+
+void on_debug_event(uint32_t* frame, uint32_t* r4_r11) {
+    const uint32_t dfsr = SCB->DFSR;
+    SCB->DFSR = dfsr;                                   // w1c
+    CoreDebug->DEMCR &= ~CoreDebug_DEMCR_MON_STEP_Msk;
+    const bool was_step = g_step_active.exchange(false);
+    const bool bkpt = (dfsr & SCB_DFSR_BKPT_Msk) != 0;
+    if (!bkpt && !was_step) return;                     // unerwartet -> weiterlaufen
+    enter_halt(frame, r4_r11);
+}
+
+uint32_t halt_count() { return g_halt_count.load(std::memory_order_relaxed); }
+
 void request_halt() {
+    // Wirkt ueber core1_service() (SysTick-Shim/MMIO-Trap auf Core1) bzw.
+    // direkt, falls von Core1 aufgerufen.
     g_halt_request.store(true);
-    SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+    if (get_core_num() == 1u) SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
     __DSB();
 }
 
@@ -175,9 +183,21 @@ uint32_t map_guest_address(uint32_t lpc_addr) {
     return lpc_addr;
 }
 
+// Nur Flash-Image und Gast-RAM sind fuer Debugger zugaenglich. Andere Adressen
+// (LPC-Peripherie, RP2350-Speicher) werden abgewiesen: ein roher Zugriff auf
+// Core0 koennte echte RP2350-Register treffen oder einen BusFault ausloesen.
+static bool guest_range(uint32_t host, std::size_t len) {
+    const uint32_t img = emulator::load_base(), ram = emulator::guest_ram_base();
+    auto in = [&](uint32_t base, uint32_t size) {
+        return host >= base && len <= size && host - base <= size - len;
+    };
+    return in(img, emulator::LPC_LOAD_MAX_SIZE) || in(ram, emulator::LPC_GUEST_RAM_SIZE);
+}
+
 bool read_memory(uint32_t addr, void* dst, std::size_t len) {
     if (!dst) return false;
     auto a = map_guest_address(addr);
+    if (!guest_range(a, len)) return false;
     std::memcpy(dst, reinterpret_cast<const void*>(a), len);
     return true;
 }
@@ -185,13 +205,16 @@ bool read_memory(uint32_t addr, void* dst, std::size_t len) {
 bool write_memory(uint32_t addr, const void* src, std::size_t len) {
     if (!src) return false;
     auto a = map_guest_address(addr);
+    if (!guest_range(a, len)) return false;
     std::memcpy(reinterpret_cast<void*>(a), src, len);
     __DSB(); __ISB();
     return true;
 }
 
 bool set_breakpoint(uint32_t addr) {
-    addr = map_guest_address(addr);
+    addr = map_guest_address(addr & ~1u);
+    const uint32_t img = emulator::load_base();                // nur im Code-Image
+    if (addr < img || addr + 2u > img + emulator::LPC_LOAD_MAX_SIZE) return false;
     for (auto& b : g_bp) if (b.used && b.addr == addr) return true;
     for (auto& b : g_bp) if (!b.used) {
         auto* p = reinterpret_cast<uint16_t*>(addr);
@@ -204,7 +227,7 @@ bool set_breakpoint(uint32_t addr) {
 }
 
 bool clear_breakpoint(uint32_t addr) {
-    addr = map_guest_address(addr);
+    addr = map_guest_address(addr & ~1u);
     for (auto& b : g_bp) if (b.used && b.addr == addr) {
         *reinterpret_cast<uint16_t*>(addr) = b.saved;
         b.used = false;

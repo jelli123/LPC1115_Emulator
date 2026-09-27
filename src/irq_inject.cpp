@@ -151,7 +151,7 @@ void poll() {
     }
 }
 
-extern "C" void pendsv_inject_c() {
+extern "C" void pendsv_inject_c(uint32_t* r4_r11) {
     // PendSV gehoert ausschliesslich dem Gast-Core (Core1). Der emulatoreigene
     // isr_pendsv ueberschreibt das schwache SDK-PendSV-Symbol und ist daher
     // AUCH in Core0s Vektortabelle installiert. Wuerde PendSV jemals auf Core0
@@ -163,7 +163,7 @@ extern "C" void pendsv_inject_c() {
     if (get_core_num() != 1u) return;
 
     // Halt-Anforderungen haben Vorrang (Debugger-Pfad).
-    target_halt::on_pendsv_check();
+    target_halt::on_pendsv_check(r4_r11);
 
     // PRIMASK-Schatten (opt-in): Befindet sich der Gast in einer kritischen
     // Sektion (__disable_irq()), wird der IRQ nicht ausgeliefert, bleibt aber
@@ -236,10 +236,11 @@ void reset_inject_depth() {
 // ---------------------------------------------------------------------------
 extern "C" __attribute__((naked)) void isr_pendsv() {
     __asm volatile (
-        "push  {lr}                \n"
+        "push  {r4-r11, lr}        \n"   // Gast-r4..r11 fuer den Debug-Halt
         "sub   sp, #4              \n"   // 8-Byte-Alignment
+        "add   r0, sp, #4          \n"   // r0 = &{r4..r11}
         "bl    pendsv_inject_c     \n"
         "add   sp, #4              \n"
-        "pop   {pc}                \n"
+        "pop   {r4-r11, pc}        \n"
     );
 }
