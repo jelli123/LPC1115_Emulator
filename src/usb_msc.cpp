@@ -429,8 +429,6 @@ void parse_config(const char* buf, uint32_t len) {
         } else if (std::strcmp(line, "autostart") == 0) {
             config::set_autostart(std::strcmp(eq, "on") == 0 ||
                                   std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "freq_hz") == 0) {
-            config::set_target_frequency_hz(static_cast<uint32_t>(std::atol(eq)));
         } else if (std::strcmp(line, "cli_enable") == 0) {
             config::set_cli_enabled(std::strcmp(eq, "on") == 0 ||
                                     std::strcmp(eq, "1")  == 0);
@@ -649,9 +647,6 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     A("# --- Allgemein --------------------------------------------------\n");
     A("# autostart: nach Reset automatisch die geladene Firmware starten.\n");
     A("autostart=%s\n", config::autostart() ? "on" : "off");
-    A("# freq_hz: LPC-Soll-Takt (Zeitbasis der emulierten Timer/UART-Baud).\n");
-    A("#          Der reale RP2350-Takt bleibt bei 150 MHz.\n");
-    A("freq_hz=%lu\n", static_cast<unsigned long>(config::target_frequency_hz()));
     A("# flash_erase: on = Firmware-Slot VOR dem Laden von BOOT.HEX komplett\n");
     A("#              loeschen (sonst additiver Merge). Aktion, kein Zustand.\n");
     A("#flash_erase=off\n\n");

@@ -59,8 +59,9 @@ Legende: ⬜ offen · ✅ ok · ❌ Fehler
 | # | Test | Schritte | Erwartung | Status |
 |---|------|----------|-----------|:------:|
 | D1 | Pinmap zeigen | `pinmap show` | Tabelle LPC-Pin → RP-GPIO | ⬜ |
-| D2 | Wert setzen | `cfg set freq_hz 48000000`, `cfg get freq_hz` | Wert zurückgelesen | ⬜ |
-| D3 | Persistenz | `cfg save`, `reset`, `cfg get freq_hz` | Wert überlebt Reset | ⬜ |
+| D2 | Wert setzen | `cfg set isp_baud 57600`, `cfg get isp_baud`, `isp` | Wert zurückgelesen und live wirksam | ⬜ |
+| D3 | Persistenz | `cfg save`, `reboot`, `cfg get isp_baud` | Wert überlebt Neustart | ⬜ |
+| D3b | Unbekannter Key | `cfg set foo 1` | `err: unbekannter Schluessel` | ⬜ |
 | D4 | CONFIG.INI | `CONFIG.INI` mit `pin.0_7=25` aufs Volume, auswerfen, `pinmap show` | Mapping übernommen | ⬜ |
 | D5 | Pinmap-Reset | `pinmap reset` | Default-Tabelle wieder aktiv | ⬜ |
 

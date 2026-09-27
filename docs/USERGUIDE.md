@@ -118,7 +118,7 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 |---------------------------|--------------------------------------------------|
 | `cfg list`                | alle KV-Paare ausgeben                           |
 | `cfg get <key>`           | einen Wert lesen                                 |
-| `cfg set <key> <value>`   | Wert setzen (RAM)                                |
+| `cfg set <key> <value>`   | Wert setzen (sofort wirksam, on/off = 1/0; dauerhaft per `cfg save` oder beim Gast-Stop) |
 | `cfg save`                | RAM-Snapshot in nächsten Sektor schreiben        |
 | `pinmap show`             | Tabelle LPC-Pin → RP2350-GPIO                    |
 | `pinmap set <lpc> <rp>`   | Pin zuweisen, danach `cfg save`                  |
@@ -303,7 +303,6 @@ gdb_enable=on           # GDB-Remote-Serial-Protokoll (arm-none-eabi-gdb)
 serial_enable=on        # Serial-Adapter-CDC (uart_bridge bzw. uart0_cdc)
 
 autostart=on            # nach Reset automatisch starten
-freq_hz=48000000        # Wunsch-Coreclock (PLL-Soll)
 
 # Pinmap: pin.<port>_<pin>=<rp2350-gpio>
 pin.0_3=14

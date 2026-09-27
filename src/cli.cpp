@@ -906,10 +906,12 @@ void handle_command(char* line) {
     // --- Konfiguration: cfg show/get/set/save/clear (USERGUIDE-kompatibel) ---
     if (std::strcmp(tokens[0], "cfg") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "show") == 0) {
+            config::sync_to_store();          // Live-Stand anzeigen
             storage::config_dump(emit_line);
             return;
         }
         if (std::strcmp(tokens[1], "get") == 0 && n >= 3) {
+            config::sync_to_store();
             char buf[96];
             if (storage::config_get(tokens[2], buf, sizeof buf))
                 std::printf("%s=%s\n", tokens[2], buf);
@@ -917,9 +919,24 @@ void handle_command(char* line) {
             return;
         }
         if (std::strcmp(tokens[1], "set") == 0 && n >= 4) {
-            bool ok = storage::config_set(tokens[2], tokens[3]);
-            if (ok) apply_live_config_key(tokens[2], tokens[3]);
-            std::puts(ok ? "ok" : "err");
+            // Live-Werte -> Tabelle, Schluessel setzen, Tabelle -> Live-Werte.
+            // Frueher landete der Wert nur in der Tabelle und ging beim naechsten
+            // save() (Neuaufbau aus den Live-Werten) wieder verloren.
+            const char* v = tokens[3];
+            if (!std::strcmp(v, "on"))  v = "1";      // Bool-Keys erwarten 1/0
+            if (!std::strcmp(v, "off")) v = "0";
+            config::sync_to_store();
+            if (!storage::config_set(tokens[2], v)) { std::puts("err"); return; }
+            config::apply_from_store();
+            config::sync_to_store();
+            char chk[96];
+            if (!storage::config_get(tokens[2], chk, sizeof chk)) {
+                std::printf("err: unbekannter Schluessel '%s' ('cfg show' zeigt alle)\n", tokens[2]);
+                return;
+            }
+            usb_msc::refresh_config_volume(/*trigger_host_reread=*/false);
+            usb_msc::request_config_persist();
+            std::printf("%s=%s (dauerhaft per 'cfg save' oder beim Gast-Stop)\n", tokens[2], chk);
             return;
         }
         if (std::strcmp(tokens[1], "save") == 0) {

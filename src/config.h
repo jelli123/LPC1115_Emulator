@@ -11,7 +11,6 @@ namespace config {
 
 // Schlüssel
 inline constexpr const char* KEY_AUTOSTART       = "autostart";        // "0"/"1"
-inline constexpr const char* KEY_TARGET_FREQ_HZ  = "freq_hz";          // dezimal, 1..150_000_000
 // USB-Schnittstellen: einzelne CDC-Ports am USB komplett ein/ausblenden. Bei
 // "off" verschwindet das zugehoerige CDC-Interface aus dem USB-Deskriptor (der
 // Host sieht dann einen COM-Port weniger). MSC (Laufwerk) bleibt IMMER da, damit
@@ -78,6 +77,12 @@ struct PinMap {
 
 bool load();                         // ruft storage::config_load + bedient Defaults
 bool save();
+// KV-Tabelle (RAM) <-> Live-Werte ohne Flash-Zugriff: sync_to_store() schreibt
+// die Live-Werte in die Tabelle, apply_from_store() uebernimmt die Tabelle in die
+// Live-Werte. 'cfg set' nutzt beides, damit ein roher Schluessel nicht beim
+// naechsten save() (Neuaufbau aus den Live-Werten) verloren geht.
+bool sync_to_store();
+bool apply_from_store();
 
 bool        autostart();
 void        set_autostart(bool v);
@@ -110,8 +115,6 @@ void        set_isp_baud(uint32_t v);
 bool        reset_in();
 void        set_reset_in(bool v);
 
-uint32_t    target_frequency_hz();
-void        set_target_frequency_hz(uint32_t hz);
 
 const PinMap& pin_map();
 // verbose=true (CLI 'pinmap set'): meldet eine geloeste Kollision auf der Konsole.

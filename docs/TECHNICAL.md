@@ -510,7 +510,7 @@ Diskette über TinyUSB-MSC bereit (LUN 0, 256 KiB). Der Host sieht
 das Volume `LPC1115EMU`. Beim **Eject** (`SCSI START_STOP_UNIT
 load_eject=1, start=0`) parst der Emulator:
 
-* `CONFIG.INI` → `pin.<p>_<n>=<gpio>`, `autostart`, `freq_hz`, die
+* `CONFIG.INI` → `pin.<p>_<n>=<gpio>`, `autostart`, die
   USB-Schnittstellen-Schalter `cli_enable`/`gdb_enable`/`serial_enable` (§16a)
   sowie alle Bridge-Schlüssel. Konfig wird in den Storage-Slot persistiert.
 * `BOOT.HEX` (oder jede `*.HEX`) → Stream-Parser → Firmware-Slot. Nach

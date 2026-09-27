@@ -11,7 +11,6 @@ namespace config {
 namespace {
 
 PinMap   g_pin_map{};
-uint32_t g_target_freq = 48'000'000;
 bool     g_autostart   = false;
 bool     g_cli_enable    = true;
 bool     g_gdb_enable    = true;
@@ -58,7 +57,6 @@ int8_t   g_ct_mat[4][4] = {
 bool     g_tcap_pio = false;
 bool     g_tmatch_pio = false;
 
-constexpr uint32_t MAX_FREQ_HZ = 150'000'000; // RP2350-Limit, defensiv
 constexpr int      MAX_GPIO    = 47;          // RP2350-Pinanzahl konservativ
 
 // Sicherer strtoul, lehnt Überlauf, Leerstring, Vorzeichen ab.
@@ -116,7 +114,6 @@ void apply_default_pinmap_impl() {
 
 void apply_defaults() {
     apply_default_pinmap_impl();
-    g_target_freq = 48'000'000;
     g_autostart   = false;
     g_cli_enable    = true;
     g_gdb_enable    = true;
@@ -205,8 +202,12 @@ void load_pin_map_from_storage() {
 } // namespace
 
 bool load() {
-    apply_defaults();
     storage::config_load(); // ok wenn leer
+    return apply_from_store();
+}
+
+bool apply_from_store() {
+    apply_defaults();
     char buf[32];
     if (storage::config_get(KEY_AUTOSTART, buf, sizeof buf)) {
         g_autostart = (buf[0] == '1');
@@ -226,10 +227,6 @@ bool load() {
     if (storage::config_get(KEY_ISP_BAUD, buf, sizeof buf)) {
         uint32_t v;
         if (parse_uint32(buf, v)) g_isp_baud = v;
-    }
-    if (storage::config_get(KEY_TARGET_FREQ_HZ, buf, sizeof buf)) {
-        uint32_t v;
-        if (parse_uint32(buf, v) && v > 0 && v <= MAX_FREQ_HZ) g_target_freq = v;
     }
     if (storage::config_get(KEY_UART_BRIDGE_EN, buf, sizeof buf)) {
         g_uart_bridge_en = (buf[0] == '1');
@@ -360,6 +357,11 @@ bool load() {
 }
 
 bool save() {
+    if (!sync_to_store()) return false;
+    return storage::config_commit();
+}
+
+bool sync_to_store() {
     // Kompletter Neuaufbau des KV-Snapshots: erst leeren, dann NUR die aktuell
     // gueltigen Werte schreiben. Ohne das blieben veraltete Schluessel (z. B.
     // eine per assign_pin_unique geloeste Pinmap-Zuordnung oder ein entfernter
@@ -386,8 +388,6 @@ bool save() {
         std::snprintf(buf, sizeof buf, "%lu", static_cast<unsigned long>(g_isp_baud));
         if (!storage::config_set(KEY_ISP_BAUD, buf)) return false;
     }
-    std::snprintf(buf, sizeof buf, "%lu", static_cast<unsigned long>(g_target_freq));
-    if (!storage::config_set(KEY_TARGET_FREQ_HZ, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_uart_bridge_en ? 1 : 0));
     if (!storage::config_set(KEY_UART_BRIDGE_EN, buf)) return false;
     if (g_uart_bridge_tx >= 0) {
@@ -486,7 +486,7 @@ bool save() {
         std::snprintf(buf, sizeof buf, "%d", g_pin_map.lpc_to_rp[i]);
         if (!storage::config_set(key, buf)) return false;
     }
-    return storage::config_commit();
+    return true;
 }
 
 // Setzt NUR die "listenartigen" Pin-Zuordnungen (Pinmap + Timer-Capture/Match)
@@ -529,12 +529,6 @@ uint32_t    isp_baud()                     { return g_isp_baud; }
 void        set_isp_baud(uint32_t v)       { g_isp_baud = v; }
 bool        reset_in()                     { return g_reset_in; }
 void        set_reset_in(bool v)           { g_reset_in = v; }
-uint32_t    target_frequency_hz()          { return g_target_freq; }
-
-void set_target_frequency_hz(uint32_t hz) {
-    if (hz == 0 || hz > MAX_FREQ_HZ) return;
-    g_target_freq = hz;
-}
 
 const PinMap& pin_map() { return g_pin_map; }
 
