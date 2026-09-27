@@ -2230,7 +2230,11 @@ void ct_bridge_reinit()  { ct_bridge_init(); }
 void reset() {
     std::memset(g_gpio, 0, sizeof g_gpio);
     g_gpio_irq_primed = false;
+    // IOCON-Resetwerte (UM10398 Kap. 7.4): Pin-Register 0xD0 (FUNC=0, Pull-up),
+    // I2C-Pins PIO0_4/PIO0_5 (0x030/0x034) 0x00, Pin-Lokalisierung ab 0x0B0 = 0.
     std::memset(g_iocon, 0, sizeof g_iocon);
+    for (uint32_t off = 0; off <= 0x0ACu; off += 4)
+        if (off != 0x030u && off != 0x034u) g_iocon[off] = 0xD0u;
     g_systick_load = g_systick_val = g_systick_ctrl = 0;
     g_systick = {};
     g_systick.last_us = time_us_64();
@@ -2283,6 +2287,36 @@ void reset() {
     g_start_aprp = g_start_erp = g_start_srp = 0;
     g_start_primed = false;
     std::memset(g_mmio_shadow, 0, sizeof g_mmio_shadow);
+}
+
+// Reset der Gast-sichtbaren Peripherie bei jedem Gast-(Neu)start (Core1), wie
+// ein echter LPC-Reset: Register, IOCON, GPIO (alle Pins Eingang), Timer, UART,
+// WDT, Start-Logik. Erhalten bleiben die Host-seitigen Bridge-Ressourcen der
+// Timer (Capture-/Match-Pins, PIO-Handles) und die Statistik. Frueher lief
+// reset() nur beim RP2350-Boot -> ein Gast-Neustart erbte Timer-/UART-/GPIO-
+// Zustaende und vNVIC-Freigaben des vorigen Laufs (Geister-IRQs vor der Init).
+void guest_reset() {
+    CtModel keep[4];
+    std::memcpy(keep, g_ct, sizeof keep);
+    const Stats st = g_stats;
+    reset();
+    g_stats = st;
+    for (int t = 0; t < 4; ++t) {
+        CtModel& c = g_ct[t];
+        c.cap_pin    = keep[t].cap_pin;
+        c.cap_last   = keep[t].cap_last;
+        c.pio_handle = keep[t].pio_handle;
+        c.pio_rate   = keep[t].pio_rate;
+        c.tx_rate    = keep[t].tx_rate;
+        for (int m = 0; m < 4; ++m) {
+            c.mat_pin[m]   = keep[t].mat_pin[m];
+            c.tx_handle[m] = keep[t].tx_handle[m];
+            if (c.mat_pin[m] >= 0 && c.tx_handle[m] < 0)
+                gpio_put(static_cast<uint>(c.mat_pin[m]), false);
+        }
+    }
+    for (uint8_t i = 0; i < config::LPC_PIN_COUNT; ++i)
+        apply_gpio_to_hw(i, /*out=*/false, /*level=*/false);
 }
 
 // Bridge zum Emulator: WDT-Reset wird drüben asynchron behandelt.

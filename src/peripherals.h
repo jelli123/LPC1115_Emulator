@@ -6,10 +6,16 @@
 
 #include <cstdint>
 
+struct uart_inst;
+typedef struct uart_inst uart_inst_t;   // wie hardware/uart.h
+
 namespace peripherals {
 
 void init();
 void reset();
+// Gast-Reset (Core1, bei jedem Gast-Start): Register zuruecksetzen, Bridge-
+// Ressourcen (PIO/Capture/Match) erhalten.
+void guest_reset();
 
 // (Re-)Initialisiert die I²C-Hardware-Bridge anhand der aktuellen config.
 // Wird nach dem Einlesen von CONFIG.INI aufgerufen, damit die Bridge auch

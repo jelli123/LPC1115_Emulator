@@ -419,6 +419,10 @@ void core1_main() {
         g_request_stop.store(false, std::memory_order_release);
         g_start_count.fetch_add(1, std::memory_order_relaxed);   // Diagnose: Gast-Starts
 
+        // Wie ein echter LPC-Reset: Peripherie-Register und vNVIC zuruecksetzen.
+        peripherals::guest_reset();
+        vnvic::reset();
+
         // Firmware in RP2350-SRAM kopieren. Quelle ist storage::firmware_data()
         // — ein Pointer in den memory-mapped XIP-Bereich.
         const uint8_t* fw = storage::firmware_data();
