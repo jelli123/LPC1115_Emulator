@@ -33,6 +33,9 @@ constexpr uint32_t CMD_COMPARE_ERROR          = 10;
 
 void init();
 void dispatch(uint32_t* param, uint32_t* result);
+// Wie dispatch(), aber mit den rohen Gast-Registerwerten r0/r1: validiert und
+// uebersetzt die Zeiger (LPC-RAM -> Gast-RAM) vor dem Zugriff.
+void dispatch_guest(uint32_t param_addr, uint32_t result_addr);
 
 struct Stats {
     uint32_t calls;

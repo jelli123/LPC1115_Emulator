@@ -238,9 +238,7 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
     // BootROM gesprungen. Adresse existiert auf RP2350 nicht → Prefetch-
     // Fault. Wir bedienen den IAP-Aufruf und springen über LR zurück.
     if ((frame->pc & ~1u) == iap::ROM_ENTRY_TARGET) {
-        auto* params  = reinterpret_cast<uint32_t*>(frame->r0);
-        auto* results = reinterpret_cast<uint32_t*>(frame->r1);
-        iap::dispatch(params, results);
+        iap::dispatch_guest(frame->r0, frame->r1);
         frame->pc = frame->lr & ~1u;
         SCB->CFSR = SCB->CFSR;
         ++faultsys::g_stats.mem_traps;
@@ -410,7 +408,9 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
     // landen ebenfalls dort. Daher den gesamten Flashbereich bedienen, nicht
     // nur die geladene Code-Laenge — sonst faulten EEPROM-Reads jenseits des
     // Images und loesen einen Watchdog-Reset aus.
-    if (acc.address < emulator::LPC_LOAD_MAX_SIZE) {
+    const uint32_t acc_bytes = (acc.size == AccessSize::B) ? 1u
+                             : (acc.size == AccessSize::H) ? 2u : 4u;
+    if (acc.address + acc_bytes <= emulator::LPC_LOAD_MAX_SIZE) {   // kein Lesen hinter das Image
         if (acc.is_load) {
             auto* img = reinterpret_cast<const uint8_t*>(emulator::load_base());
             uint32_t value = 0;

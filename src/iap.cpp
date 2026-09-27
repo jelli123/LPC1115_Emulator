@@ -35,10 +35,35 @@ bool dst_in_flash(uint32_t addr, uint32_t bytes) {
 }
 
 // Schreibt einen Teilbereich des RAM-Flash-Image zurück in den Storage-Slot,
-// damit IAP-induzierte Änderungen einen Power-Cycle überleben.
+// damit IAP-induzierte Änderungen einen Power-Cycle überleben. firmware_write()
+// puffert nur einen Sektor im RAM; erst finalize() flusht ihn und erneuert den
+// Laengen-/CRC-Marker. Ohne finalize ging der zuletzt beschriebene Sektor (z. B.
+// sblib-EEPROM) beim Power-Cycle verloren, und ein geflushter Sektor passte
+// nicht mehr zur Marker-CRC -> "keine Firmware" nach dem naechsten Boot.
 void persist(uint32_t offset, uint32_t bytes) {
     storage::firmware_write(offset, flash_image() + offset, bytes);
+    storage::firmware_finalize(offset + bytes);
     g_dirty = true;
+}
+
+// Uebersetzt eine vom Gast uebergebene Adresse (LPC-Adressraum ODER bereits
+// relocierte RP2350-Adresse) in einen Host-Pointer auf Gast-RAM bzw. Flash-Image.
+// nullptr, wenn [addr, addr+bytes) nicht vollstaendig in einem der beiden liegt —
+// verhindert, dass der Gast ueber IAP beliebigen Host-Speicher liest.
+const uint8_t* guest_ptr(uint32_t addr, uint32_t bytes, bool allow_flash = true) {
+    const uint32_t ram  = emulator::guest_ram_base();
+    const uint32_t img  = emulator::load_base();
+    constexpr uint32_t LPC_RAM = 0x1000'0000u;
+    constexpr uint32_t RAM_SZ  = emulator::LPC_GUEST_RAM_SIZE;
+    auto inside = [&](uint32_t base, uint32_t size) {
+        return addr >= base && bytes <= size && addr - base <= size - bytes;
+    };
+    if (inside(LPC_RAM, RAM_SZ))       return reinterpret_cast<const uint8_t*>(ram + (addr - LPC_RAM));
+    if (inside(ram, RAM_SZ))           return reinterpret_cast<const uint8_t*>(addr);
+    if (!allow_flash)                  return nullptr;
+    if (inside(0, LPC_FLASH_BYTES))    return flash_image() + addr;
+    if (inside(img, LPC_FLASH_BYTES))  return reinterpret_cast<const uint8_t*>(addr);
+    return nullptr;
 }
 
 uint32_t cmd_prepare(uint32_t* p) {
@@ -65,11 +90,10 @@ uint32_t cmd_copy_ram_to_flash(uint32_t* p) {
     uint32_t s_end   = (dst + bytes - 1) / LPC_SECTOR_BYTES;
     if (!sectors_prepared(s_start, s_end))
         return CMD_SECTOR_NOT_PREPARED;
-    // Quell-Adresse ist Guest-RAM (0x10000000-0x10001FFF) → bei uns identisch
-    // erreichbar (Privileg-Mode), oder auch Code-Image. Wir nutzen den
-    // Adressraum direkt.
-    const uint8_t* srcp = reinterpret_cast<const uint8_t*>(src);
-    std::memcpy(flash_image() + dst, srcp, bytes);
+    // Quelle muss im Gast-RAM liegen (UM10398: RAM-Adresse, word-aligned).
+    const uint8_t* srcp = guest_ptr(src, bytes, /*allow_flash=*/false);
+    if ((src & 3u) != 0 || !srcp) return CMD_SRC_ADDR_ERROR;
+    std::memmove(flash_image() + dst, srcp, bytes);
     persist(dst, bytes);
     g_prepared_mask &= ~static_cast<uint16_t>(((1u << (s_end + 1)) - 1u) &
                                               ~((1u << s_start) - 1u));
@@ -85,6 +109,28 @@ uint32_t cmd_erase(uint32_t* p) {
         return CMD_SECTOR_NOT_PREPARED;
     uint32_t off = s_start * LPC_SECTOR_BYTES;
     uint32_t len = (s_end - s_start + 1) * LPC_SECTOR_BYTES;
+    std::memset(flash_image() + off, 0xFF, len);
+    persist(off, len);
+    g_prepared_mask &= ~static_cast<uint16_t>(((1u << (s_end + 1)) - 1u) &
+                                              ~((1u << s_start) - 1u));
+    ++g_stats.erases;
+    return CMD_SUCCESS;
+}
+
+// Erase page (cmd 59): 256-Byte-granular. Frueher auf den ganzen 4-KiB-Sektor
+// aufgerundet -> Nachbar-Pages (andere Daten) wurden mitgeloescht.
+uint32_t cmd_erase_page(uint32_t* p) {
+    constexpr uint32_t PAGE = 256;
+    constexpr uint32_t NUM_PAGES = LPC_FLASH_BYTES / PAGE;
+    uint32_t p_start = p[1], p_end = p[2];
+    if (p_start >= NUM_PAGES || p_end >= NUM_PAGES || p_start > p_end)
+        return CMD_INVALID_SECTOR;
+    uint32_t s_start = (p_start * PAGE) / LPC_SECTOR_BYTES;
+    uint32_t s_end   = (p_end   * PAGE) / LPC_SECTOR_BYTES;
+    if (!sectors_prepared(s_start, s_end))
+        return CMD_SECTOR_NOT_PREPARED;
+    uint32_t off = p_start * PAGE;
+    uint32_t len = (p_end - p_start + 1) * PAGE;
     std::memset(flash_image() + off, 0xFF, len);
     persist(off, len);
     g_prepared_mask &= ~static_cast<uint16_t>(((1u << (s_end + 1)) - 1u) &
@@ -112,9 +158,12 @@ uint32_t cmd_blank_check(uint32_t* p, uint32_t* r) {
 
 uint32_t cmd_compare(uint32_t* p, uint32_t* r) {
     uint32_t dst = p[1], src = p[2], bytes = p[3];
-    const uint8_t* a = flash_image() + dst;
-    const uint8_t* b = reinterpret_cast<const uint8_t*>(src);
-    if (!dst_in_flash(dst, bytes)) return CMD_DST_ADDR_NOT_MAPPED;
+    if ((dst & 3u) || (src & 3u)) return (dst & 3u) ? CMD_DST_ADDR_ERROR : CMD_SRC_ADDR_ERROR;
+    if (bytes & 3u) return CMD_COUNT_ERROR;
+    const uint8_t* a = guest_ptr(dst, bytes);
+    const uint8_t* b = guest_ptr(src, bytes);
+    if (!a) return CMD_DST_ADDR_NOT_MAPPED;
+    if (!b) return CMD_SRC_ADDR_NOT_MAPPED;
     for (uint32_t i = 0; i < bytes; ++i) {
         if (a[i] != b[i]) { r[1] = dst + i; return CMD_COMPARE_ERROR; }
     }
@@ -139,6 +188,18 @@ void init() {
     g_stats = {};
     g_prepared_mask = 0;
     g_dirty = false;
+}
+
+void dispatch_guest(uint32_t param_addr, uint32_t result_addr) {
+    // Parameter-/Ergebnistabelle muessen im Gast-RAM liegen (5 Worte). Ein
+    // roher LPC-RAM-Zeiger (0x10000000+) wird uebersetzt; alles andere (z. B.
+    // ein Zeiger in Host-Speicher) wird abgewiesen.
+    auto* param  = const_cast<uint32_t*>(reinterpret_cast<const uint32_t*>(
+        guest_ptr(param_addr, 5 * 4, /*allow_flash=*/false)));
+    auto* result = const_cast<uint32_t*>(reinterpret_cast<const uint32_t*>(
+        guest_ptr(result_addr, 5 * 4, /*allow_flash=*/false)));
+    if ((param_addr | result_addr) & 3u) { param = nullptr; }
+    dispatch(param, result);
 }
 
 void dispatch(uint32_t* param, uint32_t* result) {
@@ -175,16 +236,7 @@ void dispatch(uint32_t* param, uint32_t* result) {
             result[0] = CMD_SUCCESS;
             put_uid(result);
             break;
-        case 59: {
-            // Erase page — wie cmd 52, aber 256 Byte granular. Wir runden
-            // auf den umschließenden Sektor.
-            uint32_t p_start = param[1], p_end = param[2];
-            uint32_t s_start = (p_start * 256u) / LPC_SECTOR_BYTES;
-            uint32_t s_end   = (p_end   * 256u) / LPC_SECTOR_BYTES;
-            uint32_t fake[5] = { 59, s_start, s_end, 0, 0 };
-            result[0] = cmd_erase(fake);
-            break;
-        }
+        case 59: result[0] = cmd_erase_page(param);                break;
         default:
             result[0] = CMD_INVALID_COMMAND;
             ++g_stats.errors;
