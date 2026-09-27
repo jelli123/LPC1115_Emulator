@@ -126,7 +126,7 @@ enum TxState : uint8_t { TXS_IDLE = 0, TXS_SENDING, TXS_ACKWAIT };
 struct Phy {
     bool     active;
     int      tx_pin, rx_pin;
-    int      tx_h, rx_h;        // pio_glue-Handles (-1 = keins)
+    int      tx_h = -1, rx_h = -1;   // pio_glue-Handles (-1 = keins; nicht 0 = fremdes Handle)
     float    tx_cpu, rx_cpu;    // Counts pro us (aus PIO-Rate)
 
     // TX-Bitstrom-Cursor (Quelle = Frame ODER einzelnes ACK-Zeichen)
