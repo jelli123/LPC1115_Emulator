@@ -183,9 +183,24 @@ constexpr uint32_t PMU_END      = PMU_BASE + 0x100;
 struct GpioPort {
     uint32_t dir;
     uint32_t data;
+    // LPC111x-GPIO-Interrupt (UM10398 Kap. 12.3): IS (1=Pegel), IBE (beide
+    // Flanken), IEV (1=steigend/high), IE (Maske), RIS (Rohstatus).
+    uint32_t is, ibe, iev, ie, ris;
+    uint32_t prev_live;      // letzter abgetasteter Pegel (Flankenerkennung)
+    uint32_t mis_signaled;   // MIS-Bits, fuer die bereits ein IRQ gepended wurde
 };
 
 GpioPort        g_gpio[4]{};
+bool            g_gpio_irq_primed = false;
+
+// GPIO-Interrupt-Register relativ zur Port-Basis.
+constexpr uint32_t GPIO_IS_OFFSET  = 0x8004;
+constexpr uint32_t GPIO_IBE_OFFSET = 0x8008;
+constexpr uint32_t GPIO_IEV_OFFSET = 0x800C;
+constexpr uint32_t GPIO_IE_OFFSET  = 0x8010;
+constexpr uint32_t GPIO_RIS_OFFSET = 0x8014;
+constexpr uint32_t GPIO_MIS_OFFSET = 0x8018;
+constexpr uint32_t GPIO_IC_OFFSET  = 0x801C;
 
 // LPC-Pin-Index in der Pinmap = port*12 + pin (LPC1115 hat max. 12 Pins/Port).
 constexpr uint8_t lpc_pin_idx(uint8_t port, uint8_t pin) {
@@ -2154,6 +2169,7 @@ void ct_bridge_reinit()  { ct_bridge_init(); }
 
 void reset() {
     std::memset(g_gpio, 0, sizeof g_gpio);
+    g_gpio_irq_primed = false;
     std::memset(g_iocon, 0, sizeof g_iocon);
     g_systick_load = g_systick_val = g_systick_ctrl = 0;
     g_systick = {};
@@ -2318,6 +2334,31 @@ void sample_pin_interrupts() {
 
     // --- Timer-Capture (KNX-Bus-Empfang): Flanken am CAP0-Pin timestampen. ---
     for (auto& c : g_ct) ct_sample_capture(c);
+
+    // --- LPC111x-GPIO-Interrupts: Port n -> IRQ PIO_n (EINT0..3 = IRQ 31..28).
+    if (!g_gpio_irq_primed) {
+        for (uint32_t p = 0; p < 4; ++p) g_gpio[p].prev_live = live[p] & 0xFFFu;
+        g_gpio_irq_primed = true;
+    }
+    for (uint32_t p = 0; p < 4; ++p) {
+        GpioPort& g = g_gpio[p];
+        const uint32_t cur  = live[p] & 0xFFFu;
+        const uint32_t rose = cur & ~g.prev_live;
+        const uint32_t fell = ~cur & g.prev_live & 0xFFFu;
+        g.prev_live = cur;
+        const uint32_t edge_pins = ~g.is & 0xFFFu;
+        const uint32_t edge_hit  = edge_pins &
+            ((g.ibe & (rose | fell)) | (~g.ibe & ((g.iev & rose) | (~g.iev & fell))));
+        const uint32_t level_act = g.is & ((g.iev & cur) | (~g.iev & ~cur)) & 0xFFFu;
+        // Flanken-Bits bleiben bis IC stehen; Pegel-Bits folgen dem Pegel.
+        g.ris = (g.ris & edge_pins) | edge_hit | level_act;
+        const uint32_t mis = g.ris & g.ie;
+        g.mis_signaled &= mis;
+        if (mis & ~g.mis_signaled) {
+            g.mis_signaled = mis;
+            irq_inject::pend(static_cast<uint8_t>(lpc_irq::EINT0 - p));
+        }
+    }
 
     // --- PINT ---
     uint16_t cur = 0;
@@ -2503,6 +2544,19 @@ bool mmio_read8(uint32_t addr, uint8_t& out) {
                 out = static_cast<uint8_t>((g_gpio[port].dir >> ((addr & 3u) * 8u)) & 0xFFu);
                 return true;
             }
+            const GpioPort& g = g_gpio[port];
+            uint32_t v = 0;
+            switch (local & ~3u) {
+                case GPIO_IS_OFFSET:  v = g.is;  break;
+                case GPIO_IBE_OFFSET: v = g.ibe; break;
+                case GPIO_IEV_OFFSET: v = g.iev; break;
+                case GPIO_IE_OFFSET:  v = g.ie;  break;
+                case GPIO_RIS_OFFSET: v = g.ris; break;
+                case GPIO_MIS_OFFSET: v = g.ris & g.ie; break;
+                default: break;
+            }
+            out = static_cast<uint8_t>((v >> ((addr & 3u) * 8u)) & 0xFFu);
+            return true;
         }
         out = 0; return true;
     }
@@ -2626,6 +2680,23 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
                 gpio_apply_port(static_cast<uint8_t>(port), g_gpio[port].data,
                                 g_gpio[port].data, g_gpio[port].dir);
                 return true;
+            }
+            GpioPort& g = g_gpio[port];
+            const uint32_t shift = (addr & 3u) * 8u;
+            const uint32_t lane  = (static_cast<uint32_t>(val) << shift) & 0xFFFu;
+            auto patch = [&](uint32_t& r) {
+                r = ((r & ~(0xFFu << shift)) | lane) & 0xFFFu;
+            };
+            switch (local & ~3u) {
+                case GPIO_IS_OFFSET:  patch(g.is);  break;
+                case GPIO_IBE_OFFSET: patch(g.ibe); break;
+                case GPIO_IEV_OFFSET: patch(g.iev); break;
+                case GPIO_IE_OFFSET:  patch(g.ie);  break;
+                case GPIO_IC_OFFSET:                 // Flanken-Status quittieren
+                    g.ris &= ~lane;
+                    g.mis_signaled &= ~lane;
+                    break;
+                default: break;                      // RIS/MIS read-only
             }
         }
         return true;  // andere GPIO-Subregister still akzeptieren
