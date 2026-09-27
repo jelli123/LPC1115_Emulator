@@ -56,10 +56,10 @@ vom Laufwerk (Medienwechsel); die uebrigen Dateien bleiben.</div>
 <table><tr><th>Befehl</th><th>Wirkung</th></tr>
 <tr><td><code>help</code> / <code>version</code></td><td>Hilfe / Build-Info</td></tr>
 <tr><td><code>stats</code></td><td>Status &amp; Zaehler (siehe unten)</td></tr>
-<tr><td><code>run</code> / <code>stop</code> / <code>reset</code></td><td>Gast starten / anhalten / Core neu starten</td></tr>
+<tr><td><code>run</code> / <code>stop</code> / <code>reset</code></td><td>Gast starten / anhalten / neu starten</td></tr>
 <tr><td><code>step</code></td><td>ein Befehl, dann anhalten</td></tr>
-<tr><td><code>upload</code> / <code>xmodem</code></td><td>Intel-HEX per Stream bzw. XMODEM-CRC/1K laden (additiv)</td></tr>
-<tr><td><code>erase</code></td><td>Firmware-Slot komplett leeren (= <code>flash erase</code>)</td></tr>
+<tr><td><code>upload</code></td><td>Intel-HEX per XMODEM laden (additiv; Alias <code>xmodem</code>)</td></tr>
+<tr><td><code>erase</code></td><td>Firmware-Slot komplett leeren</td></tr>
 <tr><td><code>info</code></td><td>Reset-Vektor, Stack, Groesse</td></tr>
 <tr><td><code>autostart on|off</code></td><td>nach Reset automatisch starten</td></tr>
 <tr><td><code>cfg list|get|set|save</code></td><td>Konfiguration lesen/setzen/speichern</td></tr>
@@ -69,7 +69,6 @@ vom Laufwerk (Medienwechsel); die uebrigen Dateien bleiben.</div>
 <tr><td><code>cdc start|stop|status</code></td><td>USB&harr;UART-Adapter (Serial-CDC &harr; PIO-UART, beliebige GPIOs)</td></tr>
 <tr><td><code>uart pins|cdc|status</code></td><td>LPC-UART0 des Gasts: echte RP-Pads bzw. virtuell an Serial-CDC</td></tr>
 <tr><td><code>i2c on|off|status</code></td><td>I2C-Bridge auf echte RP2350-Hardware</td></tr>
-<tr><td><code>freq &lt;Hz&gt;</code></td><td>LPC-Soll-Takt der emulierten Zeitbasis</td></tr>
 </table>
 
 <h2>Ausgabe von <code>stats</code></h2>

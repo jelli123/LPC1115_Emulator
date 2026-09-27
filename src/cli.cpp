@@ -34,10 +34,6 @@ constexpr std::size_t LINE_MAX = 192;
 // angezeigt. Semantik: 0.0x-alpha = fruehe, aktiv entwickelte Vorabstaende.
 constexpr const char* EMU_VERSION = "0.03-alpha";
 
-// Stateful Hex-Upload-Modus
-bool g_in_hex_upload = false;
-hex::Parser* g_hex_parser = nullptr;
-
 bool hex_writer(uint32_t offset, const uint8_t* data, std::size_t len) {
     return storage::firmware_write(offset, data, len);
 }
@@ -114,36 +110,45 @@ bool xmodem_hex_sink(const uint8_t* data, std::size_t len, void* ctxv) {
     return true;
 }
 
-void cmd_xmodem() {
+// Serieller Firmware-Upload: Intel-HEX per XMODEM (CRC-16/1K, Fallback auf
+// Pruefsumme) ueber die CLI-CDC. Ersetzt den frueheren Zeilen-Paste-Modus, der
+// ohne Handshake/Pruefsumme arbeitete (Echo jedes Zeichens, kein Schutz gegen
+// verlorene/verfaelschte Zeilen, 192-Zeichen-Zeilenlimit).
+void cmd_upload() {
     stop_guest_for_reflash();   // XIP-Schutz fuer den blockierenden Empfang
-    std::puts("xmodem: Empfang (CRC/1K, additiv) bereit - Datei jetzt senden...");
+    std::puts("upload: bereit fuer Intel-HEX per XMODEM (additiv, 30 s Zeit).\n"
+              "        Im Terminal jetzt 'XMODEM senden' waehlen (Ctrl-X x5 = Abbruch).");
     fflush(stdout);
     static hex::Parser parser(hex_writer, 0x0000'0000, 64u * 1024u);
     parser = hex::Parser(hex_writer, 0x0000'0000, 64u * 1024u);
     XmodemHexCtx ctx{&parser, false, false};
     uint32_t raw = 0;
     auto res = xmodem::receive(xmodem_hex_sink, &ctx, usb_stdio_task, raw);
+    // Der Sender braucht nach dem letzten ACK einen Moment, bis das Terminal
+    // wieder Text anzeigt; Status erst danach ausgeben.
+    sleep_ms(200);
 
-    if (ctx.error) {
-        std::puts("\n[xmodem] HEX-Fehler -> abgebrochen");
+    const char* err = nullptr;
+    if (ctx.error)                                  err = "HEX-Fehler (Format/Pruefsumme/Adresse ausserhalb 64 KiB)";
+    else if (res == xmodem::Result::SyncFailed)     err = "kein XMODEM-Sender erkannt (Timeout)";
+    else if (res == xmodem::Result::Canceled)       err = "Uebertragung abgebrochen";
+    else if (parser.bytes_written() == 0)           err = "keine HEX-Daten empfangen";
+    if (err) {
+        storage::firmware_discard();   // halb gefuellten Sektor-Puffer verwerfen
+        std::printf("\n[upload] %s - Flash unveraendert bis auf bereits "
+                    "abgeschlossene Sektoren\n", err);
         return;
     }
-    if (res == xmodem::Result::SyncFailed) {
-        std::puts("\n[xmodem] kein Sender erkannt (timeout)");
+    const uint32_t bw = parser.bytes_written();
+    if (!storage::firmware_finalize(bw)) {
+        std::puts("\n[upload] Fehler beim Abschliessen (CRC-Marker)");
         return;
     }
-    if (res == xmodem::Result::Canceled) {
-        std::puts("\n[xmodem] abgebrochen");
-        return;
-    }
-    uint32_t bw = parser.bytes_written();
-    if (bw > 0 && storage::firmware_finalize(bw)) {
-        std::printf("\n[xmodem] %lu hex-bytes (%lu roh empfangen), CRC ok\n",
-                    static_cast<unsigned long>(bw),
-                    static_cast<unsigned long>(raw));
-    } else {
-        std::puts("\n[xmodem] keine gueltigen Daten");
-    }
+    config::set_firmware_name("(seriell/XMODEM)");
+    config::save();
+    std::printf("\n[upload] ok: HEX bis Adresse 0x%05lx geschrieben (%lu Bytes "
+                "empfangen). 'run' startet den Gast.\n",
+                static_cast<unsigned long>(bw), static_cast<unsigned long>(raw));
 }
 
 // Hilfe-Zeilen (file-scope, damit 'help' UND 'help <cmd>' darauf zugreifen).
@@ -157,12 +162,11 @@ const char* const HELP_LINES[] = {
     "  dbg [clear]                Gast-Debug-Ausgabe zeigen/loeschen",
     "  dbg save                   Debug-Ausgabe als DEBUG.TXT aufs Laufwerk",
     "  dbg auto <sek|off>         DEBUG.TXT automatisch alle N s aktualisieren",
-    "  reset                      Emulator-Core neu starten",
+    "  reset                      Gast neu starten (wie Reset-Taste am LPC)",
     "",
-    "  upload                     Intel-Hex-Stream starten (alias: flash hex)",
-    "  xmodem                     Intel-Hex per XMODEM-CRC/1K empfangen",
+    "  upload                     Intel-HEX per XMODEM empfangen (additiv; alias: xmodem)",
     "  info                       Reset-Vektor, Stack, Groesse, CRC",
-    "  erase                      Firmware-Slot loeschen (alias: flash erase)",
+    "  erase                      Firmware-Slot (64 KiB) komplett loeschen",
     "  run                        Guest starten",
     "  halt                       Guest anhalten",
     "  step                       ein Befehl, dann halten",
@@ -187,24 +191,20 @@ const char* const HELP_LINES[] = {
     "  swd stop                   SWD-Target deaktivieren",
     "  pio capture <pin> <count>  Edge-Capture-Trace (Zyklen)",
     "",
-    "  cdc start <tx> <rx>        USB-Serial-Konverter (Serial-CDC <-> PIO-UART)",
-    "  cdc stop                   CDC-Serial-Konverter stoppen",
-    "  cdc status                 Pins, Baudrate, Datenfluss",
-    "  uart pins <tx> <rx>|off    LPC-UART0 auf RP-UART-Pads routen",
-    "  uart cdc on|off            LPC-UART0 virtuell an Serial-CDC koppeln",
-    "  uart status                LPC-UART0-Routing anzeigen",
+    "  uart pins <tx> <rx>|off    Gast-UART0 auf RP-GPIOs legen (echte Leitung)",
+    "  uart cdc on|off            Gast-UART0 auf den Serial-COM-Port (ohne Draht)",
+    "  uart status                Gast-UART0-Anbindung + Datenfluss anzeigen",
+    "  cdc start <tx> <rx>        Unabhaengiger USB-Seriell-Adapter: Serial-COM-Port",
+    "                             <-> PIO-UART an RP-GPIOs (nicht mit dem Gast verbunden)",
+    "  cdc stop|status            USB-Seriell-Adapter stoppen / Zustand",
     "",
     "  i2c on <inst> <sda> <scl> [hz]  I2C-Bridge auf RP2350-HW (Neustart noetig)",
     "  i2c off                    I2C-Bridge deaktivieren",
     "  i2c status                 Instanz/Pins/Takt anzeigen",
     "",
-    "  freq <Hz>                  Ziel-CPU-Frequenz",
-    "  flash hex                  Intel-Hex-Stream (alias fuer upload)",
-    "  flash erase                Firmware-Slot loeschen",
-    "  flash finalize <bytes>     Firmware abschliessen + CRC-Marker",
-    "",
     "Komfort: TAB vervollstaendigt, Pfeil-hoch/runter = History (nur im Terminal).",
-    "Aliase: show=list=dump, stats=status, run=start, halt=stop, cfg=config, pinmap=pin.",
+    "Aliase: show=list=dump, stats=status, run=start, halt=stop, cfg=config, pinmap=pin,",
+    "        upload=xmodem.",
     nullptr
 };
 
@@ -464,14 +464,13 @@ constexpr Word TOP[] = {
     {"help","help"}, {"?","help"}, {"version","version"},
     {"stats","stats"}, {"status","stats"},
     {"dbg","dbg"}, {"reset","reset"},
-    {"upload","upload"}, {"xmodem","xmodem"}, {"info","info"},
+    {"upload","upload"}, {"xmodem","upload"}, {"info","info"},
     {"erase","erase"},
     {"run","run"}, {"start","run"},
     {"halt","halt"}, {"stop","halt"},
     {"step","step"}, {"autostart","autostart"},
     {"cfg","cfg"}, {"config","cfg"},
     {"pinmap","pinmap"}, {"pin","pinmap"},
-    {"freq","freq"}, {"flash","flash"},
     {"gdb","gdb"}, {"bp","bp"}, {"regs","regs"}, {"mem","mem"},
     {"pio","pio"}, {"swd","swd"}, {"cdc","cdc"},
     {"uart","uart"}, {"i2c","i2c"},
@@ -488,8 +487,8 @@ constexpr Word SUB_CDC[]    = {{"start","start"},{"stop","stop"},{"status","stat
 constexpr Word SUB_UART[]   = {{"pins","pins"},{"cdc","cdc"},{"status","status"}};
 constexpr Word SUB_I2C[]    = {{"on","on"},{"off","off"},{"status","status"}};
 constexpr Word SUB_PIO[]    = {{"capture","capture"}};
-constexpr Word SUB_FLASH[]  = {{"hex","hex"},{"erase","erase"},{"finalize","finalize"}};
 constexpr Word SUB_BP[]     = {{"clr","clr"}};   // blosse Adresse = Breakpoint setzen
+constexpr Word SUB_ONOFF[]  = {{"on","on"},{"off","off"}};
 
 template <int N> constexpr int wcount(const Word (&)[N]) { return N; }
 
@@ -504,8 +503,8 @@ bool get_subtable(const char* cmd, const Word*& tbl, int& cnt) {
     if (!std::strcmp(cmd, "uart"))   { tbl = SUB_UART;   cnt = wcount(SUB_UART);   return true; }
     if (!std::strcmp(cmd, "i2c"))    { tbl = SUB_I2C;    cnt = wcount(SUB_I2C);    return true; }
     if (!std::strcmp(cmd, "pio"))    { tbl = SUB_PIO;    cnt = wcount(SUB_PIO);    return true; }
-    if (!std::strcmp(cmd, "flash"))  { tbl = SUB_FLASH;  cnt = wcount(SUB_FLASH);  return true; }
     if (!std::strcmp(cmd, "bp"))     { tbl = SUB_BP;     cnt = wcount(SUB_BP);     return true; }
+    if (!std::strcmp(cmd, "autostart")) { tbl = SUB_ONOFF; cnt = wcount(SUB_ONOFF); return true; }
     return false;
 }
 
@@ -736,22 +735,11 @@ void handle_command(char* line) {
         std::strcmp(tokens[0], "status") == 0)  { cmd_status(); return; }
 
     // --- Firmware ---
-    if (std::strcmp(tokens[0], "upload") == 0 ||
-        (std::strcmp(tokens[0], "flash") == 0 && n >= 2 &&
-         std::strcmp(tokens[1], "hex") == 0)) {
+    if (std::strcmp(tokens[0], "upload") == 0) {
         // Kein Auto-Erase: HEX wird additiv in den vorhandenen Slot gemischt,
         // damit z. B. ein zuvor geladener Bootloader erhalten bleibt. Zum
         // vollstaendigen Loeschen 'erase' verwenden.
-        stop_guest_for_reflash();   // XIP-Schutz fuer den folgenden Stream
-        static hex::Parser parser(hex_writer, 0x0000'0000, 64u * 1024u);
-        parser = hex::Parser(hex_writer, 0x0000'0000, 64u * 1024u);
-        g_hex_parser = &parser;
-        g_in_hex_upload = true;
-        std::puts("hex: stream Intel-Hex Zeilen (additiv), Ende mit leerer Zeile");
-        return;
-    }
-    if (std::strcmp(tokens[0], "xmodem") == 0) {
-        cmd_xmodem();
+        cmd_upload();
         return;
     }
     if (std::strcmp(tokens[0], "info") == 0)  { cmd_info(); return; }
@@ -798,9 +786,7 @@ void handle_command(char* line) {
         std::puts("--- ende ---");
         return;
     }
-    if (std::strcmp(tokens[0], "erase") == 0 ||
-        (std::strcmp(tokens[0], "flash") == 0 && n >= 2 &&
-         std::strcmp(tokens[1], "erase") == 0)) {
+    if (std::strcmp(tokens[0], "erase") == 0) {
         stop_guest_for_reflash();   // XIP-Schutz
         bool ok = storage::firmware_erase();
         if (ok) {
@@ -871,8 +857,12 @@ void handle_command(char* line) {
         return;
     }
     if (std::strcmp(tokens[0], "reset") == 0) {
+        // Frueher nur emulator::stop() -> Gast blieb stehen (entsprach 'halt').
+        // Jetzt echtes Reset-Verhalten: stoppen und aus dem Flash-Slot neu starten.
         emulator::stop();
-        std::puts("reset");
+        if (storage::firmware_size() == 0) { std::puts("reset: keine Firmware geladen"); return; }
+        emulator::load_and_start();
+        std::puts("reset: Gast neu gestartet");
         return;
     }
     if (std::strcmp(tokens[0], "autostart") == 0 && n >= 2) {
@@ -955,25 +945,7 @@ void handle_command(char* line) {
         }
         if (std::strcmp(tokens[1], "reset") == 0) {
             config::apply_default_pinmap();
-            std::puts("pinmap defaults restored");
-            return;
-        }
-    }
-
-    if (std::strcmp(tokens[0], "freq") == 0 && n == 2) {
-        long hz;
-        if (!parse_int(tokens[1], 1, 150'000'000, hz)) { std::puts("err"); return; }
-        config::set_target_frequency_hz(static_cast<uint32_t>(hz));
-        std::puts("ok");
-        return;
-    }
-
-    if (std::strcmp(tokens[0], "flash") == 0 && n >= 2) {
-        if (std::strcmp(tokens[1], "finalize") == 0 && n == 3) {
-            long len;
-            if (!parse_int(tokens[2], 1, 64L * 1024, len)) { std::puts("err"); return; }
-            stop_guest_for_reflash();   // XIP-Schutz
-            std::puts(storage::firmware_finalize(static_cast<std::size_t>(len)) ? "ok" : "err");
+            persist_pinmap_change();   // sonst nach Power-Cycle wieder die alte Map
             return;
         }
     }
@@ -1227,12 +1199,16 @@ void handle_command(char* line) {
             config::set_i2c_bridge_scl_pin(static_cast<int>(scl));
             config::set_i2c_bridge_hz(static_cast<uint32_t>(hz));
             config::set_i2c_bridge_enabled(true);
-            std::puts("ok (wird beim naechsten Start/Reset aktiv)");
+            usb_msc::refresh_config_volume(/*trigger_host_reread=*/false);
+            usb_msc::request_config_persist();
+            std::puts("ok (wirkt beim naechsten 'reset'; dauerhaft per 'cfg save' oder beim Gast-Stop)");
             return;
         }
         if (std::strcmp(tokens[1], "off") == 0) {
             config::set_i2c_bridge_enabled(false);
-            std::puts("ok (wird beim naechsten Start/Reset wirksam)");
+            usb_msc::refresh_config_volume(/*trigger_host_reread=*/false);
+            usb_msc::request_config_persist();
+            std::puts("ok (wirkt beim naechsten 'reset'; dauerhaft per 'cfg save' oder beim Gast-Stop)");
             return;
         }
         if (std::strcmp(tokens[1], "status") == 0) {
@@ -1255,40 +1231,6 @@ void handle_command(char* line) {
         } else {
             std::puts("unvollstaendig — 'help' fuer die Syntax");
         }
-    }
-}
-
-void process_hex_line(const char* line) {
-    if (*line == '\0') {
-        // Leerzeile beendet Upload-Modus.
-        uint32_t bw = g_hex_parser ? g_hex_parser->bytes_written() : 0;
-        if (bw > 0) {
-            storage::firmware_finalize(bw);
-            std::printf("[upload] %lu bytes, CRC ok\n",
-                        static_cast<unsigned long>(bw));
-        } else {
-            std::puts("[upload] abgebrochen (keine Daten)");
-        }
-        g_in_hex_upload = false;
-        g_hex_parser = nullptr;
-        return;
-    }
-    if (!g_hex_parser) return;
-    for (const char* p = line; *p; ++p) g_hex_parser->feed(*p);
-    auto r = g_hex_parser->feed('\n');
-    using R = hex::Result;
-    if (r == R::BadFormat || r == R::BadChecksum || r == R::OutOfRange ||
-        r == R::Overflow) {
-        std::printf("hex error: %d\n", static_cast<int>(r));
-        g_in_hex_upload = false;
-        g_hex_parser = nullptr;
-    } else if (r == R::EndOfFile) {
-        uint32_t bw = g_hex_parser->bytes_written();
-        storage::firmware_finalize(bw);
-        std::printf("[upload] %lu bytes, CRC ok\n",
-                    static_cast<unsigned long>(bw));
-        g_in_hex_upload = false;
-        g_hex_parser = nullptr;
     }
 }
 
@@ -1348,8 +1290,8 @@ void run() {
             last_cr = (c == '\r');
             std::putchar('\n');
             line[len] = '\0';
-            if (g_in_hex_upload) process_hex_line(line);
-            else { history_push(line); handle_command(line); }
+            history_push(line);
+            handle_command(line);
             len = 0;
             hist_browse = 0;
             std::printf("emu> ");
@@ -1366,7 +1308,7 @@ void run() {
         if (c == 27) {
             int c1 = getchar_timeout_us(3'000);
             int c2 = (c1 == '[') ? getchar_timeout_us(3'000) : PICO_ERROR_TIMEOUT;
-            if (!g_in_hex_upload && c1 == '[' && (c2 == 'A' || c2 == 'B')) {
+            if (c1 == '[' && (c2 == 'A' || c2 == 'B')) {
                 if (c2 == 'A') {                       // hoch: aelter
                     if (hist_browse < g_hist_count) ++hist_browse;
                 } else {                               // runter: neuer
@@ -1382,9 +1324,9 @@ void run() {
             continue;   // andere ESC-Sequenzen ignorieren
         }
 
-        // --- TAB: Befehl/Option vervollstaendigen (nicht im Upload-Modus).
+        // --- TAB: Befehl/Option vervollstaendigen.
         if (c == '\t') {
-            if (!g_in_hex_upload) complete_input(line, len);
+            complete_input(line, len);
             continue;
         }
 
@@ -1396,7 +1338,7 @@ void run() {
             // Schutz gegen Overlong-Lines
             len = 0;
             std::puts("\nerr: line too long");
-            std::printf("> ");
+            std::printf("emu> ");
             continue;
         }
         if (c >= 32 && c < 127) {

@@ -48,9 +48,9 @@ Legende: ⬜ offen · ✅ ok · ❌ Fehler
 | # | Test | Schritte | Erwartung | Status |
 |---|------|----------|-----------|:------:|
 | C1 | USB-MSC | `t1_blink.hex` als `BOOT.HEX` aufs Volume, auswerfen | LED an GP9 blinkt (Autostart); HEX verschwindet danach vom Laufwerk | ⬜ |
-| C2 | CLI-Upload | `upload`, dann `t2_uart_echo.hex` als Plain-Text senden | `[upload] … bytes … CRC` | ⬜ |
+| C2 | CLI-Upload (Prüfsumme) | `upload`, dann `.hex` per XMODEM (Checksum-Modus) senden | `[upload] ok …` | ⬜ |
 | C3 | `info` | nach C2 `info` | Reset-Vektor/Stack/Size plausibel | ⬜ |
-| C4 | XMODEM | `xmodem`, dann `.hex` per XMODEM-1K senden (Tera Term/`sx -k`) | `[xmodem] … CRC ok` | ⬜ |
+| C4 | XMODEM-1K | `upload`, dann `.hex` per XMODEM-1K senden (Tera Term/`sx -k`) | `[upload] ok …` | ⬜ |
 | C5 | GDB-Load | `arm-none-eabi-gdb`, `target extended-remote <GDB-CDC>`, `load` | Übertragung ohne Fehler | ⬜ |
 | C6 | Run/Halt | `run` … `halt` … `run` | State wechselt Running/Halted (LED) | ⬜ |
 
@@ -184,7 +184,7 @@ Beispiel-HEX aus [../examples](../examples).
 | `run` → HardFault (LED flackert) | Stack-Top außerhalb 0x10000000–0x10001FFF — Details in `FAULT.TXT` / seriellem `[FAULT]`-Block |
 | Zweite App ersetzt BL nicht | Laden ist **additiv** – vor Vollersatz `erase` |
 | BL springt nicht in App | `app_start` ≠ `applicationFirstAddress`, oder `autodesc=off` |
-| `xmodem` „kein Sender erkannt" | Sender ohne CRC/1K, falscher Port |
+| `upload` „kein XMODEM-Sender erkannt" | Transfer nicht binnen 30 s gestartet, falscher Port |
 | ADC konstant ~512 | ADC-Bridge nicht aktiv (`adc_bridge_en=1`) |
 
 Details: [USERGUIDE.md](USERGUIDE.md) · [TECHNICAL.md](TECHNICAL.md) ·

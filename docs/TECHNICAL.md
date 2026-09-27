@@ -477,7 +477,7 @@ der Gast startet neu, USB/CLI bleiben.
 Ein Flash-Erase/Program stallt XIP; läuft währenddessen Code aus dem Flash,
 crasht der betroffene Core. Betroffen sind zwei Pfade:
 
-* **Core 0 schreibt** (CLI `upload`/`erase`/`finalize`, `xmodem`, `cfg save`,
+* **Core 0 schreibt** (CLI `upload`/`erase`, `cfg save`,
   USB-MSC-Eject): Vor dem Schreiben wird der Gast pausiert
   (`emulator::FlashPauseGuard` → `pause_for_flash()` → `stop()`), sodass Core 1
   in der SDK-Spin-Schleife steht (SDK-VTOR). `stop()` legt zudem Core 0s
@@ -676,11 +676,13 @@ RP2350-SRAM zeigt.
 ## 19. XMODEM-Upload (CLI)
 
 [src/xmodem.cpp](../src/xmodem.cpp) implementiert einen **XMODEM-CRC/1K-
-Empfänger** als robuste Alternative zum reinen HEX-Paste auf CDC#0 (das bei
-fehlender Flusskontrolle Zeichen verlieren kann).
+Empfänger**; er ist der einzige serielle Upload-Weg (der frühere HEX-Paste-
+Modus wurde entfernt).
 
-* Blockgrößen: `SOH`=128 Byte, `STX`=1024 Byte; Sync per `'C'` (CRC-Mode).
-* Integritätsprüfung: CRC16-CCITT (Poly `0x1021`) je Block, `ACK`/`NAK`.
+* Blockgrößen: `SOH`=128 Byte, `STX`=1024 Byte; Sync zunächst per `'C'`
+  (CRC-Mode), nach ~6 s Fallback auf `NAK` (klassische 8-Bit-Prüfsumme).
+* Integritätsprüfung: CRC16-CCITT (Poly `0x1021`) bzw. Prüfsumme je Block,
+  `ACK`/`NAK`.
 * `xmodem::receive(sink, ctx, pump, bytes)` ist blockierend, ruft aber je
   Poll-Iteration `pump()` (= `usb_stdio_task` → `tud_task`) auf, damit der
   USB-CDC-Stack während des Empfangs bedient wird.
@@ -688,7 +690,7 @@ fehlender Flusskontrolle Zeichen verlieren kann).
   EOF-Record wird `storage::firmware_finalize()` aufgerufen. XMODEM-Padding
   (`0x1A`) nach EOF wird verworfen.
 
-CLI: `xmodem` → „Empfang bereit", dann die `.hex`-Datei mit einem XMODEM-
+CLI: `upload` (Alias `xmodem`) → „bereit", dann die `.hex`-Datei mit einem XMODEM-
 fähigen Terminal (Tera Term, `sx`/`lrzsz`) senden.
 
 ---

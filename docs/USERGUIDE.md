@@ -98,14 +98,13 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 | `help`              | Liste aller Befehle                                  |
 | `version`           | Build-Info, Pico-SDK, Emulator-Rev                   |
 | `stats`             | MMIO-/Fault-/IRQ-Counter                             |
-| `reset`             | Emulator-Core neu starten                            |
+| `reset`             | Gast neu starten (wie Reset-Taste am LPC)            |
 
 ### Firmware
 
 | Befehl              | Wirkung                                              |
 |---------------------|------------------------------------------------------|
-| `upload`            | wartet auf Intel-HEX-Stream auf der CLI-CDC (**additiv**) |
-| `xmodem`            | Intel-HEX per XMODEM-CRC/1K empfangen (robust)       |
+| `upload`            | Intel-HEX per XMODEM empfangen (**additiv**; Alias `xmodem`) |
 | `info`              | zeigt Reset-Vector, Stack, Größe, CRC                |
 | `erase`             | Firmware-Slot komplett leeren                        |
 | `run`               | Guest starten                                        |
@@ -356,37 +355,29 @@ wfi_pin_wakeup=off      # on = WFI der Firmware auf Pin-IRQ-Wakeup patchen
 > CONFIG.INI-Werte werden beim Einlesen dauerhaft gespeichert; UART-/I²C-
 > Bridge werden sofort (ohne Power-Cycle) angewandt.
 
-### Variante B: Intel-HEX über CLI
+### Variante B: Intel-HEX per XMODEM über die CLI
+
+`upload` empfängt die `.hex`-Datei per XMODEM (blockweise mit CRC-16 bzw.
+Prüfsumme und ACK/NAK – kein Zeichenverlust, keine Zeilenlängengrenze). Der
+frühere Klartext-Stream („Send file", Protocol *plain*) wurde entfernt, da er
+ohne Handshake und Prüfsumme arbeitete.
 
 ```
 emu> upload
-... <jetzt HEX-Datei senden> ...
-[upload] 16234 bytes, 12 records, CRC32=0xA8B3F210
-emu> info
-Reset:  0x00000A85    Stack: 0x10001FF8    Size: 16234    CRC32: 0xA8B3F210
-emu> run
-[guest] running...
-```
-
-In *PuTTY*/*Tera Term*: „Send file" → Datei `.hex` wählen, Protocol: **plain**.
-
-### Variante B2: XMODEM-CRC/1K über CLI (robust gegen Zeichenverlust)
-
-Der reine HEX-Stream (Variante B) kann bei schnellem „Einfügen" ohne
-Flusskontrolle einzelne Zeichen verlieren. `xmodem` überträgt blockweise
-mit CRC-Prüfung und ACK/NAK und ist dadurch zuverlässig:
-
-```
-emu> xmodem
-xmodem: Empfang (CRC/1K, additiv) bereit - Datei jetzt senden...
+upload: bereit fuer Intel-HEX per XMODEM (additiv, 30 s Zeit).
+        Im Terminal jetzt 'XMODEM senden' waehlen (Ctrl-X x5 = Abbruch).
 ... <jetzt .hex per XMODEM senden> ...
-[xmodem] 16234 hex-bytes (16896 roh empfangen), CRC ok
+[upload] ok: HEX bis Adresse 0x03f6a geschrieben (16384 Bytes empfangen). 'run' startet den Gast.
+emu> run
 ```
 
-Sender-Seite:
+Sender-Seite (Varianten CRC, 1K und klassische Prüfsumme werden erkannt):
 
-* **Tera Term:** *Datei → Transfer → XMODEM → Send…*, Option **1K** wählen,
-  die `.hex`-Datei auswählen.
+* **Tera Term:** *Datei → Transfer → XMODEM → Senden…*, `.hex`-Datei
+  auswählen (Option 1K empfohlen).
+* **minicom:** `Ctrl-A S` → *xmodem*.
+* **PuTTY** kann kein XMODEM – dafür Tera Term, minicom oder ExtraPuTTY
+  nutzen oder die HEX-Datei aufs USB-Laufwerk kopieren (Variante A).
 * **Linux/macOS:** `sx -k -X firmware.hex < /dev/ttyACM0 > /dev/ttyACM0`
   (aus `lrzsz`; `-k` = 1K-Blöcke).
 
@@ -731,15 +722,14 @@ Entsprechende CONFIG.INI-Schlüssel: `uart0_cdc`, `uart0_tx`, `uart0_rx`.
 | KNX-RX leer                               | Pinmap und sblib-Konstanten gegenchecken           |
 | Zweite App ersetzt Bootloader nicht / alte Reste | Laden ist **additiv** – vor Vollersatz `erase`     |
 | Bootloader springt nicht in App           | `app_start` ≠ `applicationFirstAddress`, oder `autodesc=off` – Log `[EMU] Boot-Descriptor …` prüfen |
-| `xmodem` „kein Sender erkannt"            | Sender nutzt kein CRC/1K, oder falscher COM-Port    |
+| `upload` „kein XMODEM-Sender erkannt"     | Transfer nicht binnen 30 s gestartet, oder falscher COM-Port |
 
 ---
 
 ## 10. Quick-Reference
 
 ```
-upload          # HEX laden (additiv)
-xmodem          # HEX per XMODEM-CRC/1K laden (robust)
+upload          # HEX per XMODEM laden (additiv)
 erase           # Firmware-Slot komplett löschen
 run / halt      # Guest steuern
 gdb on          # GDB-Stub auf der GDB-CDC

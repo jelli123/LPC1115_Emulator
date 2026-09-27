@@ -16,7 +16,8 @@ constexpr uint8_t NAK = 0x15;
 constexpr uint8_t CAN = 0x18; // Abbruch
 constexpr uint8_t C   = 'C';  // CRC-Modus anfordern
 
-constexpr int      MAX_SYNC_TRIES = 16;   // ~16 s auf Sender-Start warten
+constexpr int      MAX_SYNC_TRIES = 30;   // ~30 s auf Sender-Start warten
+constexpr int      CRC_SYNC_TRIES = 6;    // danach auf Pruefsummen-Modus (NAK) wechseln
 constexpr int      MAX_ERRORS     = 10;   // Fehlerbloecke bis Abbruch
 constexpr uint32_t BYTE_TIMEOUT   = 1'000'000u; // 1 s pro Zeichen
 
@@ -68,13 +69,21 @@ Result receive(DataSink sink, void* ctx, Pump pump, uint32_t& bytes_received) {
     bytes_received = 0;
     static uint8_t block[1024];
 
-    // --- Synchronisation: 'C' senden, bis der Sender den ersten Block schickt.
-    int first = PICO_ERROR_TIMEOUT;
-    for (int tries = 0; tries < MAX_SYNC_TRIES; ++tries) {
-        put_ctrl(C);
-        first = rx_byte(BYTE_TIMEOUT, pump);
-        if (first == SOH || first == STX || first == EOT || first == CAN) break;
-        first = PICO_ERROR_TIMEOUT;
+    // --- Synchronisation: zuerst 'C' (CRC-16) anfordern; reagiert der Sender
+    // nicht, auf den klassischen Pruefsummen-Modus (NAK) zurueckfallen. Manche
+    // Terminals (z. B. Tera Term mit Option "Checksum") warten nur auf NAK.
+    // Nicht-Protokoll-Bytes (z. B. das LF eines CRLF nach dem Befehl) werden
+    // verworfen, ohne einen Versuch zu verbrauchen.
+    int  first = PICO_ERROR_TIMEOUT;
+    bool use_crc = true;
+    for (int tries = 0; tries < MAX_SYNC_TRIES && first == PICO_ERROR_TIMEOUT; ++tries) {
+        use_crc = tries < CRC_SYNC_TRIES;
+        put_ctrl(use_crc ? C : NAK);
+        absolute_time_t until = make_timeout_time_us(BYTE_TIMEOUT);
+        while (!time_reached(until)) {
+            int b = rx_byte(10'000u, pump);
+            if (b == SOH || b == STX || b == EOT || b == CAN) { first = b; break; }
+        }
     }
     if (first == PICO_ERROR_TIMEOUT) return Result::SyncFailed;
     if (first == CAN)               return Result::Canceled;
@@ -115,15 +124,23 @@ Result receive(DataSink sink, void* ctx, Pump pump, uint32_t& bytes_received) {
             if (b == PICO_ERROR_TIMEOUT) { frame_ok = false; break; }
             block[i] = static_cast<uint8_t>(b);
         }
+        // CRC-Modus: 2 Byte CRC-16 (MSB zuerst); Pruefsummen-Modus: 1 Byte Summe.
         int crc_hi = frame_ok ? rx_byte(BYTE_TIMEOUT, pump) : PICO_ERROR_TIMEOUT;
-        int crc_lo = frame_ok ? rx_byte(BYTE_TIMEOUT, pump) : PICO_ERROR_TIMEOUT;
+        int crc_lo = (frame_ok && use_crc) ? rx_byte(BYTE_TIMEOUT, pump) : 0;
         if (crc_hi == PICO_ERROR_TIMEOUT || crc_lo == PICO_ERROR_TIMEOUT) frame_ok = false;
 
         // Rahmen-/Pruefsummenvalidierung.
         if (frame_ok) {
-            uint16_t want = static_cast<uint16_t>((crc_hi << 8) | crc_lo);
-            uint16_t got  = crc16_ccitt(block, data_len);
-            if (((blk + nblk) & 0xFF) != 0xFF || want != got) frame_ok = false;
+            bool sum_ok;
+            if (use_crc) {
+                uint16_t want = static_cast<uint16_t>((crc_hi << 8) | crc_lo);
+                sum_ok = (want == crc16_ccitt(block, data_len));
+            } else {
+                uint8_t sum = 0;
+                for (std::size_t i = 0; i < data_len; ++i) sum = static_cast<uint8_t>(sum + block[i]);
+                sum_ok = (sum == static_cast<uint8_t>(crc_hi));
+            }
+            if (((blk + nblk) & 0xFF) != 0xFF || !sum_ok) frame_ok = false;
         }
 
         if (!frame_ok) {

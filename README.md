@@ -284,7 +284,7 @@ vor der App (Default `app_start − 0x100`).
 
 Der Emulator unterstützt diesen Ablauf direkt:
 
-* **Mergendes Laden:** `upload`/`xmodem`/`BOOT.HEX` schreiben **additiv** in
+* **Mergendes Laden:** `upload`/`BOOT.HEX` schreiben **additiv** in
   den 64-KiB-Slot (Sektor-Read-Modify-Write). Eine zweite Datei (z. B. die
   App) überschreibt den zuvor geladenen Bootloader **nicht**. Vollständiges
   Löschen nur explizit über `erase` (CLI) bzw. `flash_erase=on` (CONFIG.INI).
@@ -321,13 +321,11 @@ KNX-Bus** in den emulierten Bootloader geschrieben werden (IAP-Pfad).
 | `config get/set/save/dump`    | persistierte Konfiguration                    |
 | `pin set <lpc> <rp\|-1>`      | Pin-Mapping setzen                            |
 | `pin show`                    | aktuelles Pin-Mapping                         |
-| `freq <Hz>`                   | nur Konfig (RP2350-Takt folgt der Gast-PLL)   |
-| `upload` / `flash hex`        | Intel-Hex-Upload (**additiv/mergend**)        |
-| `xmodem`                      | Intel-Hex per XMODEM-CRC/1K empfangen         |
-| `erase` / `flash erase`       | Firmware-Slot komplett löschen                |
-| `flash finalize <bytes>`      | CRC-Marker setzen                             |
+| `upload` (Alias `xmodem`)     | Intel-HEX per XMODEM (**additiv/mergend**)    |
+| `erase`                       | Firmware-Slot komplett löschen                |
 | `run`                         | Gast starten (Core 1)                         |
-| `stop` / `reset`              | Core 1 abschießen + neu booten                |
+| `stop`                        | Gast anhalten                                 |
+| `reset`                       | Gast neu starten                              |
 | `gdb on/off/status`           | GDB-Stub auf USB-CDC #1                       |
 | `swd start <dio> <clk>`       | SWD-Target auf RP-GPIOs (clk = dio+1)         |
 | `swd stop` / `swd status`     | SWD-Target stoppen / Zustand                  |
