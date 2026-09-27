@@ -427,7 +427,13 @@ void systick_program_hw() {
     // der Host-Tick weiterlaufen, bis alle ausgeliefert sind — auch wenn der Gast
     // kein SysTick nutzt und kein weiterer Match ansteht. Sonst blieben die
     // uebrigen IRQs bis zum naechsten Ausloeser liegen.
-    const bool irq_waiting = vnvic::irq_pending();
+    // Nur IRQs, die JETZT zustellbar sind, rechtfertigen einen schnellen
+    // Re-Arm. Laeuft gerade ein injizierter Handler, wird der pendende IRQ bei
+    // dessen Ruecksprung nachgeliefert (note_injected_return). Frueher erzwang
+    // jeder pendende IRQ einen 30-us-Takt; da der Shim selbst etwa so lange
+    // braucht, bekam der Handler keine Rechenzeit mehr -> Livelock (Gast fror
+    // z. B. im CT16B1-Handler ein, waehrend UART0 wartete).
+    const bool irq_waiting = vnvic::irq_pending() && irq_inject::can_inject_now();
 
     if (!guest_irq && !ct_pending && !irq_waiting) {
         systick_hw->csr = 0u;           // nichts braucht eine Host-Taktquelle
@@ -1444,16 +1450,17 @@ uint64_t next_ct_irq_deadline_us(uint64_t now) {
         if (!c.enabled) continue;
         uint64_t mask   = c.is32 ? 0xFFFF'FFFFull : 0xFFFFull;
         uint64_t period = mask + 1u;
-        double tick_us  = static_cast<double>(c.pre + 1u) * 1'000'000.0
-                          / static_cast<double>(hz);       // us pro TC-Inkrement
-        if (tick_us <= 0.0) continue;
+        // Ganzzahlig (kein Soft-Float-double im Shim): us = delta*(pre+1)*1e6/hz.
         for (int m = 0; m < 4; ++m) {
             uint32_t mcr_m = (c.mcr >> (m * 3)) & 0x7u;
             if (!(mcr_m & 0x1u)) continue;                 // nur Interrupt-Matches
             uint64_t delta = (static_cast<uint64_t>(c.mr[m]) - c.tc) & mask;
             if (delta == 0u) delta = period;               // gerade getroffen -> ganzer Zyklus
-            double   d_us     = static_cast<double>(delta) * tick_us;
-            uint64_t deadline = now + static_cast<uint64_t>(d_us + 0.5);
+            const uint64_t ticks = delta * (static_cast<uint64_t>(c.pre) + 1u);
+            const uint64_t d_us  = (ticks < ~uint64_t(0) / 1'000'000u)
+                                       ? (ticks * 1'000'000u + hz / 2u) / hz
+                                       : (ticks / hz) * 1'000'000u;   // Ueberlaufschutz
+            uint64_t deadline = now + d_us;
             if (deadline < best) best = deadline;
         }
     }

@@ -225,6 +225,10 @@ uint32_t inject_depth_live() {
     return d < 0 ? 0u : static_cast<uint32_t>(d);
 }
 
+bool can_inject_now() {
+    return g_inject_depth == 0 && !vnvic::primask();
+}
+
 void reset_inject_depth() {
     g_inject_depth = 0;
 }
