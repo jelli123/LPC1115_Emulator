@@ -339,7 +339,7 @@ wfi_pin_wakeup=off      # on = WFI der Firmware auf Pin-IRQ-Wakeup patchen
 > Host-Loop; eine reine `__WFI()`-Warteschleife der Firmware wird sonst nur
 > durch einen MMIO-Zugriff wieder „geweckt". Mit `wfi_pin_wakeup=on` werden
 > beim Laden alle `WFI`-Instruktionen auf einen SVC-Trap gepatcht. Der Host
-> pollt dann echte RP2350-Pin-Flanken (PINT/GINT) sowie die Timer-/WWDT-
+> pollt dann echte RP2350-Pin-Flanken (GPIO-/Start-Logik-Interrupts) sowie die Timer-/WWDT-
 > Modelle und injiziert fällige LPC-IRQs.
 > Einschränkungen: (1) Es wird aktiv gepollt — funktional korrekt, aber
 > **nicht stromsparend**. (2) `WFI` mit aktivierten Interrupts läuft über

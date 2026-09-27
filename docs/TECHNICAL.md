@@ -361,7 +361,7 @@ alle `WFI` (Thumb `0xBF30`) auf `SVC #0` (`0xDF00`) gepatcht
 ([src/hex_patcher.cpp](../src/hex_patcher.cpp) `patch_wfi_to_svc`) und der
 SVC-Vektor (Slot 11) auf `isr_svc_wfi`
 ([src/emulator.cpp](../src/emulator.cpp)) umgebogen. Der Handler pollt
-`peripherals::sample_pin_interrupts()` (echte PINT/GINT-Flanken) und
+`peripherals::sample_pin_interrupts()` (GPIO- und Start-Logik-Flanken) und
 `peripherals::poll_timed_sources()` (CT16/CT32/WWDT) und kehrt mit
 gesetztem PendSV zurück, sobald ein vom Gast aktivierter IRQ pending wird.
 

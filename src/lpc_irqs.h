@@ -12,16 +12,10 @@
 namespace lpc_irq {
 
 enum : uint8_t {
-    PIN_INT0       = 0,
-    PIN_INT1       = 1,
-    PIN_INT2       = 2,
-    PIN_INT3       = 3,
-    PIN_INT4       = 4,
-    PIN_INT5       = 5,
-    PIN_INT6       = 6,
-    PIN_INT7       = 7,
-    GINT0          = 8,
-    GINT1          = 9,
+    // 0..12: Start-Logik PIO0_0..PIO0_11, PIO1_0 (Index = Eingang)
+    START_PIO0_0   = 0,
+    START_PIO1_0   = 12,
+    C_CAN          = 13,
     SSP1           = 14,
     I2C0           = 15,
     CT16B0         = 16,

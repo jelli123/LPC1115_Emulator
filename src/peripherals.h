@@ -32,7 +32,7 @@ bool mmio_write8(uint32_t addr, uint8_t   val);
 // des Gastes auf dem RP2350 eingestellt wurde (0 = Default 48 MHz IRC).
 uint32_t current_cpu_hz();
 
-// Liest echte Eingänge, erkennt Flanken und pendet PINT-/GINT-IRQs.
+// Liest echte Eingänge, erkennt Flanken und pendet GPIO- (PIO_0..3) und Start-Logik-IRQs (0..12).
 // Normalerweise aus dem MMIO-Trap aufgerufen; bei aktivem WFI-Pin-Wakeup
 // auch aus dem SVC-Warte-Handler (src/emulator.cpp), damit eine reine
 // WFI-Warteschleife durch echte Pin-Flanken geweckt werden kann.

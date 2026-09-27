@@ -142,8 +142,8 @@ Mapping LPC-Peripherie → IRQ-Index ist zentral in
 | ADC              | nutzbar     | 24         | sofortige Wandlung, ADC-IRQ     |
 | WWDT             | nutzbar     | 25         | echtes Timeout, Soft-Reset des Guests |
 | BOD              | TODO        | 26         | nicht modelliert                |
-| PINT (PIN_INT0..7)| nutzbar²   | 0..7       | PINTSEL + Edge/Level, IRQ via irq_inject |
-| GINT0/GINT1      | nutzbar²    | 8/9        | Gruppen-Match (AND/OR), IRQ via irq_inject |
+| GPIO-Interrupts  | nutzbar²    | 28..31     | IS/IBE/IEV/IE/RIS/MIS/IC je Port (PIO_0..3) |
+| Start-Logik      | nutzbar²    | 0..12      | STARTAPRP0/ERP0/SRP0 (PIO0_0..11, PIO1_0) |
 
 ¹ Aktivierung per CLI `i2c on <inst> <sda> <scl> [hz]` (wirkt nach Reset).
   Ohne Bridge bleibt das alte Stub-Verhalten. Schreib-Adress-ACK wird
@@ -370,11 +370,10 @@ auskommentierte Optionen). Die Feld- und Abkürzungs-Erklärungen stehen in
 
 * **Peripherie-Modelle**: GPIO0 (inkl. Eingangspegel), SYSCON, UART0,
   CT16B0/B1, CT32B0/B1, SSP0/SSP1, I²C0 (HW-Bridge), ADC, WWDT sowie
-  PINT (PIN_INT0..7) und GINT0/GINT1 sind modelliert (siehe
+  GPIO-Interrupts (PIO_0..3) und die Start-Logik (IRQ 0..12) sind modelliert (siehe
   [peripherals.cpp](src/peripherals.cpp)). Noch offen: BOD.
-* **Pin-Interrupts (PINT/GINT)** werden nur abgetastet, wenn der Gast
-  einen MMIO-Zugriff auslöst (synchrones Core-1-Modell). Ein reiner
-  `WFI`-Wartepunkt ohne MMIO kann nicht durch Pin-IRQs geweckt werden.
+* **Pin-Interrupts (GPIO/Start-Logik)** werden bei jedem MMIO-Trap und im
+  SysTick-Shim (≤ 1 ms) abgetastet, nicht flankengenau per Hardware-IRQ.
 * **I²C-Bridge**: Schreib-Transaktionen werden gepuffert und beim STOP/
   Repeated-START geflusht; das Adress-ACK wird währenddessen optimistisch
   gemeldet. Lese-Transaktionen lesen lazy Byte-für-Byte (passt zu

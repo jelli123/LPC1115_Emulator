@@ -85,7 +85,8 @@ Jeweils HEX laden (Weg aus Abschnitt C) und `run`.
 | F1 | SSP/SPI-Loopback | SSP0 senden, RX lesen | RX == TX (Loopback-Modell) | ⬜ |
 | F2 | I²C-Bridge | `i2c on <inst 0\|1> <sda> <scl> [hz]`, `reset`, echten Slave anschließen | Slave antwortet (ACK/Daten) | ⬜ |
 | F3 | WWDT-Reset | Firmware mit WDT ohne Feed | Guest-Reset (LED), RP2350 bleibt aktiv | ⬜ |
-| F4 | PINT/GINT | Firmware mit Pin-Interrupt, Flanke an gemapptem GPIO | ISR feuert (bei MMIO-Aktivität) | ⬜ |
+| F4 | GPIO-IRQ | Firmware mit `attachInterrupt` (PIOINTn), Flanke an gemapptem GPIO | PIOINTn_IRQHandler feuert | ⬜ |
+| F4b | Start-Logik | STARTERP0/APRP0 fuer PIO0_x setzen, Flanke anlegen | IRQ 0..11 feuert, STARTSRP0 gesetzt | ⬜ |
 | F5 | WFI-Wakeup | `cfg set wfi_pin_wakeup on`, Firmware mit `__WFI()` | Pin-Flanke weckt Guest (opt-in) | ⬜ |
 | F6 | BOD | Firmware setzt `BODRSTENA` | echte RP2350-POWMAN-BOD aktiv | ⬜ |
 
