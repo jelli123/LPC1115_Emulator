@@ -26,6 +26,8 @@ extern "C" void usb_stdio_task(void);
 
 #include "pico/stdlib.h"
 #include "pico/version.h"
+#include "pico/bootrom.h"
+#include "hardware/watchdog.h"
 
 namespace {
 
@@ -46,21 +48,7 @@ bool hex_writer(uint32_t offset, const uint8_t* data, std::size_t len) {
 // 'run' neu -> kein Auto-Resume.
 void stop_guest_for_reflash() {
     if (emulator::pause_for_flash())
-        std::puts("[CLI] Gast fuer Flash-Zugriff gestoppt ('run' zum Neustart)");
-}
-
-// Wendet ausgewaehlte Schluessel sofort auf die laufende Konfiguration an,
-// damit ein direkt folgendes 'run' sie ohne Power-Cycle beruecksichtigt
-// (andere Keys greifen erst nach erneutem config::load() beim Boot).
-void apply_live_config_key(const char* key, const char* val) {
-    if (std::strcmp(key, config::KEY_APP_START) == 0)
-        config::set_app_start_addr(
-            static_cast<uint32_t>(std::strtoul(val, nullptr, 0)));
-    else if (std::strcmp(key, config::KEY_DESC_ADDR) == 0)
-        config::set_descriptor_addr(
-            static_cast<uint32_t>(std::strtoul(val, nullptr, 0)));
-    else if (std::strcmp(key, config::KEY_AUTODESC) == 0)
-        config::set_autodesc(val[0] == '1' || std::strcmp(val, "on") == 0);
+        std::puts("[FLASH] Gast fuer Flash-Zugriff gestoppt ('run' zum Neustart)");
 }
 
 // Persistiert eine soeben geaenderte Pinmap in den Flash-Config-Slot und baut
@@ -117,9 +105,12 @@ bool xmodem_hex_sink(const uint8_t* data, std::size_t len, void* ctxv) {
 // verlorene/verfaelschte Zeilen, 192-Zeichen-Zeilenlimit).
 void cmd_upload() {
     stop_guest_for_reflash();   // XIP-Schutz fuer den blockierenden Empfang
+    // Hinweistext bewusst OHNE grosses 'C': ein XMODEM-Sender, der schon
+    // mitliest, wuerde es sonst als CRC-Startanforderung werten.
     std::puts("upload: bereit fuer Intel-HEX per XMODEM (additiv, 30 s Zeit).\n"
-              "        Im Terminal jetzt 'XMODEM senden' waehlen (Ctrl-X x5 = Abbruch).");
+              "        Im Terminal jetzt 'XMODEM senden' waehlen (Strg-X 5x = Abbruch).");
     fflush(stdout);
+    for (int i = 0; i < 20; ++i) { usb_stdio_task(); sleep_ms(5); }   // Text vor dem ersten 'C' ausliefern
     static hex::Parser parser(hex_writer, 0x0000'0000, 64u * 1024u);
     parser = hex::Parser(hex_writer, 0x0000'0000, 64u * 1024u);
     XmodemHexCtx ctx{&parser, false, false};
@@ -159,6 +150,8 @@ const char* const HELP_LINES[] = {
     "Befehle (abkuerzbar auf eindeutiges Praefix, z.B. 'cf sh' = 'cfg show'):",
     "  help [cmd]                 diese Hilfe / Hilfe zu einem Befehl ('?' = help)",
     "  version                    Build-Info",
+    "  reboot                     RP2350 neu starten",
+    "  bootsel                    RP2350 in den USB-Bootloader (picotool/UF2 flashen)",
     "  stats                      Emulatorstatus & Zaehler",
     "  dbg [clear]                Gast-Debug-Ausgabe zeigen/loeschen",
     "  dbg save                   Debug-Ausgabe als DEBUG.TXT aufs Laufwerk",
@@ -234,7 +227,8 @@ void cmd_status() {
         // Geladene Firmware-Datei (Langname der zuletzt via MSC geflashten HEX;
         // "(unbekannt)" = Autostart aus persistiertem Flash-Slot ohne Dateiname).
         const char* hexn = usb_msc::loaded_hex_name();
-        std::printf("Firmware: %s\n", (hexn && hexn[0]) ? hexn : "(unbekannt)");
+        std::printf("Firmware: %s\n", storage::firmware_size() == 0 ? "(keine)"
+                                     : (hexn && hexn[0]) ? hexn : "(unbekannt)");
     }
     std::printf("Gast-Starts=%lu\n",
                 static_cast<unsigned long>(emulator::start_count()));
@@ -420,9 +414,10 @@ void cmd_version() {
 
 void cmd_info() {
     std::printf("LPC1115-Emulator v%s\n", EMU_VERSION);
-    const char* hexn = usb_msc::loaded_hex_name();
-    std::printf("Firmware-Datei: %s\n", (hexn && hexn[0]) ? hexn : "(unbekannt)");
     std::size_t sz = storage::firmware_size();
+    const char* hexn = usb_msc::loaded_hex_name();
+    std::printf("Firmware-Datei: %s\n", sz == 0 ? "(keine)"
+                                       : (hexn && hexn[0]) ? hexn : "(unbekannt)");
     if (sz == 0) { std::puts("(kein Firmware-Image)"); return; }
     const uint8_t* fw = storage::firmware_data();
     uint32_t sp   = *reinterpret_cast<const uint32_t*>(fw);
@@ -476,6 +471,7 @@ struct Word { const char* w; const char* canon; };   // w=Eingabewort, canon=kan
 // Top-Level-Befehle (inkl. Aliase). w==canon markiert den kanonischen Eintrag.
 constexpr Word TOP[] = {
     {"help","help"}, {"?","help"}, {"version","version"},
+    {"reboot","reboot"}, {"bootsel","bootsel"},
     {"stats","stats"}, {"status","stats"},
     {"dbg","dbg"}, {"reset","reset"},
     {"upload","upload"}, {"xmodem","upload"}, {"info","info"},
@@ -751,6 +747,17 @@ void handle_command(char* line) {
         return;
     }
     if (std::strcmp(tokens[0], "version") == 0) { cmd_version(); return; }
+    if (std::strcmp(tokens[0], "reboot") == 0 || std::strcmp(tokens[0], "bootsel") == 0) {
+        const bool bs = tokens[0][0] == 'b';
+        std::puts(bs ? "bootsel: RP2350 -> USB-Bootloader" : "reboot: RP2350 startet neu");
+        if (isp::active()) isp::leave(false);             // ISP-Flashstand festschreiben
+        emulator::stop();
+        usb_msc::flush_pending_config();                   // vorgemerkte Config sichern
+        for (int i = 0; i < 20; ++i) { usb_stdio_task(); sleep_ms(5); }
+        if (bs) rom_reset_usb_boot(0, 0);
+        else    watchdog_reboot(0, 0, 10);
+        for (;;) tight_loop_contents();
+    }
     if (std::strcmp(tokens[0], "stats") == 0 ||
         std::strcmp(tokens[0], "status") == 0)  { cmd_status(); return; }
 

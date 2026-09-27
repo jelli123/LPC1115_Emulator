@@ -46,6 +46,10 @@ void request_config_persist();
 // persistiert wurde -> loescht eine noch vorgemerkte deferred-Persistenz.
 void note_config_persisted();
 
+// Schreibt eine vorgemerkte Persistenz sofort (Gast muss gestoppt sein), z. B.
+// vor 'reboot'/'bootsel'.
+void flush_pending_config();
+
 // Vom Hauptloop aufgerufen, wenn das Volume gerade nicht beschrieben
 // wird; persistiert Dirty-Sektoren in Storage.
 void poll();

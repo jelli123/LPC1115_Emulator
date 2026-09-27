@@ -1120,6 +1120,13 @@ void note_config_persisted() {
     g_config_persist_pending.store(false, std::memory_order_relaxed);
 }
 
+void flush_pending_config() {
+    if (g_config_persist_pending.exchange(false, std::memory_order_relaxed)) {
+        emulator::FlashPauseGuard fp;
+        config::save();
+    }
+}
+
 void poll() {
     // Deferred CLI-Config-Persist (aus 'pinmap set' o. ae.): den Live-Config-
     // Zustand in den Flash schreiben, ABER NUR wenn der Gast NICHT laeuft. Dann

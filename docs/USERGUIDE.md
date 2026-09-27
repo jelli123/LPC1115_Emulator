@@ -98,6 +98,8 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 | `help`              | Liste aller Befehle                                  |
 | `version`           | Build-Info, Pico-SDK, Emulator-Rev                   |
 | `stats`             | MMIO-/Fault-/IRQ-Counter                             |
+| `reboot`            | RP2350 neu starten                                   |
+| `bootsel`           | RP2350 in den USB-Bootloader (Update per `picotool load` oder UF2) |
 | `reset`             | Gast neu starten (wie Reset-Taste am LPC)            |
 
 ### Firmware

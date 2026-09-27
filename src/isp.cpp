@@ -177,6 +177,9 @@ void commit_flash() {
     if (!g_flash_dirty) return;
     storage::firmware_commit();
     g_flash_dirty = false;
+    // Herkunft fuer 'info'/'stats' festhalten (Gast steht -> Flash-Write sicher).
+    config::set_firmware_name(storage::firmware_size() ? "(ISP)" : "");
+    config::save();
 }
 
 bool sectors_prepared(uint32_t s, uint32_t e) {
