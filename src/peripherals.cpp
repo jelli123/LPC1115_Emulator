@@ -125,6 +125,8 @@ constexpr uint32_t UART0_FCR    = UART0_BASE + 0x008;
 constexpr uint32_t UART0_LCR    = UART0_BASE + 0x00C;
 constexpr uint32_t UART0_MCR    = UART0_BASE + 0x010;
 constexpr uint32_t UART0_LSR    = UART0_BASE + 0x014;
+constexpr uint32_t UART0_SCR    = UART0_BASE + 0x01C;
+constexpr uint32_t UART0_FDR    = UART0_BASE + 0x028;   // DIVADDVAL[3:0], MULVAL[7:4]
 
 // CT16B0/CT16B1 @ 0x4000C000 / 0x40010000
 // CT32B0/CT32B1 @ 0x40014000 / 0x40018000
@@ -208,6 +210,8 @@ constexpr uint8_t lpc_pin_idx(uint8_t port, uint8_t pin) {
 }
 
 void apply_gpio_to_hw(uint8_t lpc_pin, bool out, bool level);
+void uart0_ensure_hw();
+void uart0_clock_changed();
 
 // Aktuell auf GPIO_FUNC_UART geroutete RP2350-Pads fuer den LPC-UART0 (-1 =
 // keins). Werden von uart0_apply_pins gesetzt und von bridge_owns_gpio geprueft.
@@ -682,6 +686,7 @@ void retarget_rp2350_clock(uint32_t target_hz) {
     // g_current_hz ab). Wichtig, falls der Gast SysTick VOR der PLL-Konfiguration
     // aufsetzt und der Takt sich danach aendert.
     systick_program_hw();
+    uart0_clock_changed();  // UART-Baud haengt am (neuen) Takt
     std::printf("[CLK] LPC-Soll-Takt %lu kHz uebernommen "
                 "(emulierte Zeitbasis; RP2350-Takt unveraendert)\n",
                 static_cast<unsigned long>((target_hz + 500u) / 1000u));
@@ -710,7 +715,7 @@ void syscon_write32(uint32_t addr, uint32_t value) {
         case MAINCLKSEL:    g_mainclksel   = value & 0x3u;  g_pll_reconfig_pending = true; break;
         case SYSAHBCLKDIV:  g_sysahbclkdiv = value & 0xFFu; g_pll_reconfig_pending = true; break;
         case SYSAHBCLKCTRL: g_sysahbclkctrl = value;                                         break;
-        case UARTCLKDIV:    g_uartclkdiv    = value & 0xFFu;                                  break;
+        case UARTCLKDIV:    g_uartclkdiv    = value & 0xFFu; uart0_clock_changed();             break;
         case PDRUNCFG:      g_pdruncfg     = value;                                           break;
         case BODCTRL:       g_bodctrl      = value & 0x1Fu; bod_apply();                       break;
         case SYSPLLCLKUEN:
@@ -797,6 +802,8 @@ struct UartModel {
     uint8_t  fcr;
     uint8_t  mcr;
     uint16_t divisor;
+    uint8_t  fdr;        // Fractional Divider (Reset 0x10: MULVAL=1, DIVADDVAL=0)
+    uint8_t  scr;        // Scratch-Register
     uart_inst_t* hw;
     bool     init_done;
     // THRE-Interrupt-Quelle (16550): wird gesetzt, sobald THR leer ist und der
@@ -952,7 +959,34 @@ void uart0_apply_format() {
     hw->cr    = cr_save ? cr_save : enabled;
 }
 
-void uart0_ensure_hw(uint32_t f_cpu) {
+// Baudrate nach UM10398 Kap. 13.5.15:
+//   UART_PCLK = main_clk / UARTCLKDIV
+//   Baud      = UART_PCLK / (16 * DL * (1 + DIVADDVAL/MULVAL))
+// main_clk = emulierter Systemtakt * SYSAHBCLKDIV. UARTCLKDIV=0 (Takt aus) wird
+// tolerant wie 1 behandelt. Frueher: f_cpu/(16*DL) ohne FDR -> z. B. sblib
+// 460800/576000 Baud (FDR-gestuetzt) lagen um 30 % daneben.
+uint32_t uart0_baud() {
+    if (g_uart0.divisor == 0) return 0;
+    const uint64_t f_main = static_cast<uint64_t>(g_current_hz) *
+                            (g_sysahbclkdiv ? g_sysahbclkdiv : 1u);
+    const uint64_t pclk   = f_main / (g_uartclkdiv ? g_uartclkdiv : 1u);
+    uint32_t mul    = (g_uart0.fdr >> 4) & 0x0Fu;
+    uint32_t divadd = g_uart0.fdr & 0x0Fu;
+    if (mul == 0) mul = 1;
+    if (divadd >= mul) divadd = 0;   // ungueltig laut UM (DIVADDVAL < MULVAL) -> ignorieren
+    const uint64_t den = 16ull * g_uart0.divisor * (mul + divadd);
+    return static_cast<uint32_t>((pclk * mul + den / 2) / den);
+}
+
+void uart0_ensure_hw();
+
+// Takt-/Teileraenderung: Baud nur nachfuehren, wenn der Gast die UART bereits
+// konfiguriert hat (sonst wuerden Pads schon beim PLL-Setup geroutet).
+void uart0_clock_changed() {
+    if (g_uart0.divisor != 0) uart0_ensure_hw();
+}
+
+void uart0_ensure_hw() {
     // Virtueller CDC-Modus: kein HW-uart0/Pin-Routing — TX/RX laufen ueber die
     // Ringe zu CDC#2. Nur den "konfiguriert"-Status fuehren (fuer LSR/Baud).
     if (config::uart0_cdc_enabled()) {
@@ -977,7 +1011,7 @@ void uart0_ensure_hw(uint32_t f_cpu) {
         return;
     }
     if (g_uart0.divisor == 0) return;
-    uint32_t baud = f_cpu / (16u * g_uart0.divisor);
+    uint32_t baud = uart0_baud();
     if (baud == 0) baud = 9600;
     // WICHTIG: KEIN uart_init() hier! Das laeuft im MMIO-Fault-Handler (Core1,
     // Handler-Mode) und enthaelt in der SDK unreset_block_num_wait_blocking()
@@ -1066,6 +1100,8 @@ uint8_t uart0_read_reg(uint32_t addr) {
             return static_cast<uint8_t>(fifo | 0x01u);
         }
         case UART0_LCR: return g_uart0.lcr;
+        case UART0_SCR: return g_uart0.scr;
+        case UART0_FDR: return g_uart0.fdr;
         case UART0_MCR: return g_uart0.mcr;
         case UART0_LSR: {
             uint8_t s = 0x60;   // THRE|TEMT: Sender stets bereit
@@ -1087,7 +1123,7 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
             if (dlab) {
                 g_uart0.divisor = static_cast<uint16_t>(
                     (g_uart0.divisor & 0xFF00u) | val);
-                uart0_ensure_hw(g_current_hz);
+                uart0_ensure_hw();
             } else if (config::uart0_cdc_enabled()) {
                 // Virtuell: Byte in den TX-Ring -> Core0 schiebt es nach CDC#2.
                 ring_push(g_uart0_tx, val);
@@ -1107,7 +1143,7 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
                 g_uart0.divisor = static_cast<uint16_t>(
                     (g_uart0.divisor & 0x00FFu) |
                     (static_cast<uint16_t>(val) << 8));
-                uart0_ensure_hw(g_current_hz);
+                uart0_ensure_hw();
             } else {
                 // 16550: Aktivieren von IER.THRE bei leerem THR loest sofort den
                 // THRE-Interrupt aus. Treiber, die erst den Puffer fuellen und
@@ -1136,8 +1172,10 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
             }
             break;
         }
-        case UART0_LCR: g_uart0.lcr = val; uart0_ensure_hw(g_current_hz); break;
+        case UART0_LCR: g_uart0.lcr = val; uart0_ensure_hw(); break;
         case UART0_MCR: g_uart0.mcr = val; break;
+        case UART0_SCR: g_uart0.scr = val; break;
+        case UART0_FDR: g_uart0.fdr = val; uart0_ensure_hw(); break;
         default: break;
     }
 }
@@ -2219,6 +2257,7 @@ void reset() {
     g_pll_reconfig_pending = false;
     g_stats = {};
     g_uart0 = {};
+    g_uart0.fdr = 0x10;
     g_uart0_rx_signaled = false;
     g_uart0_tx_gpio = -1;   // UART0-Pin-Routing bei Guest-(Neu)start zuruecksetzen
     g_uart0_rx_gpio = -1;
