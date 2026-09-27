@@ -447,6 +447,18 @@ void parse_config(const char* buf, uint32_t len) {
             config::set_uart_bridge_tx_pin(static_cast<int>(std::atol(eq)));
         } else if (std::strcmp(line, "uart_bridge_rx") == 0) {
             config::set_uart_bridge_rx_pin(static_cast<int>(std::atol(eq)));
+        } else if (std::strcmp(line, "isp_enable") == 0) {
+            config::set_isp_cdc_enabled(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
+        } else if (std::strcmp(line, "isp_dtr_rts") == 0) {
+            config::set_isp_dtr_rts(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
+        } else if (std::strcmp(line, "isp_autosync") == 0) {
+            config::set_isp_autosync(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
+        } else if (std::strcmp(line, "isp_pins") == 0) {
+            config::set_isp_pins(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
+        } else if (std::strcmp(line, "reset_in") == 0) {
+            config::set_reset_in(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
+        } else if (std::strcmp(line, "isp_baud") == 0) {
+            config::set_isp_baud(static_cast<uint32_t>(std::strtoul(eq, nullptr, 0)));
         } else if (std::strcmp(line, "uart0_cdc") == 0) {
             config::set_uart0_cdc_enabled(std::strcmp(eq, "on") == 0 ||
                                           std::strcmp(eq, "1")  == 0);
@@ -629,6 +641,8 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     A("gdb_enable=%s\n", config::gdb_enabled() ? "on" : "off");
     A("# serial_enable: Serial-Adapter-CDC (uart_bridge bzw. uart0_cdc).\n");
     A("serial_enable=%s\n", config::serial_cdc_enabled() ? "on" : "off");
+    A("# isp_enable:    ISP-CDC (virtueller LPC-ISP-Bootloader, z. B. FlashMagic).\n");
+    A("isp_enable=%s\n", config::isp_cdc_enabled() ? "on" : "off");
     A("# Hinweis: Das USB-MSC-Laufwerk (diese CONFIG.INI) bleibt IMMER aktiv\n");
     A("#          (Wiederherstellungs-Pfad, falls alle CDCs deaktiviert sind).\n\n");
 
@@ -641,6 +655,21 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     A("# flash_erase: on = Firmware-Slot VOR dem Laden von BOOT.HEX komplett\n");
     A("#              loeschen (sonst additiver Merge). Aktion, kein Zustand.\n");
     A("#flash_erase=off\n\n");
+
+    A("# --- ISP-Bootloader / Reset ------------------------------------\n");
+    A("# isp_dtr_rts:  auf der ISP-CDC steuert DTR den RESET und RTS den ISP-Pin\n");
+    A("#               (FlashMagic: 'Use DTR and RTS to control RST and ISP pin').\n");
+    A("isp_dtr_rts=%s\n", config::isp_dtr_rts() ? "on" : "off");
+    A("# isp_autosync: ein '?' auf der ISP-CDC haelt den Gast an und startet den ISP.\n");
+    A("isp_autosync=%s\n", config::isp_autosync() ? "on" : "off");
+    A("# reset_in:     LPC-P0_0 (pin.0_0) ist RESET-Eingang (low = Gast im Reset),\n");
+    A("#               solange der Gast P0_0 nicht per IOCON als GPIO nutzt.\n");
+    A("reset_in=%s\n", config::reset_in() ? "on" : "off");
+    A("# isp_pins:     beim Reset P0_1 (pin.0_1) abfragen; low = ISP ueber die\n");
+    A("#               UART0-Pads (uart0_tx/uart0_rx), wie beim echten LPC1115.\n");
+    A("isp_pins=%s\n", config::isp_pins() ? "on" : "off");
+    A("# isp_baud:     Baudrate fuer ISP ueber Pins; 0 = Autobaud (per '?').\n");
+    A("isp_baud=%lu\n\n", static_cast<unsigned long>(config::isp_baud()));
 
     A("# --- GPIO-Mapping  LPC-Pin -> RP2350-GPIO -----------------------\n");
     A("# Format: pin.<port>_<pin>=<gpio>   (z. B. pin.1_8=1)\n");

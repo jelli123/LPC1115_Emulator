@@ -24,6 +24,7 @@ void usb_desc_build();
 int  usb_desc_cdc_cli();      // CLI/stdio
 int  usb_desc_cdc_gdb();      // GDB-RSP
 int  usb_desc_cdc_serial();   // Serial-Adapter / LPC-UART0<->CDC
+int  usb_desc_cdc_isp();      // virtueller ISP-Bootloader
 
-// Anzahl aktiver CDC-Interfaces (0..3).
+// Anzahl aktiver CDC-Interfaces (0..4).
 int  usb_desc_cdc_count();

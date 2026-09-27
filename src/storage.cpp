@@ -68,7 +68,7 @@ constexpr std::size_t marker_offset =
 // Groessen so gewaehlt, dass alle Eintraege + ConfigHeader in EINEN Flash-
 // Sektor (SECTOR_SIZE, i.d.R. 4096 B) passen:
 //   MAX_KV * sizeof(KV) + sizeof(ConfigHeader) <= SECTOR_SIZE
-//   56 * 64 + 16 = 3600 <= 4096.
+//   63 * 64 + 16 = 4048 <= 4096.
 // 56 Eintraege decken die volle Default-Pinmap (23) + alle Skalar-Keys (~18)
 // mit Reserve ab. Frueher MAX_KV=32 -> config_set gab bei Ueberlauf false ->
 // save() brach VOR dem Commit ab -> Pinmap ueberlebte keinen Power-Cycle.
@@ -77,7 +77,8 @@ struct KV {
     char key[24];
     char value[40];
 };
-constexpr std::size_t MAX_KV = 56;
+constexpr std::size_t MAX_KV = 63;
+static_assert(MAX_KV * sizeof(KV) + 16 <= SECTOR_SIZE, "KV-Tabelle passt nicht in einen Sektor");
 
 KV       kv_table[MAX_KV];
 uint32_t kv_count       = 0;

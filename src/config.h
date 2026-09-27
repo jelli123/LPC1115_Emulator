@@ -19,6 +19,12 @@ inline constexpr const char* KEY_TARGET_FREQ_HZ  = "freq_hz";          // dezima
 inline constexpr const char* KEY_CLI_ENABLE      = "cli_enable";       // "0"/"1" CDC-CLI
 inline constexpr const char* KEY_GDB_ENABLE      = "gdb_enable";       // "0"/"1" CDC-GDB
 inline constexpr const char* KEY_SERIAL_ENABLE   = "serial_enable";    // "0"/"1" CDC-Serial(#2)
+inline constexpr const char* KEY_ISP_ENABLE      = "isp_enable";       // "0"/"1" CDC-ISP
+inline constexpr const char* KEY_ISP_DTR_RTS     = "isp_dtr_rts";      // "0"/"1" DTR=RESET, RTS=ISP
+inline constexpr const char* KEY_ISP_AUTOSYNC    = "isp_autosync";     // "0"/"1" '?' startet ISP
+inline constexpr const char* KEY_ISP_PINS        = "isp_pins";         // "0"/"1" ISP-Pin P0_1 + UART0-Pads
+inline constexpr const char* KEY_ISP_BAUD        = "isp_baud";         // 0 = Autobaud
+inline constexpr const char* KEY_RESET_IN        = "reset_in";         // "0"/"1" P0_0 = RESET-Eingang
 inline constexpr const char* KEY_PIN_PREFIX      = "pin.";             // pin.<lpc>=<rp2350>
 inline constexpr const char* KEY_UART_BRIDGE_EN  = "uart_bridge_en";   // "0"/"1"
 inline constexpr const char* KEY_UART_BRIDGE_TX  = "uart_bridge_tx";   // GPIO-Nummer
@@ -89,6 +95,20 @@ bool        gdb_enabled();
 void        set_gdb_enabled(bool v);
 bool        serial_cdc_enabled();
 void        set_serial_cdc_enabled(bool v);
+bool        isp_cdc_enabled();
+void        set_isp_cdc_enabled(bool v);
+
+// ISP-Bootloader / Reset-Eingang (siehe isp.h).
+bool        isp_dtr_rts();
+void        set_isp_dtr_rts(bool v);
+bool        isp_autosync();
+void        set_isp_autosync(bool v);
+bool        isp_pins();
+void        set_isp_pins(bool v);
+uint32_t    isp_baud();
+void        set_isp_baud(uint32_t v);
+bool        reset_in();
+void        set_reset_in(bool v);
 
 uint32_t    target_frequency_hz();
 void        set_target_frequency_hz(uint32_t hz);

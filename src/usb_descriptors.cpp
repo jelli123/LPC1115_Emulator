@@ -5,12 +5,12 @@
 
 #include <cstring>
 
-// Composite-USB mit bis zu DREI CDC-Interfaces + MSC. Welche CDCs erscheinen,
-// bestimmt die CONFIG.INI (cli_enable/gdb_enable/serial_enable). Deaktivierte
+// Composite-USB mit bis zu VIER CDC-Interfaces + MSC. Welche CDCs erscheinen,
+// bestimmt die CONFIG.INI (cli_enable/gdb_enable/serial_enable/isp_enable). Deaktivierte
 // CDCs fallen komplett aus dem Konfigurations-Deskriptor -> der Host zeigt einen
 // COM-Port weniger. Das MSC-Laufwerk ist IMMER dabei (Recovery-Pfad ueber
 // CONFIG.INI). Der Deskriptor wird zur Bootzeit dynamisch gebaut (usb_desc_build,
-// vor tusb_init). Die Reihenfolge der aktiven CDCs ist fix: CLI, GDB, Serial;
+// vor tusb_init). Die Reihenfolge der aktiven CDCs ist fix: CLI, GDB, Serial, ISP;
 // ihre tud_cdc_n_*-Instanzindizes vergibt der Builder entsprechend.
 
 #define USB_VID   0xCAFE
@@ -20,7 +20,7 @@
 // String-Indizes (Reihenfolge in string_desc_arr unten).
 enum {
     STRID_LANG = 0, STRID_MANUF, STRID_PRODUCT, STRID_SERIAL,
-    STRID_CLI, STRID_GDB, STRID_MSC, STRID_SERIALADP,
+    STRID_CLI, STRID_GDB, STRID_MSC, STRID_SERIALADP, STRID_ISP,
 };
 
 static tusb_desc_device_t const desc_device = {
@@ -33,7 +33,7 @@ static tusb_desc_device_t const desc_device = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0100,
+    .bcdDevice          = 0x0101,   // bei Aenderung des Interface-Layouts erhoehen (Windows-Cache)
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,
@@ -47,14 +47,15 @@ uint8_t const* tud_descriptor_device_cb(void) {
 // --- Dynamischer Konfigurations-Deskriptor --------------------------------
 namespace {
 
-// Puffer gross genug fuer 3x CDC + MSC + Header.
-uint8_t  g_cfg_desc[TUD_CONFIG_DESC_LEN + 3 * TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN];
+// Puffer gross genug fuer 4x CDC + MSC + Header.
+uint8_t  g_cfg_desc[TUD_CONFIG_DESC_LEN + CFG_TUD_CDC * TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN];
 uint16_t g_cfg_len = 0;
 
 // CDC-Instanzindizes je Rolle (-1 = deaktiviert). MSC ist immer dabei.
 int g_cdc_cli    = -1;
 int g_cdc_gdb    = -1;
 int g_cdc_serial = -1;
+int g_cdc_isp    = -1;
 int g_cdc_count  =  0;
 bool g_built = false;
 
@@ -76,16 +77,18 @@ void append_cdc(uint32_t& pos, uint8_t& itf, uint8_t& ep_num, uint8_t str_idx) {
 } // namespace
 
 void usb_desc_build() {
-    g_cdc_cli = g_cdc_gdb = g_cdc_serial = -1;
+    g_cdc_cli = g_cdc_gdb = g_cdc_serial = g_cdc_isp = -1;
     g_cdc_count = 0;
 
     const bool cli = config::cli_enabled();
     const bool gdb = config::gdb_enabled();
     const bool ser = config::serial_cdc_enabled();
+    const bool isp = config::isp_cdc_enabled();
     int idx = 0;
     if (cli) g_cdc_cli    = idx++;
     if (gdb) g_cdc_gdb    = idx++;
     if (ser) g_cdc_serial = idx++;
+    if (isp) g_cdc_isp    = idx++;
     g_cdc_count = idx;
 
     const uint8_t itf_total = static_cast<uint8_t>(g_cdc_count * 2 + 1); // +MSC
@@ -96,6 +99,7 @@ void usb_desc_build() {
     if (cli) append_cdc(pos, itf, ep, STRID_CLI);
     if (gdb) append_cdc(pos, itf, ep, STRID_GDB);
     if (ser) append_cdc(pos, itf, ep, STRID_SERIALADP);
+    if (isp) append_cdc(pos, itf, ep, STRID_ISP);
 
     // MSC: OUT = ep, IN = 0x80|ep.
     {
@@ -120,6 +124,7 @@ void usb_desc_build() {
 int usb_desc_cdc_cli()    { return g_cdc_cli; }
 int usb_desc_cdc_gdb()    { return g_cdc_gdb; }
 int usb_desc_cdc_serial() { return g_cdc_serial; }
+int usb_desc_cdc_isp()    { return g_cdc_isp; }
 int usb_desc_cdc_count()  { return g_cdc_count; }
 
 uint8_t const* tud_descriptor_configuration_cb(uint8_t /*idx*/) {
@@ -136,6 +141,7 @@ static char const* string_desc_arr[] = {
     "LPC-Emu GDB",                        // 5: CDC GDB
     "LPC-Emu MSC",                        // 6: MSC
     "LPC-Emu Serial",                     // 7: CDC Serial-Adapter
+    "LPC-Emu ISP",                        // 8: CDC ISP-Bootloader
 };
 
 static uint16_t _desc_str[32];

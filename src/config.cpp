@@ -16,6 +16,12 @@ bool     g_autostart   = false;
 bool     g_cli_enable    = true;
 bool     g_gdb_enable    = true;
 bool     g_serial_enable = true;
+bool     g_isp_enable    = true;
+bool     g_isp_dtr_rts   = true;
+bool     g_isp_autosync  = true;
+bool     g_isp_pins      = false;
+uint32_t g_isp_baud      = 0;
+bool     g_reset_in      = false;
 bool     g_uart_bridge_en = false;
 int      g_uart_bridge_tx = -1;
 int      g_uart_bridge_rx = -1;
@@ -115,6 +121,12 @@ void apply_defaults() {
     g_cli_enable    = true;
     g_gdb_enable    = true;
     g_serial_enable = true;
+    g_isp_enable    = true;
+    g_isp_dtr_rts   = true;
+    g_isp_autosync  = true;
+    g_isp_pins      = false;
+    g_isp_baud      = 0;
+    g_reset_in      = false;
     g_uart_bridge_en = false;
     g_uart_bridge_tx = -1;
     g_uart_bridge_rx = -1;
@@ -206,6 +218,15 @@ bool load() {
         g_gdb_enable = (buf[0] == '1');
     if (storage::config_get(KEY_SERIAL_ENABLE, buf, sizeof buf))
         g_serial_enable = (buf[0] == '1');
+    if (storage::config_get(KEY_ISP_ENABLE, buf, sizeof buf))   g_isp_enable   = (buf[0] == '1');
+    if (storage::config_get(KEY_ISP_DTR_RTS, buf, sizeof buf))  g_isp_dtr_rts  = (buf[0] == '1');
+    if (storage::config_get(KEY_ISP_AUTOSYNC, buf, sizeof buf)) g_isp_autosync = (buf[0] == '1');
+    if (storage::config_get(KEY_ISP_PINS, buf, sizeof buf))     g_isp_pins     = (buf[0] == '1');
+    if (storage::config_get(KEY_RESET_IN, buf, sizeof buf))     g_reset_in     = (buf[0] == '1');
+    if (storage::config_get(KEY_ISP_BAUD, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32(buf, v)) g_isp_baud = v;
+    }
     if (storage::config_get(KEY_TARGET_FREQ_HZ, buf, sizeof buf)) {
         uint32_t v;
         if (parse_uint32(buf, v) && v > 0 && v <= MAX_FREQ_HZ) g_target_freq = v;
@@ -354,6 +375,17 @@ bool save() {
     if (!storage::config_set(KEY_GDB_ENABLE, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_serial_enable ? 1 : 0));
     if (!storage::config_set(KEY_SERIAL_ENABLE, buf)) return false;
+    {
+        const struct { const char* k; bool v; } flags[] = {
+            {KEY_ISP_ENABLE, g_isp_enable}, {KEY_ISP_DTR_RTS, g_isp_dtr_rts},
+            {KEY_ISP_AUTOSYNC, g_isp_autosync}, {KEY_ISP_PINS, g_isp_pins},
+            {KEY_RESET_IN, g_reset_in},
+        };
+        for (const auto& f : flags)
+            if (!storage::config_set(f.k, f.v ? "1" : "0")) return false;
+        std::snprintf(buf, sizeof buf, "%lu", static_cast<unsigned long>(g_isp_baud));
+        if (!storage::config_set(KEY_ISP_BAUD, buf)) return false;
+    }
     std::snprintf(buf, sizeof buf, "%lu", static_cast<unsigned long>(g_target_freq));
     if (!storage::config_set(KEY_TARGET_FREQ_HZ, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_uart_bridge_en ? 1 : 0));
@@ -485,6 +517,18 @@ bool        gdb_enabled()                  { return g_gdb_enable; }
 void        set_gdb_enabled(bool v)        { g_gdb_enable = v; }
 bool        serial_cdc_enabled()           { return g_serial_enable; }
 void        set_serial_cdc_enabled(bool v) { g_serial_enable = v; }
+bool        isp_cdc_enabled()              { return g_isp_enable; }
+void        set_isp_cdc_enabled(bool v)    { g_isp_enable = v; }
+bool        isp_dtr_rts()                  { return g_isp_dtr_rts; }
+void        set_isp_dtr_rts(bool v)        { g_isp_dtr_rts = v; }
+bool        isp_autosync()                 { return g_isp_autosync; }
+void        set_isp_autosync(bool v)       { g_isp_autosync = v; }
+bool        isp_pins()                     { return g_isp_pins; }
+void        set_isp_pins(bool v)           { g_isp_pins = v; }
+uint32_t    isp_baud()                     { return g_isp_baud; }
+void        set_isp_baud(uint32_t v)       { g_isp_baud = v; }
+bool        reset_in()                     { return g_reset_in; }
+void        set_reset_in(bool v)           { g_reset_in = v; }
 uint32_t    target_frequency_hz()          { return g_target_freq; }
 
 void set_target_frequency_hz(uint32_t hz) {
