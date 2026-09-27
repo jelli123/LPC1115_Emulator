@@ -594,10 +594,17 @@ Mechanik (Read-Modify-Write je 4-KiB-Sektor):
 * `firmware_finalize(total_len)` flusht den letzten Sektor, setzt
   `total_len = max(vorhandene_Größe, total_len)` (Längen-Merge), berechnet
   die CRC32 über `[region, total_len)` und schreibt anschließend den
-  Firmware-Marker.
+  Firmware-Marker. Der Marker liegt in einem **eigenen Sektor direkt vor**
+  dem 64-KiB-Slot – nicht im LPC-Sektor 15, damit Gast-Daten dort (sblib-
+  EEPROM) und Marker sich nicht gegenseitig löschen.
+* IAP-Schreibzugriffe des Gasts (`copy`/`erase`/`erase page`) rufen nach dem
+  Schreiben ebenfalls `firmware_finalize()` auf und sind damit sofort
+  power-cycle-fest.
+* `firmware_discard()` verwirft den Sektor-Puffer nach einem Parse-/
+  Transferfehler.
 
-`firmware_erase()` (CLI `erase`/`flash erase`, CONFIG.INI `flash_erase=on`)
-löscht den gesamten Slot explizit und setzt den Sektor-Cache zurück.
+`firmware_erase()` (CLI `erase`, CONFIG.INI `flash_erase=on`)
+löscht Marker + gesamten Slot explizit und setzt den Sektor-Cache zurück.
 
 Derselbe RMW-Pfad macht auch die **IAP-Persistenz** (Cmd 51, sblib-EEPROM,
 OTA) robuster: Programmierung erfolgt jetzt als echtes Erase+Program statt

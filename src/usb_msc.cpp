@@ -950,6 +950,7 @@ void on_volume_ready() {
             }
         }
         if (any_err || ctx.overflow) {
+            storage::firmware_discard();   // Teil-Sektor nicht spaeter mitflushen
             std::printf("[MSC] %s parsefehler\n", hex_name);
         } else {
             storage::firmware_finalize(ctx.total);

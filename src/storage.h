@@ -65,5 +65,8 @@ bool firmware_write(std::size_t offset, const void* data, std::size_t len);
 const uint8_t* firmware_data();              // Pointer in den memory-mapped XIP-Bereich
 std::size_t   firmware_size();               // letzte beschriebene Länge (Marker)
 bool firmware_finalize(std::size_t total_len); // schreibt Längen-Marker
+// Verwirft einen noch nicht geflushten Sektor-Puffer (nach Parse-/Transfer-
+// Fehler), damit Teil-Daten nicht beim naechsten Schreibzugriff im Flash landen.
+void firmware_discard();
 
 } // namespace storage

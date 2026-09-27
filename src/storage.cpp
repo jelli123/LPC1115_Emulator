@@ -38,21 +38,31 @@ struct FirmwareHeader {
 
 // Offsets relativ zum Flash-Start. Ende des Flash = (PICO_FLASH_SIZE_BYTES).
 // Wir reservieren am Ende:
-//   [...firmware...][...config...]
+//   [marker][...firmware (64 KiB)...][...config...]
+// Der Marker-Sektor (Laenge + CRC) liegt AUSSERHALB des 64-KiB-Firmware-Slots.
+// Frueher lag er im letzten Slot-Sektor (= LPC-Sektor 15, 0xF000-0xFFFF): jedes
+// finalize() loeschte damit die dort liegenden Gast-Daten (sblib-userEeprom), und
+// jeder IAP-Schreibzugriff auf Sektor 15 zerstoerte umgekehrt den Marker ->
+// nach dem naechsten Power-Cycle "keine Firmware".
 constexpr std::size_t flash_size_bytes = PICO_FLASH_SIZE_BYTES;
 constexpr std::size_t config_region_size   = CONFIG_SLOT_SECTORS * SECTOR_SIZE;
 constexpr std::size_t firmware_region_size =
     ((FIRMWARE_SLOT_BYTES + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE;
+constexpr std::size_t marker_region_size   = SECTOR_SIZE;
 
-static_assert(config_region_size + firmware_region_size <= flash_size_bytes,
+static_assert(config_region_size + firmware_region_size + marker_region_size
+                  <= flash_size_bytes,
               "Storage-Reservierung passt nicht in den verfügbaren Flash");
-static_assert(config_region_size + firmware_region_size < flash_size_bytes / 4,
+static_assert(config_region_size + firmware_region_size + marker_region_size
+                  < flash_size_bytes / 4,
               "Storage darf maximal das letzte Viertel des Flash belegen");
 
 constexpr std::size_t config_region_offset =
     flash_size_bytes - config_region_size;
 constexpr std::size_t firmware_region_offset =
     config_region_offset - firmware_region_size;
+constexpr std::size_t marker_offset =
+    firmware_region_offset - marker_region_size;
 
 // In-RAM Konfig-Snapshot.
 // Groessen so gewaehlt, dass alle Eintraege + ConfigHeader in EINEN Flash-
@@ -324,11 +334,16 @@ static bool fw_flush_sector() {
     return true;
 }
 
+void firmware_discard() {
+    fw_sector_base  = SIZE_MAX;
+    fw_sector_dirty = false;
+}
+
 bool firmware_erase() {
     fw_sector_base  = SIZE_MAX;
     fw_sector_dirty = false;
     FlashGuard guard;
-    flash_range_erase(firmware_region_offset, firmware_region_size);
+    flash_range_erase(marker_offset, marker_region_size + firmware_region_size);
     firmware_length   = 0;
     firmware_sequence = 0;
     return true;
@@ -368,10 +383,9 @@ bool firmware_finalize(std::size_t total_len) {
     // groesser sein als die soeben additiv geschriebene Datei.
     std::size_t existing = firmware_size();
     if (existing > total_len) total_len = existing;
-    if (total_len == 0 || total_len > FIRMWARE_SLOT_BYTES - sizeof(FirmwareHeader)) {
+    if (total_len == 0 || total_len > FIRMWARE_SLOT_BYTES) {
         return false;
     }
-    // Marker-Sektor liegt am Ende des Firmware-Slots (letzter Sektor).
     FirmwareHeader hdr{};
     hdr.magic    = MAGIC_FIRMWARE;
     hdr.sequence = firmware_sequence + 1;
@@ -379,8 +393,6 @@ bool firmware_finalize(std::size_t total_len) {
     hdr.crc32    = crc32(xip_ptr(firmware_region_offset),
                          static_cast<std::size_t>(total_len));
 
-    std::size_t marker_offset =
-        firmware_region_offset + firmware_region_size - SECTOR_SIZE;
     if (!sector_erase_and_write(marker_offset, &hdr, sizeof hdr)) return false;
 
     firmware_length   = hdr.length;
@@ -395,11 +407,10 @@ const uint8_t* firmware_data() {
 std::size_t firmware_size() {
     if (firmware_length != 0) return firmware_length;
     // Lazy-Read aus Marker
-    std::size_t marker_offset = firmware_region_offset + firmware_region_size - SECTOR_SIZE;
     const FirmwareHeader* h = reinterpret_cast<const FirmwareHeader*>(
         xip_ptr(marker_offset));
     if (h->magic != MAGIC_FIRMWARE) return 0;
-    if (h->length > FIRMWARE_SLOT_BYTES - SECTOR_SIZE) return 0;
+    if (h->length == 0 || h->length > FIRMWARE_SLOT_BYTES) return 0;
     if (crc32(xip_ptr(firmware_region_offset), h->length) != h->crc32) return 0;
     firmware_length   = h->length;
     firmware_sequence = h->sequence;
