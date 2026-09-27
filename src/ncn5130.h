@@ -40,8 +40,9 @@ uint8_t spi_exchange(uint8_t mosi);
 // PHY quittiert dieses Modell gesendete Frames selbst (positiv).
 void poll();
 
-// Loopback/Monitor-Selbsttest: gesendete Frames werden zusaetzlich als
-// L_Data_*.ind in den RX-Pfad zurueckgespiegelt (Test ohne KNX-Transceiver).
+// Selbsttest: gesendete Frames werden nach Echo/U_FrameState/L_Data.con
+// zusaetzlich als empfangenes Frame zugestellt (Test des Gast-RX-Pfads ohne
+// KNX-Bus). Das Echo selbst sendet der NCN5130 immer (Datenblatt S. 40).
 void set_loopback(bool enable);
 bool loopback();
 
@@ -68,8 +69,18 @@ bool pop_tx_frame(const uint8_t** data, uint16_t* len);
 // Ergebnis einer Bus-Sendung zurueckmelden -> erzeugt L_Data.con (pos/neg).
 void tx_result(bool positive);
 
-// Meldet, ob gerade Empfangsdaten fuer den Host anstehen (DATA_READY).
+// Meldet, ob Bytes fuer den Host anstehen.
 bool data_ready();
+
+// Vom SSP-Modell (Core1): naechstes Byte, das der NCN5130 als SPI-Master von
+// sich aus zum Host taktet (Antworten, Indications, Empfangsframes). false =
+// nichts anstehend. Das Host-MOSI-Byte eines solchen Transfers wird NICHT als
+// Kommando gewertet.
+bool pull_byte(uint8_t& b);
+
+// true, solange das Modell zeitgesteuert arbeiten muss (Sendung laeuft oder
+// reale PHY aktiv) -> der Host-Takt (SysTick-Shim) muss dann weiterlaufen.
+bool busy();
 
 // --- Diagnose (CLI 'ncn status') ------------------------------------------
 struct Debug {

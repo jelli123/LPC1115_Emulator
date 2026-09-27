@@ -434,8 +434,9 @@ void systick_program_hw() {
     // braucht, bekam der Handler keine Rechenzeit mehr -> Livelock (Gast fror
     // z. B. im CT16B1-Handler ein, waehrend UART0 wartete).
     const bool irq_waiting = vnvic::irq_pending() && irq_inject::can_inject_now();
+    const bool ncn_busy    = ncn5130::busy();   // NCN-Sendung/PHY braucht Takt
 
-    if (!guest_irq && !ct_pending && !irq_waiting) {
+    if (!guest_irq && !ct_pending && !irq_waiting && !ncn_busy) {
         systick_hw->csr = 0u;           // nichts braucht eine Host-Taktquelle
         return;
     }
@@ -1878,8 +1879,12 @@ void adc_write_byte(uint32_t addr, uint8_t val) {
 // SSP-Bridge; sie laufen wie gehabt über das GPIO-Modell (echte Pins).
 // =========================================================================
 struct SspModel {
-    uint32_t cr0, cr1, cpsr, imsc, ris, dr_rx, tx;
+    uint32_t cr0, cr1, cpsr, imsc, ris, tx;
     uint8_t  irq_num;
+    // RX-FIFO (8 Eintraege wie am LPC). Frueher nur ein Register: ein zweites
+    // Byte vor dem Auslesen ging verloren.
+    uint16_t rxq[8];
+    uint8_t  rx_head, rx_count;
 };
 SspModel g_ssp[2]{};
 
@@ -1947,6 +1952,28 @@ uint32_t ssp_idx_for(uint32_t addr) {
 }
 uint32_t ssp_base_for(uint32_t i) { return i ? SSP1_BASE : SSP0_BASE; }
 
+void ssp_rx_push(SspModel& s, uint16_t v) {
+    if (s.rx_count >= 8u) { s.ris |= 0x1u; return; }      // RORRIS: Ueberlauf
+    s.rxq[(s.rx_head + s.rx_count) & 7u] = v;
+    ++s.rx_count;
+    s.ris |= 0x4u;
+    if (s.imsc & 0x4u) irq_inject::pend(s.irq_num);
+}
+
+// Virtueller NCN5130 als SPI-Master: anstehende Bytes (Antworten, Indications,
+// Empfangsframes) taktet er von sich aus zum Host - ohne dass der Gast etwas
+// schreiben muss. Bei Platz im RX-FIFO werden sie dort abgelegt.
+void ssp_ncn_pump(uint32_t idx) {
+    if (!ncn5130::enabled(static_cast<int>(idx))) return;
+    // Zeitgesteuerten Fortschritt (Sende-Abschluss, PHY) auch hier treiben:
+    // ein Gast, der per Polling auf L_Data.con wartet, laeuft sonst nur weiter,
+    // wenn zufaellig der SysTick-Shim aktiv ist.
+    ncn5130::poll();
+    SspModel& s = g_ssp[idx];
+    uint8_t b;
+    while (s.rx_count < 8u && ncn5130::pull_byte(b)) ssp_rx_push(s, b);
+}
+
 uint8_t ssp_read_byte(uint32_t idx, uint32_t off) {
     SspModel& s = g_ssp[idx];
     uint32_t lane = (off & 3u) * 8u;
@@ -1954,14 +1981,23 @@ uint8_t ssp_read_byte(uint32_t idx, uint32_t off) {
         case SSP_CR0:  return static_cast<uint8_t>((s.cr0  >> lane) & 0xFFu);
         case SSP_CR1:  return static_cast<uint8_t>((s.cr1  >> lane) & 0xFFu);
         case SSP_DR:   {
-            uint32_t v = s.dr_rx;
-            s.ris &= ~0x4u;     // RX nicht mehr voll
+            uint32_t v = s.rx_count ? s.rxq[s.rx_head] : 0u;
+            // Byte 0 (bzw. Byte 1 bei >8 Bit) konsumiert den FIFO-Eintrag.
+            const uint32_t bits = (s.cr0 & 0xFu) + 1u;
+            const bool last = (bits <= 8u) ? ((off & 3u) == 0u) : ((off & 3u) == 1u);
+            if (last && s.rx_count) {
+                s.rx_head = static_cast<uint8_t>((s.rx_head + 1u) & 7u);
+                --s.rx_count;
+                if (!s.rx_count) s.ris &= ~0x4u;
+                ssp_ncn_pump(idx);
+            }
             return static_cast<uint8_t>((v >> lane) & 0xFFu);
         }
         case SSP_SR: {
-            // TFE(0)+TNF(1) immer gesetzt (synchroner Transfer); RNE(2), wenn
-            // ein RX-Wort bereitsteht. BSY(4) nie (Transfer schon fertig).
-            uint8_t sr = 0x03u | ((s.ris & 0x4u) ? 0x04u : 0x00u);
+            ssp_ncn_pump(idx);   // Poll-Schleife auf RNE sieht neue NCN-Bytes
+            // TFE(0)+TNF(1) immer gesetzt (synchroner Transfer); RNE(2) bei
+            // Daten im RX-FIFO, RFF(3) bei vollem FIFO. BSY(4) nie.
+            uint8_t sr = 0x03u | (s.rx_count ? 0x04u : 0x00u) | (s.rx_count >= 8u ? 0x08u : 0x00u);
             return static_cast<uint8_t>((sr >> lane) & 0xFFu);
         }
         case SSP_CPSR: return static_cast<uint8_t>((s.cpsr >> lane) & 0xFFu);
@@ -1989,27 +2025,28 @@ void ssp_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
             bool complete = (bits <= 8u) ? ((off & 3u) == 0u)
                                          : ((off & 3u) == 1u);
             if (!complete) break;
+            uint16_t rxv = 0;
             if (ncn5130::enabled(static_cast<int>(idx))) {
                 // Virtueller NCN5130 (KNX-Sekundaerinterface): byte-transparenter
                 // SPI-Austausch durch den NCN-Automaten statt HW-Bridge/Loopback.
                 // Nur 8-Bit-Frames (NCN5130 kommuniziert byteweise).
-                s.dr_rx = ncn5130::spi_exchange(static_cast<uint8_t>(s.tx & 0xFFu));
+                rxv = ncn5130::spi_exchange(static_cast<uint8_t>(s.tx & 0xFFu));
             } else if (ssp_is_bridged(idx)) {
                 if (bits <= 8u) {
                     uint8_t tx = static_cast<uint8_t>(s.tx & 0xFFu), rx = 0;
                     spi_write_read_blocking(g_spi_hw, &tx, &rx, 1);
-                    s.dr_rx = rx;
+                    rxv = rx;
                 } else {
                     uint16_t tx = static_cast<uint16_t>(s.tx & 0xFFFFu), rx = 0;
                     spi_write16_read16_blocking(g_spi_hw, &tx, &rx, 1);
-                    s.dr_rx = rx;
+                    rxv = rx;
                 }
             } else {
-                s.dr_rx = s.tx;        // Loopback-Fallback
+                rxv = static_cast<uint16_t>(s.tx);   // Loopback-Fallback
             }
             s.tx = 0;
-            s.ris |= 0x4u;             // RX-FIFO not empty
-            if (s.imsc & 0x4u) irq_inject::pend(s.irq_num);
+            ssp_rx_push(s, rxv);       // jeder Transfer liefert ein RX-Wort
+            ssp_ncn_pump(idx);         // weitere NCN-Bytes (z. B. Antwort) nachtakten
             break;
         }
         case SSP_CPSR: patch(s.cpsr); break;
@@ -2473,6 +2510,7 @@ void poll_timed_sources() {
     wdt_advance();
     systick_advance();
     ncn5130::poll();   // virtueller NCN5130: TX-Abschluss/L_Data.con (Core1)
+    ssp_ncn_pump(0); ssp_ncn_pump(1);   // NCN-Bytes als SPI-Master zum Gast takten
     // UART0-RX-Interrupt (initialer Trigger): liegen Empfangsdaten vor und hat
     // der Gast den RBR-IRQ aktiviert (IER Bit0), UART0-IRQ penden. Laeuft auf
     // Core1 (via SysTick-Shim/WFI-Loop). Nach dem ersten Byte haelt sich die

@@ -61,7 +61,7 @@ Hardware.
 | Bit-Order | **LSB zuerst** | ⚠ nicht LPC-SSP-Default (MSB) – **explizit setzen** |
 | Wortbreite | 8 Bit | |
 | `TREQ` | Host-GPIO-Ausgang → NCN-Eingang | negative Flanke = „Byte folgt" (§A.2) |
-| DATA_READY | NCN → Host (GPIO/IRQ) | „Empfangsdaten liegen an" (§A.4) |
+| Datenzustellung | NCN taktet selbst (Master) | kein DATA_READY-Pin im SPI-Modus; Host sieht RX-FIFO nicht leer / SSP-RX-IRQ (§A.4) |
 
 > **Referenzsoftware-Pflicht:** SSP auf **LSB-first + Mode 0** konfigurieren. Der Emulator
 > vergleicht Byte-Werte transparent, echte Hardware braucht diese Einstellung.
@@ -107,22 +107,39 @@ erzeugt werden, damit derselbe Code auf Hardware funktioniert.
 | `0x4B`+Byte | `U_SystemStat.ind` | Statusbyte; Mode in Bit1..0 (`00`PU `01`Sync `10`Stop `11`Normal) |
 | `0x2B` | `U_StopMode.ind` | Stop bestätigt |
 | `0xCB` | `U_FrameEnd.ind` | Frame-Ende (nur mit MARKER) |
-| `0x0B`+Flags | `U_FrameState.ind` | Frame-Fehler (re/ce/te) |
+| `0x13`+Flags | `U_FrameState.ind` | `re ce te 1 res 0 1 1`: Frame-Ende im SPI-Modus, Fehlerflags re=0x80 ce=0x40 te=0x20 |
 | `0b aa ap c m 01` | `U_Configure.ind` | Aktueller Feature-Zustand |
-| `10r1 p1p0 00`+n | `L_Data_Standard.ind` | Empf. Standard-Frame (danach n Bytes) |
-| `00r1 p1p0 00`+n | `L_Data_Extended.ind` | Empf. Extended-Frame |
+| `10r1 p1p0 00` | `L_Data_Standard.ind` | = das Control-Octet des empfangenen Frames selbst (kein eigenes Präfix-Byte) |
+| `00r1 p1p0 00` | `L_Data_Extended.ind` | dito, Extended-Frame |
 | `0x8B`/`0x0B` | `L_Data.con` | Sende-Quittung: `0x8B` positiv, `0x0B` negativ |
 
-### A.4 Empfang + DATA_READY
+### A.4 Empfang und Senden (Byte-Folge zum Host, SPI-Modus)
 
-Empfangene KNX-Frames werden **byte-transparent** übertragen: zuerst das
-`L_Data_*.ind`-Control-Byte, dann die Frame-Bytes (bei `c`-Feature +2 CRC-Bytes; bei
-`m`-Feature `0xCB`+`U_FrameState.ind` als Ende, sonst 2.6 ms Stille).
+Empfangene KNX-Frames kommen **byte-transparent**; das Control-Octet ist zugleich die
+`L_Data_*.ind` (Datenblatt Fig. 50–55):
 
-Der Emulator signalisiert **DATA_READY** über eine virtuelle IRQ-Leitung (PINT/`irq_inject`,
-Level-gehalten). Die Referenzsoftware kann **interrupt-** oder **poll-basiert** lesen
-(`U_State.req` bzw. Ready-Leitung). Nach vollständigem Frame quittiert der Host mit
-`U_Ackn.req` (`a/b/n`).
+```
+Frame-Bytes (inkl. Checksumme) [CRC lo, CRC hi]  U_FrameState.ind (0x13|Flags)  [U_FrameEnd.ind 0xCB]
+```
+
+Beim Senden spiegelt der NCN5130 **jedes gesendete Oktett** zurück (Fig. 44/47/48):
+
+```
+Echo-Bytes [CRC lo, CRC hi]  U_FrameState.ind  L_Data.con (0x8B/0x0B)  [U_FrameEnd.ind]
+```
+
+`[CRC]` nur mit `c`-Feature (CRC-CCITT, Polynom 0x1021, Start 0xFFFF, Low-Byte zuerst),
+`[U_FrameEnd.ind]` nur mit `m`-Feature (MARKER); dann wird ein Daten-0xCB verdoppelt.
+
+`U_L_DataCont.req` trägt den Byte-Index (Reihenfolge beliebig, `U_L_DataOffset.req` für
+Indizes ≥ 64); `U_L_DataEnd.req` prüft die Checksumme – bei Fehler kommt statt der Sendung
+`U_State.ind` mit Receive-Error (`0x47`).
+
+**Datenzustellung:** Der NCN5130 ist SPI-Master und taktet anstehende Bytes selbst zum Host.
+Im Emulator landen sie im **RX-FIFO der SSP** (8 Einträge) und werden über `SR.RNE` bzw. den
+SSP-RX-Interrupt (`IMSC.RXIM`) gemeldet – interrupt- oder poll-basiert lesbar wie am echten
+Chip. Ein Host-Transfer (`DR`-Write, entspricht TREQ) liefert zusätzlich ein Dummy-Byte in den
+RX-FIFO. Nach einem empfangenen Frame quittiert der Host mit `U_Ackn.req` (`a/b/n`).
 
 ### A.5 Minimal-Init-Sequenz (Empfehlung Referenzsoftware)
 
@@ -131,7 +148,7 @@ U_Reset.req (0x01)                     → warte U_Reset.ind (0x03)
 U_SystemState.req (0x0D)               → prüfe Mode == Normal (11)
 U_Configure.req (0x18|Features)        → optional CRC/MARKER/Poll
 U_SetAddress.req (0xF1, AH, AL, 0x00)  → Auto-Ack aktiv; warte U_Configure.ind
---- betriebsbereit: senden via U_L_Data*, empfangen via DATA_READY + L_Data_*.ind ---
+--- betriebsbereit: senden via U_L_Data*, empfangen über den SSP-RX-FIFO ---
 ```
 
 ---
@@ -182,26 +199,22 @@ Im DR-Zweig von `ssp_write_byte` **vor** dem Bridge-/Loopback-Zweig:
 
 ```cpp
 if (ncn5130::enabled(static_cast<int>(idx))) {
-    s.dr_rx = ncn5130::spi_exchange(static_cast<uint8_t>(s.tx & 0xFFu));
+    rxv = ncn5130::spi_exchange(static_cast<uint8_t>(s.tx & 0xFFu));
 } else if (ssp_is_bridged(idx)) {
-    …  // reale SPI-HW (unveraendert)
+    …  // reale SPI-HW
 } else {
-    s.dr_rx = s.tx;  // Loopback
+    rxv = s.tx;  // Loopback
 }
-s.tx = 0;
-s.ris |= 0x4u;                        // RX-FIFO not empty
-if (s.imsc & 0x4u) irq_inject::pend(s.irq_num);
+ssp_rx_push(s, rxv);     // RX-FIFO (8), RNE/RXRIS, SSP-IRQ bei IMSC.RXIM
+ssp_ncn_pump(idx);       // weitere NCN-Bytes nachtakten
 ```
 
-Der übrige SSP-Pfad (`SR`/`RIS`/IRQ) bleibt unverändert. `ssp_read_byte` liefert `s.dr_rx`
-wie gehabt.
+### B.3 Datenzustellung (NCN als SPI-Master)
 
-### B.3 DATA_READY / IRQ-Anbindung
-
-`push_rx_frame` setzt `data_ready=true` und pendet – **level-gehalten** – den zugeordneten
-LPC-IRQ über einen PINT-Kanal (`irq_inject::pend`). Das Halte-Flag wird gelöscht, wenn der
-Gast den RX-Puffer geleert hat (analog `g_uart0_rx_signaled`, Lessons #31/#32). Pollt der
-Gast nur, spiegelt ein GPIO-Read den `data_ready`-Zustand.
+`ssp_ncn_pump()` holt per `ncn5130::pull_byte()` anstehende Bytes in den SSP-RX-FIFO, solange
+dort Platz ist – nach jedem `DR`-Zugriff, bei jedem `SR`-Read und im SysTick-Shim. Dabei wird
+auch `ncn5130::poll()` getrieben (Sende-Abschluss), sodass ein pollender Gast nicht vom
+Host-Takt abhängt. Solange eine Sendung läuft, hält `ncn5130::busy()` den Host-Takt aktiv.
 
 ### B.4 Back-End-Kontrakt (PHY)
 
@@ -210,7 +223,7 @@ Gast nur, spiegelt ein GPIO-Read den `data_ready`-Zustand.
 | RX (Bus→Host) | PIO/CT liefert Frame → `push_rx_frame()` | CT-Capture bzw. PIO-RX auf Sekundär-Pin |
 | TX (Host→Bus) | `pop_tx_frame()` → PIO/CT sendet | CT-Match bzw. PIO-TX auf Sekundär-Pin |
 | TX-Ende | `tx_result(pos/neg)` → `L_Data.con` | nach Repetition/ACK-Fenster |
-| Test | Loopback: `push_rx_frame(pop_tx_frame())` | ohne Transceiver |
+| Test | `ncn loopback on`: gesendetes Frame zusätzlich als empfangenes Frame zustellen | ohne Transceiver |
 
 ### B.5 CLI (Vorschlag, analog `i2c`/`cdc`)
 

@@ -9,6 +9,14 @@ das der emulierte LPC-Gast über seine **SSP/SPI-Schnittstelle** anspricht. Es e
 nachgebildet, wie es der Gast-Treiber (Referenzsoftware, noch zu bauen) tatsächlich sieht.
 Alle Byte-Codes und Protokolleigenschaften unten sind aus dem Datenblatt verifiziert.
 
+> **Hinweis (Umsetzung, 2026-09):** Maßgeblich für Treiber ist `docs/NCN5130_INTERFACE.md`.
+> Gegenüber diesem Entwurf wurden bei der Prüfung gegen das Datenblatt korrigiert:
+> `U_FrameState.ind` = `0x13`+Flags (nicht `0x0B`), `L_Data_*.ind` ist das Control-Octet
+> selbst (kein Präfix), Reihenfolge `U_FrameState.ind` vor `U_FrameEnd.ind`, Echo jeder
+> Sendung, Index/Offset/Checksumme bei `U_L_Data*`, CRC-CCITT, Statusbyte ohne TW-Bit,
+> `U_Reset.ind` nach `U_ExitStopMode.req`; statt DATA_READY über PINT liefert das SSP-Modell
+> die Bytes über den RX-FIFO (NCN als SPI-Master).
+
 > Schwesterdokument: **`docs/NCN5130_INTERFACE.md`** — die Schnittstellenbeschreibung
 > (Emulator-C++-API + Gast-seitiger Treiber-Kontrakt).
 

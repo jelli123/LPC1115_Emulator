@@ -34,10 +34,14 @@ constexpr uint8_t IND_STATE     = 0x07;  // U_State.ind (fehlerfrei; +Flags)
 constexpr uint8_t IND_SYSSTAT   = 0x4B;  // U_SystemStat.ind (+ 1 Statusbyte)
 constexpr uint8_t IND_STOPMODE  = 0x2B;  // U_StopMode.ind
 constexpr uint8_t IND_FRAMEEND  = 0xCB;  // U_FrameEnd.ind (nur mit MARKER)
+constexpr uint8_t IND_FRAMESTATE= 0x13;  // U_FrameState.ind "re ce te 1 res 0 1 1" (fehlerfrei)
+constexpr uint8_t FS_RE = 0x80, FS_CE = 0x40;   // U_FrameState: Paritaet/Bit-, Checksummen-/Laengenfehler
+constexpr uint8_t ST_RE = 0x40;          // U_State.ind "sc re te pe tw 1 1 1": receive error
 constexpr uint8_t CON_POS       = 0x8B;  // L_Data.con positiv
 constexpr uint8_t CON_NEG       = 0x0B;  // L_Data.con negativ
-constexpr uint8_t IND_LDATA_STD = 0x90;  // L_Data_Standard.ind Basis (10r1..)
-constexpr uint8_t IND_LDATA_EXT = 0x10;  // L_Data_Extended.ind Basis (00r1..)
+// L_Data_Standard/Extended.ind sind KEINE eigenen Praefix-Bytes: das empfangene
+// KNX-Control-Octet selbst (10r1pp00 / 00r1pp00) ist die Indication, danach
+// folgen die Frame-Bytes transparent (Datenblatt Tab. 13, Fig. 50).
 
 // --- Kommando-Parser-Zustand ----------------------------------------------
 enum Cmd : uint8_t {
@@ -49,7 +53,7 @@ enum Cmd : uint8_t {
     CMD_LDATA_CTRL,   // 1 Folgebyte: Control-/Daten-/Check-Octet
 };
 
-constexpr uint16_t FRAME_MAX = 280;   // Standard/Extended KNX-Frame + Overhead
+constexpr uint16_t FRAME_MAX = 320;   // Index bis 4*64+63 (U_L_DataOffset) + Checksumme
 constexpr uint16_t RESP_MAX  = 512;   // Antwort-/Indication-Ring (Bytes)
 
 struct Model {
@@ -70,6 +74,8 @@ struct Model {
     uint8_t  cmd_buf[4];       // gesammelte Folgebytes
     uint8_t  cmd_got;          // Anzahl gesammelter Folgebytes
     uint8_t  intreg_addr;      // aaa fuer INTREGWR
+    uint16_t ldata_index;      // Zielindex des naechsten U_L_Data*-Folgebytes
+    bool     ldata_end;        // Folgebyte ist die Checksumme (U_L_DataEnd)
 
     // Sende-Frame (Host -> Bus): Assembly-Puffer
     uint8_t  tx_frame[FRAME_MAX];
@@ -214,21 +220,63 @@ uint8_t resp_pop() {
     return b;
 }
 
-// DATA_READY-Level nachfuehren: solange Antwort-Bytes anstehen ODER ein
-// RX-Frame nicht komplett abgeholt ist, signalisieren wir dem Gast einen IRQ.
-// Level-gehalten (analog uart0-RX, Lessons #31/#32): nur bei Flanke penden.
-bool g_irq_signaled = false;
+// Datenbereitschaft: Der NCN5130 ist SPI-MASTER und taktet anstehende Bytes
+// selbst zum Host (es gibt im SPI-Modus keinen DATA_READY-Pin). Die Zustellung
+// an den Gast uebernimmt daher das SSP-Modell (peripherals.cpp, ssp_ncn_pump):
+// es holt per pull_byte() Bytes in den RX-FIFO, sobald dort Platz ist, und
+// meldet sie ueber RNE/RXRIS + SSP-IRQ - wie am echten Chip.
 
-void update_data_ready() {
-    bool ready = !resp_empty() || g.rx_ready;
-    if (ready) {
-        if (!g_irq_signaled && g.ssp >= 0) {
-            g_irq_signaled = true;
-            irq_inject::pend(g.ssp == 0 ? lpc_irq::SSP0 : lpc_irq::SSP1);
-        }
-    } else {
-        g_irq_signaled = false;
+// KNX-Checksumme: NOT(XOR aller Bytes) -> XOR ueber Frame inkl. Checksumme = 0xFF.
+bool knx_checksum_ok(const uint8_t* d, uint16_t len) {
+    if (len < 2) return false;
+    uint8_t x = 0;
+    for (uint16_t i = 0; i < len; ++i) x ^= d[i];
+    return x == 0xFFu;
+}
+
+// CRC-CCITT laut Datenblatt S. 53: Polynom 0x1021, Start 0xFFFF, kein Reflect,
+// kein Final-XOR ("123456789" -> 0x29B1).
+uint16_t crc_ccitt(const uint8_t* d, uint16_t len) {
+    uint16_t crc = 0xFFFFu;
+    for (uint16_t i = 0; i < len; ++i) {
+        crc ^= static_cast<uint16_t>(d[i]) << 8;
+        for (int b = 0; b < 8; ++b)
+            crc = (crc & 0x8000u) ? static_cast<uint16_t>((crc << 1) ^ 0x1021u)
+                                  : static_cast<uint16_t>(crc << 1);
     }
+    return crc;
+}
+
+// Frame-Bytes transparent zum Host; mit MARKER wird 0xCB verdoppelt, damit der
+// Host Daten-0xCB von U_FrameEnd.ind unterscheiden kann (Bem. zu Fig. 50-55).
+void push_frame_bytes(const uint8_t* data, uint16_t len) {
+    for (uint16_t i = 0; i < len; ++i) {
+        resp_push(data[i]);
+        if ((g.cfg & CFG_MARKER) && data[i] == IND_FRAMEEND) resp_push(data[i]);
+    }
+    if (g.cfg & CFG_CRC) {                   // CRC-CCITT, Low-Byte zuerst (Fig. 55)
+        uint16_t crc = crc_ccitt(data, len);
+        resp_push(static_cast<uint8_t>(crc & 0xFFu));
+        resp_push(static_cast<uint8_t>(crc >> 8));
+    }
+}
+
+// Empfangenes KNX-Frame zum Host (Fig. 50-55, SPI-Modus):
+//   Frame-Bytes [+CRC], U_FrameState.ind, [U_FrameEnd.ind bei MARKER]
+void emit_rx_frame(const uint8_t* data, uint16_t len, uint8_t fs_flags) {
+    if (!knx_checksum_ok(data, len)) fs_flags |= FS_CE;
+    push_frame_bytes(data, len);
+    resp_push(static_cast<uint8_t>(IND_FRAMESTATE | fs_flags));
+    if (g.cfg & CFG_MARKER) resp_push(IND_FRAMEEND);
+}
+
+// Abschluss einer Sendung (Fig. 44/47/48): jedes gesendete Oktett geht als Echo
+// zurueck, dann U_FrameState.ind, L_Data.con, [U_FrameEnd.ind bei MARKER].
+void emit_tx_complete(bool positive) {
+    push_frame_bytes(g.tx_frame, g.tx_len);
+    resp_push(IND_FRAMESTATE);
+    resp_push(positive ? CON_POS : CON_NEG);
+    if (g.cfg & CFG_MARKER) resp_push(IND_FRAMEEND);
 }
 
 // --- Zustandswechsel -------------------------------------------------------
@@ -252,41 +300,33 @@ void enter_reset() {
     // die U_SystemState-Abfrage liefert Mode=Normal).
     g.state = ST_NORMAL;
     resp_push(IND_RESET);                  // U_Reset.ind bei Erreichen Normal
-    update_data_ready();
 }
 
-// U_SystemStat.ind-Statusbyte: obere Bits = Analog-Status ("gut"), Bits1..0 =
-// Mode. Exaktes Bitlayout siehe Datenblatt S.37 (TODO: HW-Abgleich); fuer den
-// Emulator sind die Analog-Bits fix gesetzt.
+// U_SystemStat.ind-Statusbyte (S. 37): Bit7..3 = V20V VDD2 VBUS VFILT XTAL
+// ('1' = im Normalbereich), Bit2 = TW (Temperaturwarnung, '1' = Warnung),
+// Bit1..0 = Mode. Frueher 0xFC -> meldete faelschlich eine Temperaturwarnung.
 uint8_t sysstat_byte() {
-    return static_cast<uint8_t>(0xFCu | (g.state & 0x03u));
+    return static_cast<uint8_t>(0xF8u | (g.state & 0x03u));
 }
 
-// Ein empfangenes KNX-Frame als L_Data_*.ind + Bytes in den Antwort-FIFO legen.
-void emit_rx_frame(const uint8_t* data, uint16_t len, bool extended) {
-    // Control-Byte: r=1 (nicht wiederholt), Prio aus dem Frame nicht bekannt ->
-    // 0. Basis 0x90 (Standard) bzw. 0x10 (Extended); der Gast wertet die Bytes
-    // ohnehin selbst aus (L2 im Gast).
-    resp_push(extended ? IND_LDATA_EXT : IND_LDATA_STD);
-    for (uint16_t i = 0; i < len; ++i) resp_push(data[i]);
-    if (g.cfg & CFG_MARKER) {
-        resp_push(IND_FRAMEEND);           // U_FrameEnd.ind
-        resp_push(IND_STATE);              // U_FrameState.ind (fehlerfrei-Basis)
-    }
+uint8_t configure_ind() {
+    return static_cast<uint8_t>(0x01u
+         | ((g.cfg & CFG_BUSY)     ? 0x40u : 0u)
+         | ((g.cfg & CFG_AUTOACK)  ? 0x20u : 0u)
+         | ((g.cfg & CFG_AUTOPOLL) ? 0x10u : 0u)
+         | ((g.cfg & CFG_CRC)      ? 0x08u : 0u)
+         | ((g.cfg & CFG_MARKER)   ? 0x04u : 0u));
 }
 
 // --- Kommando-Ausfuehrung (nach vollstaendigem Empfang) --------------------
 void exec_setaddr() {
     g.phys_addr = static_cast<uint16_t>((g.cmd_buf[0] << 8) | g.cmd_buf[1]);
-    g.cfg |= CFG_AUTOACK;
-    // U_Configure.ind: 0 b aa ap c m 0 1
-    uint8_t ind = 0x01u
-                | ((g.cfg & CFG_BUSY)     ? 0x40u : 0u)
-                | ((g.cfg & CFG_AUTOACK)  ? 0x20u : 0u)
-                | ((g.cfg & CFG_AUTOPOLL) ? 0x10u : 0u)
-                | ((g.cfg & CFG_CRC)      ? 0x08u : 0u)
-                | ((g.cfg & CFG_MARKER)   ? 0x04u : 0u);
-    resp_push(ind);
+    // U_Configure.ind nur bei der Aktivierung von Auto-Acknowledge (S. 35:
+    // weitere Aufrufe setzen nur die Adresse).
+    if (!(g.cfg & CFG_AUTOACK)) {
+        g.cfg |= CFG_AUTOACK;
+        resp_push(configure_ind());
+    }
 }
 
 void exec_configure(uint8_t ctrl) {
@@ -295,34 +335,22 @@ void exec_configure(uint8_t ctrl) {
     if (ctrl & 0x04u) g.cfg |= CFG_AUTOPOLL;
     if (ctrl & 0x02u) g.cfg |= CFG_CRC;
     if (ctrl & 0x01u) g.cfg |= CFG_MARKER;
-    uint8_t ind = 0x01u
-                | ((g.cfg & CFG_BUSY)     ? 0x40u : 0u)
-                | ((g.cfg & CFG_AUTOACK)  ? 0x20u : 0u)
-                | ((g.cfg & CFG_AUTOPOLL) ? 0x10u : 0u)
-                | ((g.cfg & CFG_CRC)      ? 0x08u : 0u)
-                | ((g.cfg & CFG_MARKER)   ? 0x04u : 0u);
-    resp_push(ind);
+    resp_push(configure_ind());
 }
 
 void tx_finalize() {
     g.tx_building = false;
-    if (g.tx_len == 0) return;
     g.tx_pending = true;
     ++g.tx_frames;
     // Modelliertes KNX-TP1-Timing: ~1.15 ms je Oktett (9600 bit/s, 11 bit je
     // Oktett) + ~5 ms Prioritaets-/ACK-Fenster. Die L_Data.con folgt in poll()
-    // (Core1), NICHT synchron im SPI-Exchange - real dauert die Bus-Sendung
-    // Millisekunden, und der Gast wartet zwischenzeitlich auf die con.
+    // (Core1), NICHT synchron im SPI-Exchange.
     uint64_t dur = static_cast<uint64_t>(g.tx_len) * 1150u + 5000u;
     g.tx_done_us = time_us_64() + dur;
-    // Die eigentliche Bus-Sendung + L_Data.con uebernimmt das interne Back-End
-    // (poll()) bzw. ein externer PHY (pop_tx_frame -> tx_result).
 }
 
 // Ein einzelnes vom Host empfangenes Control-Byte dekodieren + ausfuehren.
 void decode_control(uint8_t b) {
-    // Multi-Byte-Kommandos setzen g.cmd/g.cmd_need; die Folgebytes landen in
-    // collect_data().
     if (b == 0x01) { enter_reset(); return; }                 // U_Reset.req
     if (b == 0x02) { resp_push(IND_STATE); return; }          // U_State.req
     if (b == 0x03) { g.cfg |= CFG_BUSY;  return; }            // U_SetBusy.req
@@ -331,14 +359,15 @@ void decode_control(uint8_t b) {
     if (b >= 0x08 && b <= 0x0C) { g.data_offset = static_cast<uint8_t>(b - 0x08); return; } // U_L_DataOffset
     if (b == 0x0D) { resp_push(IND_SYSSTAT); resp_push(sysstat_byte()); return; } // U_SystemState.req
     if (b == 0x0E) { g.state = ST_STOP;   resp_push(IND_STOPMODE); return; }      // U_StopMode.req
-    if (b == 0x0F) { g.state = ST_NORMAL; return; }           // U_ExitStopMode.req
+    if (b == 0x0F) {                                          // U_ExitStopMode.req
+        // Stop -> Sync -> Normal; bestaetigt mit U_Reset.ind (Fig. 40).
+        if (g.state == ST_STOP) { g.state = ST_NORMAL; resp_push(IND_RESET); }
+        return;
+    }
     if (b >= 0x10 && b <= 0x17) {                             // U_Ackn.req (n/b/a)
-        // Host quittiert ein empfangenes Frame -> Kurz-Acknowledge auf den Bus
-        // (adressiert=ACK 0xCC, busy=0xC0, nack=0x0C). RX-Ready loeschen.
         phy_queue_ack(static_cast<uint8_t>(b & 0x07u));
         g.rx_ready = false;
         g.cfg &= ~CFG_BUSY;                                   // Ackn hebt Busy auf
-        update_data_ready();
         return;
     }
     if (b >= 0x18 && b <= 0x1F) { exec_configure(b); return; }// U_Configure.req
@@ -351,20 +380,25 @@ void decode_control(uint8_t b) {
         resp_push(g.ireg[b & 0x07u]);
         return;
     }
-    if (b >= 0x47 && b <= 0x7F) {                             // U_L_DataEnd.req (+FCS)
-        g.cmd = CMD_LDATA_CTRL; g.cmd_need = 1; g.cmd_got = 0;
-        g.cmd_buf[3] = 0xFF;   // Marker: DataEnd (vs. Start/Cont)
-        return;
-    }
+    // Sendedaten: Byte-Position = Offset*64 + Index (Tab. 12, S. 40); Bytes
+    // duerfen in beliebiger Reihenfolge kommen und ueberschrieben werden.
     if (b == 0x80) {                                          // U_L_DataStart.req (+CTRL)
-        g.tx_len = 0; g.tx_building = true;
+        g.data_offset = 0;                                    // Start setzt den Offset zurueck
+        g.tx_building = true;
         g.cmd = CMD_LDATA_CTRL; g.cmd_need = 1; g.cmd_got = 0;
-        g.cmd_buf[3] = 0x00;   // Marker: Start/Cont-Byte anhaengen
+        g.ldata_index = 0; g.ldata_end = false;
         return;
     }
     if (b >= 0x81 && b <= 0xBF) {                             // U_L_DataCont.req (+Data)
         g.cmd = CMD_LDATA_CTRL; g.cmd_need = 1; g.cmd_got = 0;
-        g.cmd_buf[3] = 0x00;   // anhaengen
+        g.ldata_index = static_cast<uint16_t>(g.data_offset * 64u + (b & 0x3Fu));
+        g.ldata_end = false;
+        return;
+    }
+    if (b >= 0x47 && b <= 0x7F) {                             // U_L_DataEnd.req (+FCS)
+        g.cmd = CMD_LDATA_CTRL; g.cmd_need = 1; g.cmd_got = 0;
+        g.ldata_index = static_cast<uint16_t>(g.data_offset * 64u + (b & 0x3Fu)); // = Laenge
+        g.ldata_end = true;
         return;
     }
     if (b >= 0xE0 && b <= 0xEE) {                             // U_PollingState.req (3B)
@@ -373,7 +407,7 @@ void decode_control(uint8_t b) {
     }
     if (b == 0xF1) { g.cmd = CMD_SETADDR; g.cmd_need = 3; g.cmd_got = 0; return; } // U_SetAddress
     if (b == 0xF2) { g.cmd = CMD_SETREP;  g.cmd_need = 3; g.cmd_got = 0; return; } // U_SetRepetition
-    // Unbekannt -> ignorieren (kein Haenger; Dummy).
+    // Unbekannt (auch 0x00-Fuellbytes) -> ignorieren.
 }
 
 // Ein Folgebyte eines Multi-Byte-Kommandos verarbeiten.
@@ -387,14 +421,20 @@ void collect_data(uint8_t b) {
         case CMD_SETREP:    g.rep_cnt = g.cmd_buf[0]; break;
         case CMD_POLLSTATE: /* Poll-Slot gesetzt; im Emulator ohne Wirkung */ break;
         case CMD_INTREGWR:  g.ireg[g.intreg_addr] = g.cmd_buf[0]; break;
-        case CMD_LDATA_CTRL:
-            if (g.cmd_buf[3] == 0xFF) {          // DataEnd: FCS anhaengen + senden
-                if (g.tx_building && g.tx_len < FRAME_MAX) g.tx_frame[g.tx_len++] = g.cmd_buf[0];
-                tx_finalize();
-            } else {                             // Start/Cont: Octet anhaengen
-                if (g.tx_building && g.tx_len < FRAME_MAX) g.tx_frame[g.tx_len++] = g.cmd_buf[0];
+        case CMD_LDATA_CTRL: {
+            const uint16_t idx = g.ldata_index;
+            if (!g.tx_building || idx + 1u >= FRAME_MAX) break;
+            g.tx_frame[idx] = g.cmd_buf[0];
+            if (g.ldata_end) {
+                // Laenge = letzter Index + 1, danach die Checksumme. Nur bei
+                // korrekter Checksumme wird gesendet, sonst U_State.ind mit
+                // Receive-Error (S. 39).
+                g.tx_len = static_cast<uint16_t>(idx + 1u);
+                if (knx_checksum_ok(g.tx_frame, g.tx_len)) tx_finalize();
+                else { g.tx_building = false; resp_push(static_cast<uint8_t>(IND_STATE | ST_RE)); }
             }
             break;
+        }
         default: break;
     }
     g.cmd = CMD_NONE; g.cmd_need = 0; g.cmd_got = 0;
@@ -543,11 +583,9 @@ void phy_finish_frame() {
         return;
     }
     if (p.rx_buf_len > 0) {
-        bool extended = !(p.rx_buf[0] & 0x80u);   // FT-Bit: 1=Standard 0=Extended
-        emit_rx_frame(p.rx_buf, p.rx_buf_len, extended);
+        emit_rx_frame(p.rx_buf, p.rx_buf_len, p.rx_frame_err ? FS_RE : 0u);
         g.rx_ready = true;
         ++g.rx_frames;
-        update_data_ready();
         p.rx_frame_end_wall = now;                // Basis fuer ACK-Timing
     }
     p.rx_buf_len = 0;
@@ -657,7 +695,7 @@ void phy_init(int tx_pin, int rx_pin) {
     // Alte State-Machines freigeben.
     if (p.tx_h >= 0) pio_glue::tx_teardown(p.tx_h);
     if (p.rx_h >= 0) pio_glue::ts_teardown(p.rx_h);
-    std::memset(&p, 0, sizeof p);
+    p = Phy{};
     p.tx_h = p.rx_h = -1;
     p.tx_pin = tx_pin;
     p.rx_pin = rx_pin;
@@ -692,16 +730,16 @@ void poll() {
     if (!g.tx_pending) return;
     if (time_us_64() < g.tx_done_us) return;
 
-    // Selbsttest/Monitor: eigenes Frame als L_Data_*.ind zurueckspiegeln.
-    // FT-Bit (Frame Type) = Bit7 des Control-Octets: 1=Standard, 0=Extended.
-    if (g.loopback || g.busmon) {
-        bool extended = !(g.tx_len > 0 && (g.tx_frame[0] & 0x80u));
-        emit_rx_frame(g.tx_frame, g.tx_len, extended);
+    // Sendung abgeschlossen: Echo + U_FrameState.ind + L_Data.con (positiv).
+    g.tx_pending = false;
+    tx_result(true);
+    // Selbsttest: das Frame zusaetzlich wie von einem anderen Teilnehmer
+    // empfangen zustellen (testet den RX-Pfad des Gasts ohne KNX-Bus).
+    if (g.loopback) {
+        emit_rx_frame(g.tx_frame, g.tx_len, 0);
         g.rx_ready = true;
         ++g.rx_frames;
     }
-    g.tx_pending = false;
-    tx_result(true);        // L_Data.con positiv (+ update_data_ready)
 }
 
 uint8_t spi_exchange(uint8_t mosi) {
@@ -711,16 +749,15 @@ uint8_t spi_exchange(uint8_t mosi) {
     // 2) MOSI-Byte in den Kommando-Parser geben.
     if (g.cmd != CMD_NONE) collect_data(mosi);
     else                   decode_control(mosi);
-    update_data_ready();
     return miso;
 }
 
 void push_rx_frame(const uint8_t* data, uint16_t len, bool extended) {
     if (!data || len == 0) return;
-    emit_rx_frame(data, len, extended);
+    (void)extended;                        // Frame-Typ steckt im Control-Octet
+    emit_rx_frame(data, len, 0);
     g.rx_ready = true;
     ++g.rx_frames;
-    update_data_ready();
 }
 
 bool pop_tx_frame(const uint8_t** data, uint16_t* len) {
@@ -732,11 +769,18 @@ bool pop_tx_frame(const uint8_t** data, uint16_t* len) {
 }
 
 void tx_result(bool positive) {
-    resp_push(positive ? CON_POS : CON_NEG);
-    update_data_ready();
+    emit_tx_complete(positive);
 }
 
-bool data_ready() { return !resp_empty() || g.rx_ready; }
+bool data_ready() { return !resp_empty(); }
+
+bool busy() { return g.enabled && (g.tx_pending || p.active); }
+
+bool pull_byte(uint8_t& b) {
+    if (!g.enabled || resp_empty()) return false;
+    b = resp_pop();
+    return true;
+}
 
 Debug debug() {
     Debug d{};
