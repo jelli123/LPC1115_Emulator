@@ -352,8 +352,8 @@ bool find_hex_entry(uint16_t& cluster, uint32_t& size,
 //   ncn_loopback=on|off      Selbsttest: gesendete Frames als RX zurueckspiegeln
 //   tcap.<t>=<rp-gpio>        Timer-Capture-Eingang (KNX-RX), t=0..3
 //   tmat.<t>.<m>=<rp-gpio>    Timer-Match-Ausgang (KNX-TX), t=0..3, m=0..3
-//   tcap_pio=on|off          Capture flankengenau per PIO (opt-in)
-//   tmatch_pio=on|off        Match/PWM-Ausgangspuls hardware-getaktet per PIO (opt-in)
+//   tcap_pio=on|off          Capture flankengenau per PIO (Default on)
+//   tmatch_pio=on|off        Match/PWM-Ausgangspuls hardware-getaktet per PIO (Default on)
 //   wfi_pin_wakeup=on|off   (opt-in)
 //   primask_shadow=on|off   (opt-in)
 //
@@ -777,8 +777,14 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     A("\n");
 
     A("# --- KNX-Bus / Timer-Capture+Match (CT16/CT32 auf GPIOs) -------\n");
+    A("# tcap_pio / tmatch_pio: Capture-Zeitstempel bzw. Match-/PWM-Pulse per PIO\n");
+    A("#   (flankengenau). off = Software-Pfad, nur fuer langsame Signale - fuer\n");
+    A("#   KNX-Bit-Timing (35-us-Pulse) ungeeignet. Default on.\n");
+    A("tcap_pio=%s\n", config::tcap_pio() ? "on" : "off");
+    A("tmatch_pio=%s\n", config::tmatch_pio() ? "on" : "off");
     A("# tcap.<t>=<gpio>   Capture-Eingang (Bus-RX), t: 0=CT16B0 1=CT16B1 2=CT32B0 3=CT32B1\n");
     A("# tmat.<t>.<m>=<gpio> Match-Ausgang (Bus-TX), m=0..3\n");
+    A("# Pin entfernen/abschalten: Zeile loeschen oder Wert -1.\n");
     for (int t = 0; t < 4; ++t) {
         if (config::ct_capture_pin(t) >= 0)
             A("tcap.%d=%d\n", t, config::ct_capture_pin(t));
@@ -786,10 +792,7 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
             if (config::ct_match_pin(t, mm) >= 0)
                 A("tmat.%d.%d=%d\n", t, mm, config::ct_match_pin(t, mm));
     }
-    A("# Beispiel KNX auf CT16B1:  #tcap.1=15   #tmat.1.0=14\n");
-    A("# tcap_pio / tmatch_pio: flankengenaue Capture/PWM per PIO (opt-in).\n");
-    A("%stcap_pio=%s\n", config::tcap_pio() ? "" : "#", config::tcap_pio() ? "on" : "off");
-    A("%stmatch_pio=%s\n\n", config::tmatch_pio() ? "" : "#", config::tmatch_pio() ? "on" : "off");
+    A("# Beispiel KNX auf CT16B1:  #tcap.1=15   #tmat.1.0=14\n\n");
 
     A("# --- Experimentell (opt-in) ------------------------------------\n");
     A("# wfi_pin_wakeup: WFI der Firmware auf Pin-/Timer-Wakeup patchen.\n");

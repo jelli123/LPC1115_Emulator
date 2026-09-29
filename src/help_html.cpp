@@ -54,7 +54,8 @@ vom Laufwerk (Medienwechsel); die uebrigen Dateien bleiben.</div>
 
 <h2>CLI-Befehle (USB-CLI-CDC, 115200&nbsp;8N1)</h2>
 <table><tr><th>Befehl</th><th>Wirkung</th></tr>
-<tr><td><code>help</code> / <code>version</code></td><td>Hilfe / Build-Info</td></tr>
+<tr><td><code>help [cmd]</code> / <code>version</code></td><td>Hilfe (auch zu einzelnem Befehl) / Build-Info. Befehle sind abkuerzbar, TAB vervollstaendigt.</td></tr>
+<tr><td><code>reboot</code> / <code>bootsel</code></td><td>RP2350 neu starten / in den USB-Bootloader (Update per <code>picotool load</code> oder UF2)</td></tr>
 <tr><td><code>stats</code></td><td>Status &amp; Zaehler (siehe unten)</td></tr>
 <tr><td><code>run</code> / <code>stop</code> / <code>reset</code></td><td>Gast starten / anhalten / neu starten</td></tr>
 <tr><td><code>step</code></td><td>ein Befehl, dann anhalten</td></tr>
@@ -62,15 +63,20 @@ vom Laufwerk (Medienwechsel); die uebrigen Dateien bleiben.</div>
 <tr><td><code>erase</code></td><td>Firmware-Slot komplett leeren</td></tr>
 <tr><td><code>info</code></td><td>Reset-Vektor, Stack, Groesse</td></tr>
 <tr><td><code>autostart on|off</code></td><td>nach Reset automatisch starten</td></tr>
-<tr><td><code>cfg list|get|set|save</code></td><td>Konfiguration lesen/setzen/speichern</td></tr>
+<tr><td><code>cfg show|get|set|save|clear</code></td><td>Konfiguration; <code>set</code> wirkt sofort (on/off erlaubt), dauerhaft per <code>save</code></td></tr>
+<tr><td><code>dbg [clear|save|auto]</code></td><td>Debug-Ausgabe des Gasts (Debug-Bridge) / als <code>DEBUG.TXT</code></td></tr>
 <tr><td><code>pinmap show|set|reset</code></td><td>LPC-Pin &rarr; RP2350-GPIO</td></tr>
-<tr><td><code>gdb on|off</code>, <code>bp</code>, <code>regs</code>, <code>mem</code></td><td>Debugger (GDB-Stub auf der GDB-CDC)</td></tr>
+<tr><td><code>gdb on|off|status</code></td><td>GDB-Stub auf der GDB-CDC (Adressen in LPC-Sicht, passend zur ELF)</td></tr>
+<tr><td><code>halt</code>, <code>step</code>, <code>regs</code>, <code>bp [clr] &lt;addr&gt;</code>, <code>mem &lt;addr&gt; &lt;len&gt;</code></td><td>Gast anhalten, Einzelschritt, Register, Breakpoints, Speicher (Flash/RAM)</td></tr>
 <tr><td><code>swd start &lt;dio&gt; &lt;clk&gt;</code></td><td>externes SWD-Target (clk = dio+1)</td></tr>
 <tr><td><code>cdc start|stop|status</code></td><td>USB&harr;UART-Adapter (Serial-CDC &harr; PIO-UART, beliebige GPIOs)</td></tr>
 <tr><td><code>uart pins|cdc|status</code></td><td>LPC-UART0 des Gasts: echte RP-Pads bzw. virtuell an Serial-CDC</td></tr>
 <tr><td><code>isp</code>, <code>isp enter|exit</code></td><td>ISP-Bootloader (FlashMagic: ISP-COM-Port, Option &bdquo;Use DTR and RTS&ldquo;)</td></tr>
 <tr><td><code>resetpin on|off</code></td><td>P0_0 als RESET-Eingang des Gasts</td></tr>
 <tr><td><code>i2c on|off|status</code></td><td>I2C-Bridge auf echte RP2350-Hardware</td></tr>
+<tr><td><code>ncn on|off|loopback|status</code></td><td>virtueller NCN5130 (KNX-Transceiver) an LPC-SSP0/1</td></tr>
+<tr><td><code>pio capture &lt;pin&gt; &lt;n&gt;</code></td><td>Flanken-Logger (Richtung + Abstand in &micro;s), liest den Pin rueckwirkungsfrei mit</td></tr>
+<tr><td><code>gpio &lt;n&gt; [up|down|none|inv|noinv]</code></td><td>RP2350-Pin: Funktion, Richtung, Pegel, Pull; Eingang invertieren</td></tr>
 </table>
 
 <h2>Ausgabe von <code>stats</code></h2>
@@ -84,11 +90,11 @@ vom Laufwerk (Medienwechsel); die uebrigen Dateien bleiben.</div>
 <tr><td class="mono">NVIC-W</td><td>Schreibzugriffe auf den Schatten-NVIC (ISER/ICER/ISPR/ICPR/IPR)</td></tr>
 <tr><td class="mono">CPU-target</td><td>uebernommene LPC-Soll-Frequenz (Zeitbasis der Timer). Der reale RP2350-Takt bleibt bei 150&nbsp;MHz.</td></tr>
 <tr><td class="mono">GDB</td><td>GDB-Stub aktiv (on/off)</td></tr>
-<tr><td class="mono">USB-CDC</td><td>dynamische CDC-Zuordnung je COM-Port (z.&nbsp;B. <code>CDC#0=CLI CDC#1=GDB CDC#2=Serial-Adapter</code>); <code>| aus:</code> listet per Config deaktivierte Rollen</td></tr>
+<tr><td class="mono">USB-CDC</td><td>dynamische CDC-Zuordnung je COM-Port (z.&nbsp;B. <code>CDC#0=CLI CDC#1=GDB CDC#2=Serial-Adapter CDC#3=ISP</code>); <code>| aus:</code> listet per Config deaktivierte Rollen</td></tr>
 <tr><td class="mono">PIO used</td><td>belegte/freie PIO-State-Machines + Instruktions-Slots</td></tr>
 </table>
-<div class="note">Die drei USB-CDCs sind einzeln abschaltbar: <code>cli_enable</code>,
-<code>gdb_enable</code>, <code>serial_enable</code> in der CONFIG.INI (Default <b>on</b>).
+<div class="note">Die vier USB-CDCs sind einzeln abschaltbar: <code>cli_enable</code>,
+<code>gdb_enable</code>, <code>serial_enable</code>, <code>isp_enable</code> in der CONFIG.INI (Default <b>on</b>).
 Eine deaktivierte CDC verschwindet komplett vom USB (ein COM-Port weniger); das
 MSC-Laufwerk bleibt immer aktiv. Aenderung wirkt erst nach einem <b>Reset</b>.</div>
 <div class="note">Laeuft der Gast und die Zaehler steigen bei erneutem <code>stats</code>
@@ -124,13 +130,15 @@ sowie <span class="mono">instr@PC</span> (die zwei Instruktions-Halbworte am PC)
 </table>
 <p><small>Weiterlaufen nach einem Fehler: CLI <code>reset</code> bzw. <code>run</code>, oder neue Firmware aufspielen.</small></p>
 
-<h2>Standard-Pinmap (LPC &rarr; RP2350-GPIO)</h2>
-<p>Aenderbar per <code>CONFIG.INI</code> (<code>pin.&lt;port&gt;_&lt;pin&gt;=&lt;gpio&gt;</code>) oder CLI <code>pinmap set</code>.
-GP25 = Status-LED (reserviert); GP26&ndash;29 bleiben fuer die ADC-Bridge frei.</p>
-<table><tr><th>LPC</th><th>GPIO</th><th>LPC</th><th>GPIO</th></tr>
-<tr><td>P0_0&ndash;P0_11</td><td>GP2&ndash;GP13</td><td>P1_8 (KNX-RX)</td><td>GP1</td></tr>
-<tr><td>P1_0&ndash;P1_7</td><td>GP14&ndash;GP21</td><td>P1_9 (KNX-TX)</td><td>GP0</td></tr>
-<tr><td>P1_10</td><td>GP22</td><td>Port&nbsp;2/3</td><td>ungemappt</td></tr>
+<h2>Pinmap (LPC &rarr; RP2350-GPIO)</h2>
+<p>Ab Werk ist <b>kein</b> LPC-Pin gemappt; die Zuordnung legt man selbst fest:
+<code>CONFIG.INI</code> (<code>pin.&lt;port&gt;_&lt;pin&gt;=&lt;gpio&gt;</code>) oder CLI <code>pinmap set 1_8 17</code>.
+GP25 = Status-LED; GP26&ndash;29 sind die ADC-Eingaenge.</p>
+<table><tr><th>Funktion</th><th>Konfiguration</th></tr>
+<tr><td>GPIO des Gasts</td><td><code>pin.&lt;port&gt;_&lt;pin&gt;=&lt;gpio&gt;</code></td></tr>
+<tr><td>LPC-UART0</td><td><code>uart0_tx</code>/<code>uart0_rx</code> (RP-UART-Pads) oder <code>uart0_cdc=on</code> (virtuell)</td></tr>
+<tr><td>KNX-Bus (Timer)</td><td><code>tcap.&lt;t&gt;=&lt;gpio&gt;</code> (RX), <code>tmat.&lt;t&gt;.&lt;m&gt;=&lt;gpio&gt;</code> (TX); <code>tcap_pio</code>/<code>tmatch_pio=on</code> (Default) fuer flankengenaues Timing</td></tr>
+<tr><td>RESET / ISP</td><td><code>pin.0_0</code> + <code>reset_in=on</code>, <code>pin.0_1</code> + <code>isp_pins=on</code></td></tr>
 </table>
 <p><small>LPC1115-Emulator &middot; generiert auf dem Geraet &middot; Details in CONFIG.INI</small></p>
 </body></html>)HTML";

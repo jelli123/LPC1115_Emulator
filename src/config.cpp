@@ -59,8 +59,8 @@ int8_t   g_ct_mat[4][4] = {
     { -1, -1, -1, -1 }, { -1, -1, -1, -1 },
     { -1, -1, -1, -1 }, { -1, -1, -1, -1 },
 };
-bool     g_tcap_pio = false;
-bool     g_tmatch_pio = false;
+bool     g_tcap_pio = true;     // PIO: noetig fuer KNX-Bit-Timing (Software-Pfad zu grob)
+bool     g_tmatch_pio = true;
 
 constexpr int      MAX_GPIO    = 47;          // RP2350-Pinanzahl konservativ
 
@@ -157,7 +157,8 @@ void apply_defaults() {
         g_ct_cap[t] = -1;
         for (int m = 0; m < 4; ++m) g_ct_mat[t][m] = -1;
     }
-    g_tcap_pio = false;
+    g_tcap_pio = true;
+    g_tmatch_pio = true;
 }
 
 // Weist einem LPC-Pin einen RP2350-GPIO zu und erzwingt dabei Eindeutigkeit:
