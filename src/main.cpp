@@ -41,15 +41,9 @@ int main() {
     config::load();
     usb_stdio_init();
 
-    // Bis zu 6 s auf USB-Host warten, damit erste Konsolenausgaben sichtbar sind.
-    // Ist die CLI-CDC deaktiviert, gibt es keinen stdio-Port -> nicht warten.
-    if (config::cli_enabled()) {
-        for (int i = 0; i < 60 && !usb_stdio_connected(); ++i) {
-            usb_stdio_task();
-            sleep_ms(100);
-            led::poll();
-        }
-    }
+    // Kein Warten auf ein Terminal mehr (frueher bis zu 6 s, die den Autostart
+    // verzoegerten): Ausgaben bis zum Verbinden puffert usb_stdio.cpp und
+    // liefert sie nach.
 
     setup_fault_handlers();
     debug_bridge::init();

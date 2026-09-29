@@ -61,9 +61,37 @@ static void stdio_cdc_out_chars(const char* buf, int length) {
     stdio_cdc_write_core0(buf, length);
 }
 
+// Ausgaben, solange kein Terminal an der CLI-CDC haengt (DTR aus), z. B. die
+// Boot-Meldungen: werden hier gepuffert und beim Verbinden nachgeliefert. So
+// muss main() nicht mehr bis zu 6 s auf ein Terminal warten, bevor der Gast
+// per Autostart startet. Nur Core0 (Producer und Consumer). Voll -> neuere
+// Zeichen verwerfen (die ersten 2 KB, also der Boot-Log, bleiben erhalten).
+#define PENDING_SIZE 2048u
+static char     s_pend_buf[PENDING_SIZE];
+static uint32_t s_pend_len = 0;
+
+static void cdc_write_raw(int itf, const char* buf, int length);
+
+static void pending_flush(int itf) {
+    if (s_pend_len == 0) return;
+    const uint32_t n = s_pend_len;
+    s_pend_len = 0;
+    cdc_write_raw(itf, s_pend_buf, (int)n);
+}
+
 static void stdio_cdc_write_core0(const char* buf, int length) {
     int itf = cli_cdc();
-    if (itf < 0 || !tud_cdc_n_connected((uint8_t)itf)) return;
+    if (itf < 0) return;
+    if (!tud_cdc_n_connected((uint8_t)itf)) {
+        for (int i = 0; i < length && s_pend_len < PENDING_SIZE; ++i)
+            s_pend_buf[s_pend_len++] = buf[i];
+        return;
+    }
+    pending_flush(itf);
+    cdc_write_raw(itf, buf, length);
+}
+
+static void cdc_write_raw(int itf, const char* buf, int length) {
     int written = 0;
     while (written < length) {
         uint32_t avail = tud_cdc_n_write_available((uint8_t)itf);
@@ -116,6 +144,8 @@ void usb_stdio_init(void) {
 
 void usb_stdio_task(void) {
     tud_task();
+    const int itf = cli_cdc();
+    if (itf >= 0 && s_pend_len && tud_cdc_n_connected((uint8_t)itf)) pending_flush(itf);
     core1_log_drain();
 }
 
