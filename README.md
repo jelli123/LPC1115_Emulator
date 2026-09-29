@@ -245,26 +245,20 @@ openocd -f interface/cmsis-dap.cfg -f target/lpc11xx.cfg
 arm-none-eabi-gdb fw.elf -ex "target extended-remote :3333"
 ```
 
-## PIO Edge-Capture
+## PIO-Flanken-Zeitstempel und Match-Pulse
 
-[pio_glue.cpp](src/pio_glue.cpp) lädt ein vollständiges PIO-Programm:
+[pio_glue.cpp](src/pio_glue.cpp) stellt zwei PIO-Programme bereit:
 
-```
-.program edge_capture
-    .wrap_target
-        mov   x, !null            ; X = 0xFFFFFFFF
-    loop:
-        jmp   pin   capture       ; Pin == 1?
-        jmp   x--   loop
-    capture:
-        mov   isr, x
-        push  noblock
-    .wrap
-```
+* **`timer_edge_ts`** – frei laufender Zähler, der bei jeder Flanke seinen Stand
+  in die FIFO schiebt (≈ 1 MHz). Grundlage für die Timer-Capture (KNX-RX,
+  `tcap_pio`) und für den Diagnose-Befehl `pio capture <pin> <n>`, der Flanken
+  mit Richtung und Abstand in µs ausgibt. Der Befehl liest den Pin nur mit
+  (Funktion und Richtung bleiben unverändert) und gibt die State-Machine danach frei.
+* **`match_pulse`** – erzeugt Match-/PWM-Pulse hardware-getaktet (`tmatch_pio`),
+  z. B. die 35-µs-Pulse des KNX-Senders.
 
-→ FIFO erhält `0xFFFFFFFF − ticks_until_edge`. Das wird in
-`pio_glue::capture_read()` invertiert und kann von einem
-LPC-CT16/CT32-Capture-Modell als Zeitstempel verwendet werden.
+Beide sind per Default aktiv; der Software-Pfad (`tcap_pio`/`tmatch_pio=off`)
+taugt nur für langsame Signale.
 
 ## Build
 

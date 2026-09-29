@@ -7,133 +7,17 @@
 #include "hardware/gpio.h"
 #include "pico/stdlib.h"
 
+#include "hardware/structs/pads_bank0.h"
 #include "timer_edge_ts.pio.h"  // von pioasm erzeugt (pico_generate_pio_header)
 #include "match_pulse.pio.h"     // von pioasm erzeugt (pico_generate_pio_header)
-
-// ---------------------------------------------------------------------------
-// PIO-Programm: Edge-Capture mit 32-Bit-Cycle-Counter.
-//
-//     .program edge_capture
-//     .wrap_target
-//         mov   x, !null            ; X = 0xFFFFFFFF
-//     loop:
-//         jmp   pin   capture       ; springt, wenn Pin == 1
-//         jmp   x--   loop
-//     capture:
-//         mov   isr, x              ; ISR = X
-//         push  noblock             ; → RX-FIFO
-//     .wrap
-//
-// Maschinen-Code (16-Bit):
-//   0x80a0   ; mov   x, !null
-//   0x00a3   ; jmp   pin, capture(=offset+3)
-//   0x0041   ; jmp   x--, loop(=offset+1)
-//   0xa0a3   ; mov   isr, x
-//   0x8000   ; push  noblock
-// wrap_target=0, wrap=4
-// ---------------------------------------------------------------------------
 
 namespace pio_glue {
 
 namespace {
-
-constexpr uint16_t edge_capture_program_instructions[] = {
-    0x80a0,
-    0x00a3,
-    0x0041,
-    0xa0a3,
-    0x8000,
-};
-
-const struct pio_program edge_capture_program = {
-    .instructions = edge_capture_program_instructions,
-    .length       = 5,
-    .origin       = -1,
-    .pio_version  = 0,
-    .used_gpio_ranges = 0,
-};
-
-constexpr unsigned MAX_HANDLES = 4;
-
-struct Capture {
-    bool      used;
-    PIO       pio;
-    uint      sm;
-    int       offset;
-    uint8_t   gpio;
-    uint32_t  last;
-};
-Capture g_caps[MAX_HANDLES]{};
-
-PIO     g_pio = pio0;
-bool    g_program_loaded = false;
-int     g_program_offset = -1;
-
-bool ensure_program() {
-    if (g_program_loaded) return true;
-    if (!pio_can_add_program(g_pio, &edge_capture_program)) {
-        g_pio = pio1;
-        if (!pio_can_add_program(g_pio, &edge_capture_program)) return false;
-    }
-    g_program_offset = pio_add_program(g_pio, &edge_capture_program);
-    g_program_loaded = true;
-    return true;
-}
-
-void config_sm(PIO pio, uint sm, int offset, uint8_t gpio) {
-    pio_sm_config c = pio_get_default_sm_config();
-    sm_config_set_wrap(&c, offset, offset + 4);
-    sm_config_set_jmp_pin(&c, gpio);
-    sm_config_set_in_pins(&c, gpio);
-    sm_config_set_in_shift(&c, /*shift_right=*/false,
-                               /*autopush=*/false, 32);
-    sm_config_set_clkdiv(&c, 1.0f);
-
-    pio_gpio_init(pio, gpio);
-    pio_sm_set_consecutive_pindirs(pio, sm, gpio, 1, /*is_out=*/false);
-
-    pio_sm_init(pio, sm, offset, &c);
-    pio_sm_set_enabled(pio, sm, true);
-}
-
+constexpr unsigned MAX_HANDLES = 4;   // je Programmtyp
 } // namespace
 
-void init() {
-    for (auto& c : g_caps) c = {};
-    g_program_loaded = false;
-    g_program_offset = -1;
-    g_pio = pio0;
-}
-uint16_t setup_capture(uint8_t rp_gpio, bool /*rising_edge*/) {
-    if (!ensure_program()) {
-        std::printf("[PIO] kein Platz für edge_capture-Programm\n");
-        return 0xFFFF;
-    }
-    for (uint16_t i = 0; i < MAX_HANDLES; ++i) {
-        if (g_caps[i].used) continue;
-        int sm = pio_claim_unused_sm(g_pio, false);
-        if (sm < 0) return 0xFFFF;
-        g_caps[i] = { true, g_pio, static_cast<uint>(sm),
-                      g_program_offset, rp_gpio, 0 };
-        config_sm(g_pio, static_cast<uint>(sm), g_program_offset, rp_gpio);
-        return i;
-    }
-    return 0xFFFF;
-}
-
-bool capture_read(uint16_t handle, uint32_t& out) {
-    if (handle >= MAX_HANDLES) return false;
-    auto& c = g_caps[handle];
-    if (!c.used) return false;
-    if (pio_sm_is_rx_fifo_empty(c.pio, c.sm)) {
-        out = c.last;
-        return false;
-    }
-    uint32_t raw = pio_sm_get(c.pio, c.sm);
-    c.last = 0xFFFF'FFFFu - raw;
-    out = c.last;
-    return true;
-}
+void init() {}
 
 // ---------------------------------------------------------------------------
 // Flankengenaues Timestamping (timer_edge_ts-Programm).
@@ -166,7 +50,7 @@ bool ts_ensure_program() {
 
 } // namespace
 
-int ts_setup(uint8_t rp_gpio, float& out_rate_hz) {
+int ts_setup(uint8_t rp_gpio, float& out_rate_hz, bool claim_pin) {
     if (!ts_ensure_program()) {
         std::printf("[PIO] kein Platz fuer timer_edge_ts-Programm\n");
         return -1;
@@ -192,9 +76,16 @@ int ts_setup(uint8_t rp_gpio, float& out_rate_hz) {
     sm_config_set_in_shift(&c, /*shift_right=*/false, /*autopush=*/false, 32);
     sm_config_set_clkdiv(&c, clkdiv);
 
-    pio_gpio_init(g_ts_pio, rp_gpio);
-    pio_sm_set_consecutive_pindirs(g_ts_pio, static_cast<uint>(sm),
-                                   rp_gpio, 1, /*is_out=*/false);
+    if (claim_pin) {
+        pio_gpio_init(g_ts_pio, rp_gpio);
+        pio_sm_set_consecutive_pindirs(g_ts_pio, static_cast<uint>(sm),
+                                       rp_gpio, 1, /*is_out=*/false);
+    } else {
+        // Nur mitlesen: PIO sieht jeden GPIO-Eingang unabhaengig von dessen
+        // Funktion. Pad-Eingang freischalten, Funktion/Richtung unveraendert.
+        gpio_set_input_enabled(rp_gpio, true);
+        hw_clear_bits(&pads_bank0_hw->io[rp_gpio], PADS_BANK0_GPIO0_ISO_BITS);
+    }
     pio_sm_init(g_ts_pio, static_cast<uint>(sm), g_ts_offset, &c);
     pio_sm_set_enabled(g_ts_pio, static_cast<uint>(sm), true);
 
@@ -275,6 +166,16 @@ int tx_setup(uint8_t rp_gpio, float& out_rate_hz) {
 
     g_tx[slot] = { true, g_tx_pio, static_cast<uint>(sm), rp_gpio };
     return slot;
+}
+
+bool tx_debug(int handle, uint32_t& pc, uint32_t& fifo, uint32_t& pin_out, uint32_t& pin_oe) {
+    if (handle < 0 || handle >= static_cast<int>(MAX_HANDLES) || !g_tx[handle].used) return false;
+    const auto& t = g_tx[handle];
+    pc      = pio_sm_get_pc(t.pio, t.sm) - static_cast<uint32_t>(g_tx_offset);
+    fifo    = pio_sm_get_tx_fifo_level(t.pio, t.sm);
+    pin_out = (t.pio->dbg_padout >> t.gpio) & 1u;
+    pin_oe  = (t.pio->dbg_padoe  >> t.gpio) & 1u;
+    return true;
 }
 
 bool tx_emit(int handle, uint32_t delay_counts, uint32_t width_counts) {

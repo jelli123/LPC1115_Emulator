@@ -14,14 +14,6 @@ namespace pio_glue {
 
 void init();
 
-// Capture-Timer: konfiguriert eine PIO-State-Machine, die einen Pin-
-// Übergang zählt und den Wert in eine FIFO schreibt. Pin = RP2350-GPIO.
-// Liefert die Programm-Offset-Adresse, sonst 0xFFFF wenn voll.
-uint16_t setup_capture(uint8_t rp_gpio, bool rising_edge);
-
-// Liest den letzten erfassten Wert (FIFO-Drain). Liefert false, wenn leer.
-bool capture_read(uint16_t handle, uint32_t& out);
-
 // ---------------------------------------------------------------------------
 // Flankengenaues Timestamping (Input-Capture): Eine PIO-State-Machine fuehrt
 // einen frei laufenden Abwaertszaehler und schiebt bei JEDER Pin-Flanke den
@@ -34,13 +26,18 @@ bool capture_read(uint16_t handle, uint32_t& out);
 // Richtet eine Timestamp-State-Machine fuer `rp_gpio` ein. `out_rate_hz`
 // liefert die tatsaechliche Zaehlrate (Counts/Sekunde), die die CPU zur
 // Umrechnung braucht. Rueckgabe: Handle >= 0, oder -1 bei Fehler/voll.
-int  ts_setup(uint8_t rp_gpio, float& out_rate_hz);
+// claim_pin=false: nur mitlesen (Pin-Funktion/-Richtung bleiben unveraendert).
+int  ts_setup(uint8_t rp_gpio, float& out_rate_hz, bool claim_pin = true);
 
 // Zieht genau einen Flanken-Timestamp aus der FIFO. false = FIFO leer.
 bool ts_read(int handle, uint32_t& counter);
 
 // Gibt die State-Machine wieder frei (vor Neukonfiguration).
 void ts_teardown(int handle);
+
+// Diagnose Match-Puls-SM: Programmzaehler (relativ), TX-FIFO-Fuellstand,
+// PIO-Ausgangspegel und -Treiberfreigabe des Pins.
+bool tx_debug(int handle, uint32_t& pc, uint32_t& fifo, uint32_t& pin_out, uint32_t& pin_oe);
 
 // ---------------------------------------------------------------------------
 // Flankengenaue Match-Puls-Erzeugung (PWM/Match-Ausgang): Eine PIO-State-

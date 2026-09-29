@@ -148,6 +148,8 @@ Jeweils HEX laden (Weg aus Abschnitt C) und `run`.
 | # | Test | Schritte | Erwartung | Status |
 |---|------|----------|-----------|:------:|
 | I1 | Capture-Trace | Rechtecksignal an Pin, `pio capture <pin> <n>` | plausible Flankenabstände | ⬜ |
+| I2 | KNX-TX-Pulse | Brücke Match-Pin→freier Pin, Gast sendet, `pio capture <freier Pin> 20` | 34–35 µs breite Pulse | ✅ (TPUART2-Emu, 2026-09-29) |
+| I3 | Virtuelles Bus-Echo | Brücke TX→RX-Pin, `tcap.1=<RX>`, `gpio <RX> inv` | sblib sieht eigenes Echo | ⬜ (Kollisionserkennung bricht ab, s. Status) |
 
 ## J — Zweistufiger Boot + Auto-Descriptor (Phase 3)
 

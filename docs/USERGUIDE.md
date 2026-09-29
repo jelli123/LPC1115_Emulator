@@ -137,7 +137,9 @@ Eingabe mit Enter. Befehle sind nicht case-sensitive, Argumente whitespace-getre
 | `mem <addr> <len>`            | Hex-Dump aus dem Guest-Adressraum                |
 | `swd start <swdio> <swclk>`   | externer Debug-Probe an RP2350 (clk = dio+1)     |
 | `swd stop`                    | SWD-Target deaktivieren                          |
-| `pio capture <pin> <count>`   | Edge-Capture-Trace (Mikrosekunden)               |
+| `pio capture <pin> <count>`   | Flanken-Logger: Richtung + Abstand in µs, liest den Pin rückwirkungsfrei mit |
+| `gpio <n> [up\|down\|none\|inv\|noinv]` | RP2350-Pin: Funktion, Richtung, Pegel, Pull; Eingang invertieren |
+| `stats` → `TX-Pulse`, `MATn-PIO` | übergebene/verworfene Match-Pulse und Zustand der Sende-PIO |
 
 ### Serielle Schnittstellen
 

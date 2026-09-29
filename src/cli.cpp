@@ -29,6 +29,8 @@ extern "C" void usb_stdio_task(void);
 #include "pico/version.h"
 #include "pico/bootrom.h"
 #include "hardware/watchdog.h"
+#include "hardware/structs/pads_bank0.h"
+#include "hardware/structs/io_bank0.h"
 
 namespace {
 
@@ -184,7 +186,8 @@ const char* const HELP_LINES[] = {
     "",
     "  swd start <swdio> <swclk>  SWD-Target aktivieren",
     "  swd stop                   SWD-Target deaktivieren",
-    "  pio capture <pin> <count>  Edge-Capture-Trace (Zyklen)",
+    "  pio capture <pin> <count>  Flanken-Logger (Richtung + Abstand in us, Diagnose)",
+    "  gpio <n> [up|down|none|inv|noinv]  RP2350-Pin anzeigen / Pull / Eingang invertieren (Diagnose)",
     "",
     "  uart pins <tx> <rx>|off    Gast-UART0 auf RP-GPIOs legen (echte Leitung)",
     "  uart cdc on|off            Gast-UART0 auf den Serial-COM-Port (ohne Draht)",
@@ -295,6 +298,20 @@ void cmd_status() {
                         static_cast<unsigned long>(tc),
                         static_cast<unsigned long>(ir),
                         static_cast<unsigned long>(pends));
+            uint32_t emitted, skip[4];
+            peripherals::ct_tx_debug(i, emitted, skip);
+            if (emitted || skip[0] || skip[1] || skip[2] || skip[3])
+                std::printf("  TX-Pulse (Match-PIO): %lu | verworfen: kein-Reset=%lu MR>=Periode=%lu vorbei=%lu FIFO/SM=%lu\n",
+                            static_cast<unsigned long>(emitted), static_cast<unsigned long>(skip[0]),
+                            static_cast<unsigned long>(skip[1]), static_cast<unsigned long>(skip[2]),
+                            static_cast<unsigned long>(skip[3]));
+            for (int m = 0; m < 4; ++m) {
+                uint32_t pc, fifo, po, poe;
+                if (pio_glue::tx_debug(peripherals::ct_tx_handle(i, m), pc, fifo, po, poe))
+                    std::printf("  MAT%d-PIO: pc=%lu fifo=%lu pin_out=%lu pin_oe=%lu\n", m,
+                                static_cast<unsigned long>(pc), static_cast<unsigned long>(fifo),
+                                static_cast<unsigned long>(po), static_cast<unsigned long>(poe));
+            }
         }
     }
     {
@@ -488,7 +505,7 @@ constexpr Word TOP[] = {
     {"cfg","cfg"}, {"config","cfg"},
     {"pinmap","pinmap"}, {"pin","pinmap"},
     {"gdb","gdb"}, {"bp","bp"}, {"regs","regs"}, {"mem","mem"},
-    {"pio","pio"}, {"swd","swd"}, {"cdc","cdc"},
+    {"pio","pio"}, {"swd","swd"}, {"cdc","cdc"}, {"gpio","gpio"},
     {"uart","uart"}, {"i2c","i2c"}, {"isp","isp"}, {"resetpin","resetpin"},
     {"ncn","ncn"},
 };
@@ -1084,30 +1101,71 @@ void handle_command(char* line) {
 
     if (std::strcmp(tokens[0], "pio") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "capture") == 0 && n >= 4) {
+            // Flanken-Logger ueber das Zeitstempel-Programm (wie beim KNX-
+            // Empfang): meldet jede Flanke mit Richtung und Abstand in us und
+            // gibt die State-Machine danach wieder frei. Rueckwirkungsfrei:
+            // der Pin wird nur mitgelesen, auch wenn ihn gerade eine andere
+            // Funktion (Match-PIO, UART, SIO) treibt.
             long pin_arg, count;
             if (!parse_int(tokens[2], 0, 47, pin_arg) ||
                 !parse_int(tokens[3], 1, 1000, count)) {
                 std::puts("err: pio capture <pin> <count>"); return;
             }
-            uint16_t h = pio_glue::setup_capture(static_cast<uint8_t>(pin_arg), true);
-            if (h == 0xFFFF) { std::puts("err: PIO voll"); return; }
-            std::printf("[PIO] capturing %ld edges on GP%ld...\n",
-                        count, pin_arg);
-            for (long i = 0; i < count; ++i) {
-                uint32_t val = 0;
-                int timeout = 5000;
-                while (!pio_glue::capture_read(h, val) && --timeout > 0)
-                    sleep_ms(1);
-                if (timeout <= 0) {
-                    std::printf("  [%ld] timeout\n", i); break;
-                }
-                std::printf("  [%ld] %lu cycles\n", i,
-                            static_cast<unsigned long>(val));
+            const uint pin = static_cast<uint>(pin_arg);
+            bool level = gpio_get(pin);             // Pegel vor dem Start
+            float rate = 0.0f;
+            const int h = pio_glue::ts_setup(static_cast<uint8_t>(pin), rate, /*claim_pin=*/false);
+            if (h < 0 || rate <= 0.0f) { std::puts("err: PIO voll"); return; }
+            std::printf("[PIO] %ld Flanken auf GP%ld (Startpegel %s, 5 s Timeout)...\n",
+                        count, pin_arg, level ? "high" : "low");
+            uint32_t prev = 0; bool have_prev = false; long got = 0;
+            absolute_time_t deadline = make_timeout_time_ms(5000);
+            while (got < count && !time_reached(deadline)) {
+                uint32_t cnt;
+                if (!pio_glue::ts_read(h, cnt)) { usb_stdio_task(); led::poll(); uart_bridge::uart0_cdc_poll(); continue; }
+                // Das Programm startet in der High-Schleife: bei Startpegel low
+                // meldet es sofort eine (Schein-)Fallflanke -> ueberspringen.
+                if (!have_prev && !level) { level = false; prev = cnt; have_prev = true; continue; }
+                level = !level;
+                const double us = have_prev ? static_cast<double>(prev - cnt) * 1e6 / rate : 0.0;
+                std::printf("  [%ld] %s  +%.1f us\n", got, level ? "steigend" : "fallend ", us);
+                prev = cnt; have_prev = true; ++got;
             }
+            if (got < count) std::printf("  Timeout nach %ld Flanken\n", got);
+            pio_glue::ts_teardown(h);
             return;
         }
     }
 
+    if (std::strcmp(tokens[0], "gpio") == 0 && n >= 2) {
+        long g;
+        if (!parse_int(tokens[1], 0, 47, g)) { std::puts("err: gpio <0..47> [up|down|none]"); return; }
+        const uint pin = static_cast<uint>(g);
+        // Eingang lesbar machen (RP2350: Pad nach Reset isoliert, IE aus) -
+        // aendert weder Funktion noch Ausgang.
+        gpio_set_input_enabled(pin, true);
+        hw_clear_bits(&pads_bank0_hw->io[pin], PADS_BANK0_GPIO0_ISO_BITS);
+        if (n >= 3) {
+            if      (!std::strcmp(tokens[2], "up"))   gpio_pull_up(pin);
+            else if (!std::strcmp(tokens[2], "down")) gpio_pull_down(pin);
+            else if (!std::strcmp(tokens[2], "none")) gpio_disable_pulls(pin);
+            else if (!std::strcmp(tokens[2], "inv"))   gpio_set_inover(pin, GPIO_OVERRIDE_INVERT);
+            else if (!std::strcmp(tokens[2], "noinv")) gpio_set_inover(pin, GPIO_OVERRIDE_NORMAL);
+            else { std::puts("err: gpio <n> [up|down|none|inv|noinv]"); return; }
+            sleep_us(50);
+        }
+        static const char* fn[] = {"HSTX","SPI","UART","I2C","PWM","SIO","PIO0","PIO1","PIO2",
+                                   "GPCK","USB","UART-AUX"};
+        const int f = static_cast<int>(gpio_get_function(pin));
+        const bool inv = ((io_bank0_hw->io[pin].ctrl & IO_BANK0_GPIO0_CTRL_INOVER_BITS)
+                          >> IO_BANK0_GPIO0_CTRL_INOVER_LSB) == GPIO_OVERRIDE_INVERT;
+        std::printf("GP%ld: Funktion=%s Richtung=%s Pegel=%s Pull=%s%s%s\n", g,
+                    (f >= 0 && f < 12) ? fn[f] : (f == 31 ? "NULL" : "?"),
+                    gpio_get_dir(pin) ? "out" : "in", gpio_get(pin) ? "high" : "low",
+                    gpio_is_pulled_up(pin) ? "up" : "", gpio_is_pulled_down(pin) ? "down" : "",
+                    inv ? " Eingang=invertiert" : "");
+        return;
+    }
     if (std::strcmp(tokens[0], "swd") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "start") == 0 && n == 4) {
             long c, d;

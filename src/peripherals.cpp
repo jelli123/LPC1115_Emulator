@@ -1232,6 +1232,9 @@ struct CtModel {
     int      tx_handle[4]; // < 0 = Software-PWM für diesen Kanal
     float    tx_rate;      // PIO-Zählrate [Counts/s] (für alle Kanäle gleich)
     uint32_t dbg_pends;    // Diagnose: wie oft dieser Timer einen Match-IRQ pendete
+    // Diagnose Match-PIO: an die PIO uebergebene Pulse bzw. verworfene Aufrufe
+    // (0 = kein Reset-Kanal, 1 = MR>=Periode, 2 = Match schon vorbei, 3 = FIFO voll/kein SM).
+    uint32_t dbg_tx_emit, dbg_tx_skip[4];
 };
 CtModel g_ct[4];
 
@@ -1306,6 +1309,7 @@ void ct_emit_tx_pulse(CtModel& c, int m) {
 
     // Kein Periodenmodell -> Pin an Software-PWM zurueckgeben (Handle freigeben).
     if (!have_reset) {
+        ++c.dbg_tx_skip[0];
         if (c.tx_handle[m] >= 0) {
             pio_glue::tx_teardown(c.tx_handle[m]);
             c.tx_handle[m] = -1;
@@ -1318,10 +1322,10 @@ void ct_emit_tx_pulse(CtModel& c, int m) {
     // MRm >= Periode: in diesem Zyklus kein Puls (z. B. MR=0xffff = "aus").
     // Handle bleibt belegt; die PIO haelt den Pin idle-low. Kein Teardown,
     // damit kein Claim/Unclaim-Churn bei pulsweisem Senden entsteht.
-    if (mr_pwm >= mr_reset) return;
+    if (mr_pwm >= mr_reset) { ++c.dbg_tx_skip[1]; return; }
 
     uint32_t delay_ticks = (mr_pwm - c.tc) & mask;     // bis zur steigenden Flanke
-    if (delay_ticks > (mask >> 1)) return;             // Match bereits vorbei
+    if (delay_ticks > (mask >> 1)) { ++c.dbg_tx_skip[2]; return; }   // Match bereits vorbei
     uint32_t width_ticks = (mr_reset - mr_pwm) & mask;
     if (width_ticks == 0) return;
 
@@ -1334,12 +1338,13 @@ void ct_emit_tx_pulse(CtModel& c, int m) {
         int h = pio_glue::tx_setup(static_cast<uint8_t>(c.mat_pin[m]), rate);
         if (h >= 0) { c.tx_handle[m] = h; c.tx_rate = rate; }
     }
-    if (c.tx_handle[m] < 0 || c.tx_rate <= 0.0f) return;  // Fallback: Software-PWM
+    if (c.tx_handle[m] < 0 || c.tx_rate <= 0.0f) { ++c.dbg_tx_skip[3]; return; }  // Fallback: Software-PWM
 
     double cnt_per_tick = static_cast<double>(c.tx_rate) / f_tc;
     uint32_t delay_cnt = static_cast<uint32_t>(static_cast<double>(delay_ticks) * cnt_per_tick);
     uint32_t width_cnt = static_cast<uint32_t>(static_cast<double>(width_ticks) * cnt_per_tick);
-    pio_glue::tx_emit(c.tx_handle[m], delay_cnt, width_cnt);
+    if (pio_glue::tx_emit(c.tx_handle[m], delay_cnt, width_cnt)) ++c.dbg_tx_emit;
+    else ++c.dbg_tx_skip[3];
 }
 
 uint32_t ct_idx_for(uint32_t addr) {
@@ -2883,6 +2888,14 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks) {
 // Diagnose je CT-Timer (0=CT16B0,1=CT16B1,2=CT32B0,3=CT32B1): Grundzustand +
 // Match-IRQ-Pend-Zaehler. Erlaubt zu sehen, WELCHER Timer wie oft einen IRQ
 // pendet (Runaway-/Sturm-Erkennung) und mit welcher Konfiguration (pre/MR0/MCR).
+int ct_tx_handle(int idx, int m) { return g_ct[idx & 3].tx_handle[m & 3]; }
+
+void ct_tx_debug(int idx, uint32_t& emitted, uint32_t skip[4]) {
+    const CtModel& c = g_ct[idx & 3];
+    emitted = c.dbg_tx_emit;
+    for (int i = 0; i < 4; ++i) skip[i] = c.dbg_tx_skip[i];
+}
+
 void ct_debug(int idx, bool& enabled, uint32_t& pre, uint32_t& mr0,
               uint32_t& mcr, uint32_t& tc, uint32_t& ir, uint32_t& pends,
               uint32_t& mr1, uint32_t& mr2, uint32_t& mr3) {

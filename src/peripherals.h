@@ -123,6 +123,9 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks);
 // Diagnose je CT-Timer (0=CT16B0,1=CT16B1,2=CT32B0,3=CT32B1): Grundzustand +
 // Match-IRQ-Pend-Zaehler (pends). Zeigt, welcher Timer wie oft einen IRQ pendet
 // (Runaway-/Sturm-Erkennung) und mit welcher Konfiguration (pre/MR0..3/MCR/TC/IR).
+// Match-PIO-Diagnose: uebergebene Pulse + Verwerfungsgruende (siehe peripherals.cpp).
+void ct_tx_debug(int idx, uint32_t& emitted, uint32_t skip[4]);
+int  ct_tx_handle(int idx, int m);   // Match-PIO-Handle des Kanals (-1 = keins)
 void ct_debug(int idx, bool& enabled, uint32_t& pre, uint32_t& mr0,
               uint32_t& mcr, uint32_t& tc, uint32_t& ir, uint32_t& pends,
               uint32_t& mr1, uint32_t& mr2, uint32_t& mr3);
