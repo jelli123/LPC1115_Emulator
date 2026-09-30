@@ -195,6 +195,29 @@ uint32_t read_cluster_chain(uint16_t first_cluster, uint32_t size,
     return copied;
 }
 
+// content_hash() ueber eine Cluster-Kette, direkt auf der RAM-Disk (ohne
+// Kopierpuffer - spart 8 KB RAM). Liefert denselben Wert wie content_hash()
+// ueber die per read_cluster_chain() kopierten Bytes.
+uint32_t hash_cluster_chain(uint16_t first_cluster, uint32_t size) {
+    const uint8_t* fat = g_disk + RESERVED_SECTORS * SECTOR_SIZE;
+    uint16_t cur  = first_cluster;
+    uint32_t done = 0;
+    uint32_t h    = 2166136261u;
+    while (cur >= 2 && cur < 0xFF8 && done < size) {
+        const uint32_t sec = FIRST_DATA_SECTOR + (cur - 2) * SECTORS_PER_CLUSTER;
+        uint32_t n = SECTOR_SIZE * SECTORS_PER_CLUSTER;
+        if (size - done < n) n = size - done;
+        const uint8_t* p = g_disk + sec * SECTOR_SIZE;
+        for (uint32_t i = 0; i < n; ++i) h = (h ^ p[i]) * 16777619u;
+        done += n;
+        const uint32_t off = (cur * 3) / 2;
+        const uint16_t e   = static_cast<uint16_t>(fat[off]) |
+                             (static_cast<uint16_t>(fat[off + 1]) << 8);
+        cur = (cur & 1) ? (e >> 4) : (e & 0x0FFF);
+    }
+    return h;
+}
+
 bool find_dir_entry(const char* name83, uint16_t& cluster, uint32_t& size,
                     uint32_t* out_idx = nullptr) {
     const uint8_t* root = g_disk +
@@ -860,11 +883,8 @@ void build_fault_volume(const char* text, uint32_t len) {
 // Schreibzugriff) ausloesen und dazu den laufenden Gast pausieren.
 void mark_config_processed() {
     uint16_t cl; uint32_t sz;
-    static char tmp[8192];
-    if (find_dir_entry("CONFIG.INI", cl, sz) && sz > 0 && sz < sizeof tmp) {
-        uint32_t n = read_cluster_chain(cl, sz, reinterpret_cast<uint8_t*>(tmp),
-                                        sizeof tmp);
-        g_last_config_hash = content_hash(reinterpret_cast<uint8_t*>(tmp), n);
+    if (find_dir_entry("CONFIG.INI", cl, sz) && sz > 0 && sz < 8192u) {   // wie cfg_buf in on_volume_ready
+        g_last_config_hash = hash_cluster_chain(cl, sz);
         g_have_config_hash = true;
     }
 }
