@@ -187,8 +187,8 @@ IRQ-Tabelle: [src/lpc_irqs.h](../src/lpc_irqs.h) (UM10398 Tab. 51).
 | SysTick         | ✅     | echt (Cortex-M33-PPB)                         |
 | WDT (WWDT)      | ✅     | echtes Timeout, **soft-reset nur des Guests** |
 | ADC             | ✅     | sofortige Wandlung, deterministisches Sample  |
-| SSP0/SSP1       | ✅     | Loopback-Modell (RX=TX)                       |
-| I²C0            | ✅     | Stub (NAK auf Adress-Send) — ohne externen Slave |
+| SSP0/SSP1       | ✅     | Master; eine SSP als Bridge auf RP-SPI (`spi_bridge_*`) oder virtueller NCN5130, sonst Loopback |
+| I²C0            | ✅     | Master; Bridge auf RP-I²C (`i2c_bridge_*`), ohne Bridge Stub (NAK) |
 | PMU/PCON        | ✅     | siehe [§13 Energiemanagement](#13-energiemanagement) |
 | BOD (`BODCTRL`) | ✅     | Register modelliert; `BODRSTENA` → echte RP2350-POWMAN-BOD aktiv |
 | RTC             | ❌     | LPC1115 hat keinen RTC-Block (entfällt)       |
@@ -316,8 +316,9 @@ docs/
 
 * **Multi-Drop-SWD**, **JTAG**, **SWD-Dormant-State**, banked APs.
 * RTC (auf der LPC1115 nicht vorhanden).
-* I²C als reiner Stub (NAK ohne externen Slave).
-* SSP nur als Loopback (kein echtes RP-SPI-Backend).
+* I²C und SSP nur als **Master** (kein Slave-Modus); SSP ohne Hardware-SSEL
+  (Chip-Select wie üblich per GPIO). Nur **eine** SSP kann auf RP-SPI gebrückt
+  werden; eine SSP ohne Bridge/NCN5130 arbeitet als Loopback (RX = TX).
 * **LittleFS** für Storage – aktuell ist nur einfaches Round-Robin-WL.
 
 ---
