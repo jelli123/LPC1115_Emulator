@@ -1,3 +1,4 @@
+#include "pico.h"
 #include "vnvic.h"
 
 #include <atomic>
@@ -13,7 +14,7 @@ std::atomic<uint32_t> g_iabr{0};
 std::atomic<bool>     g_primask{false};
 uint8_t               g_ipr[32]{};
 
-uint32_t read32(uint32_t aligned) {
+uint32_t __not_in_flash_func(read32)(uint32_t aligned) {
     switch (aligned) {
         case 0xE000'E100: return g_iser.load();          // ISER
         case 0xE000'E180: return g_iser.load();          // ICER (read = ISER)
@@ -32,7 +33,7 @@ uint32_t read32(uint32_t aligned) {
     }
 }
 
-void write32(uint32_t aligned, uint32_t v) {
+void __not_in_flash_func(write32)(uint32_t aligned, uint32_t v) {
     switch (aligned) {
         case 0xE000'E100: g_iser.fetch_or(v);  break;     // ISER: write 1 to set
         case 0xE000'E180: g_iser.fetch_and(~v); break;    // ICER: write 1 to clear
@@ -79,37 +80,48 @@ void collect(uint32_t addr, uint8_t v) {
 
 } // namespace
 
-bool is_nvic_addr(uint32_t addr) { return addr >= NVIC_BASE && addr < NVIC_END; }
+bool __not_in_flash_func(is_nvic_addr)(uint32_t addr) { return addr >= NVIC_BASE && addr < NVIC_END; }
 
-uint8_t read8(uint32_t addr) {
+uint8_t __not_in_flash_func(read8)(uint32_t addr) {
     uint32_t v = read32(addr & ~3u);
     return static_cast<uint8_t>((v >> ((addr & 3u) * 8)) & 0xFFu);
 }
 
-void write8(uint32_t addr, uint8_t val) { collect(addr, val); }
+void __not_in_flash_func(write8)(uint32_t addr, uint8_t val) { collect(addr, val); }
 
-void pend_irq(uint8_t lpc_irq) {
+void __not_in_flash_func(pend_irq)(uint8_t lpc_irq) {
     if (lpc_irq >= 32) return;
     g_ispr.fetch_or(1u << lpc_irq);
 }
 
-bool irq_pending() {
+bool __not_in_flash_func(irq_pending)() {
     return (g_iser.load() & g_ispr.load()) != 0u;
 }
 
-uint8_t next_pending_irq() {
-    uint32_t mask = g_iser.load() & g_ispr.load();
-    if (!mask) return 0xFF;
-    return static_cast<uint8_t>(__builtin_ctz(mask));
+uint8_t __not_in_flash_func(priority)(uint8_t lpc_irq) {
+    return (lpc_irq < 32) ? static_cast<uint8_t>(g_ipr[lpc_irq] >> 6) : 3u;
 }
 
-void clear_pending(uint8_t lpc_irq) {
+uint8_t __not_in_flash_func(next_pending_irq)() {
+    uint32_t mask = g_iser.load() & g_ispr.load();
+    if (!mask) return 0xFF;
+    uint8_t best = 0xFF, best_prio = 0xFF;
+    while (mask) {
+        const uint8_t n = static_cast<uint8_t>(__builtin_ctz(mask));
+        mask &= mask - 1u;
+        const uint8_t p = priority(n);
+        if (p < best_prio) { best_prio = p; best = n; if (p == 0) break; }
+    }
+    return best;
+}
+
+void __not_in_flash_func(clear_pending)(uint8_t lpc_irq) {
     if (lpc_irq >= 32) return;
     g_ispr.fetch_and(~(1u << lpc_irq));
 }
 
 void set_primask(bool masked) { g_primask.store(masked); }
-bool primask()                { return g_primask.load(); }
+bool __not_in_flash_func(primask)()                { return g_primask.load(); }
 
 Snapshot snapshot() {
     Snapshot s{};

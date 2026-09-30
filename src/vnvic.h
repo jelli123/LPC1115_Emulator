@@ -27,8 +27,12 @@ void     pend_irq(uint8_t lpc_irq);
 
 // Ist IRQ aktiv (vom Gast enabled UND pending)?
 bool     irq_pending();
+// Hoechstpriorer zustellbarer IRQ (kleinste IPR-Prioritaet, bei Gleichstand
+// die kleinste IRQ-Nummer - wie der Cortex-M0-NVIC), 0xFF = keiner.
 uint8_t  next_pending_irq();
 void     clear_pending(uint8_t lpc_irq);
+// Prioritaet eines IRQ (LPC111x: 2 Bit, 0 = hoechste .. 3 = niedrigste).
+uint8_t  priority(uint8_t lpc_irq);
 
 // PRIMASK-Schatten (opt-in via config::primask_shadow). Der Gast laeuft
 // unprivilegiert, daher ignoriert die M33-Hardware CPSID/CPSIE. Werden diese

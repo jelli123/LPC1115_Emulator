@@ -1,3 +1,4 @@
+#include "pico.h"
 #include "irq_inject.h"
 #include "vnvic.h"
 #include "lpc_irqs.h"
@@ -61,7 +62,7 @@ struct StackFrame {
 static_assert(sizeof(StackFrame) == 32, "frame size");
 
 // Liest aus der Gast-Vector-Tabelle den IRQ-Handler.
-uint32_t lookup_handler(uint8_t lpc_irq) {
+uint32_t __not_in_flash_func(lookup_handler)(uint8_t lpc_irq) {
     auto* vt = reinterpret_cast<uint32_t*>(emulator::vtable_base());
     uint32_t v = vt[16 + lpc_irq];
     return v;                  // mit Thumb-Bit
@@ -79,14 +80,28 @@ std::atomic<bool> g_systick_pending{false};
 // seinen eigenen, noch laufenden Handler rekursiv preempten (ein Frame pro Byte)
 // -> PSP-Stack-Overflow -> Gast-RAM-Korruption -> UNDEFINSTR. g_inject_depth_max
 // nur fuer die 'stats'-Diagnose (Core0 liest lesend).
+// Laufende injizierte Handler als Stapel ihrer Prioritaeten (wie die "active"-
+// Bits des NVIC): ein IRQ darf nur einen Handler niedrigerer Prioritaet
+// unterbrechen. Frueher lief grundsaetzlich nur EIN injizierter Handler; ein
+// Timer-IRQ musste dann z. B. das Ende des UART-Handlers abwarten (sblib legt
+// den Bus-Timer auf die hoechste, UART auf eine niedrige Prioritaet).
+constexpr int MAX_DEPTH = 8;
+constexpr uint8_t PRIO_THREAD = 0xFF;   // kein Handler aktiv
+constexpr uint8_t PRIO_SYSTICK = 0;     // injizierter SysTick: nicht unterbrechbar
 int g_inject_depth = 0;
+uint8_t g_active_prio[MAX_DEPTH];
+int8_t  g_active_irq[MAX_DEPTH];        // LPC-IRQ-Nummer je Ebene (-1 = SysTick)
 std::atomic<uint32_t> g_inject_depth_max{0};
+
+uint8_t __not_in_flash_func(current_prio)() {
+    return g_inject_depth > 0 ? g_active_prio[g_inject_depth - 1] : PRIO_THREAD;
+}
 
 // Synthetisiert einen Exception-Frame fuer 'handler' oben auf den Gast-PSP,
 // sodass beim PendSV-EXC_RETURN der Gast-Handler im Thread-Mode anlaeuft. Der
 // Ruecksprung (LR=0xFFFFFFFD) wird vom Fault-Handler (try_injected_irq_return)
 // abgefangen und der Original-Frame freigelegt. Gemeinsam fuer IRQs + SysTick.
-void inject_frame(uint32_t handler) {
+void __not_in_flash_func(inject_frame)(uint32_t handler, uint8_t prio, int8_t irq) {
     auto* psp = read_guest_psp();
     auto* base = psp;
     if ((reinterpret_cast<uintptr_t>(base) & 4u) != 0u) {
@@ -102,6 +117,7 @@ void inject_frame(uint32_t handler) {
                     != (reinterpret_cast<uintptr_t>(psp) & 4u))
                    ? (1u << 9) : 0u);
     write_guest_psp(reinterpret_cast<uint32_t*>(frame));
+    if (g_inject_depth < MAX_DEPTH) { g_active_prio[g_inject_depth] = prio; g_active_irq[g_inject_depth] = irq; }
     ++g_inject_depth;
     uint32_t d = static_cast<uint32_t>(g_inject_depth);
     if (d > g_inject_depth_max.load(std::memory_order_relaxed))
@@ -109,14 +125,23 @@ void inject_frame(uint32_t handler) {
 }
 
 // Atomar: nimm das nächste pending+enabled IRQ und claime es.
-int8_t take_next_irq() {
+// Naechsten IRQ entnehmen, sofern er den laufenden Handler unterbrechen darf.
+int8_t __not_in_flash_func(take_next_irq)() {
     uint32_t save = save_and_disable_interrupts();
     uint8_t n = vnvic::next_pending_irq();
-    if (n != 0xFF) {
+    if (n != 0xFF && g_inject_depth < MAX_DEPTH && vnvic::priority(n) < current_prio()) {
         vnvic::clear_pending(n);
+    } else {
+        n = 0xFF;
     }
     restore_interrupts(save);
     return (n == 0xFF) ? -1 : static_cast<int8_t>(n);
+}
+
+// Liegt ein IRQ an, der den laufenden Kontext unterbrechen darf?
+bool __not_in_flash_func(preempting_irq_pending)() {
+    const uint8_t n = vnvic::next_pending_irq();
+    return n != 0xFF && g_inject_depth < MAX_DEPTH && vnvic::priority(n) < current_prio();
 }
 
 } // namespace
@@ -127,7 +152,7 @@ void init() {
     NVIC_SetPriority(PendSV_IRQn, 0xFFu);
 }
 
-void pend(uint8_t lpc_irq) {
+void __not_in_flash_func(pend)(uint8_t lpc_irq) {
     if (lpc_irq >= lpc_irq::COUNT) return;
     vnvic::pend_irq(lpc_irq);
     // PendSV anstoßen — atomar, in jedem Kontext zulässig.
@@ -151,7 +176,7 @@ void poll() {
     }
 }
 
-extern "C" void pendsv_inject_c(uint32_t* r4_r11) {
+extern "C" void __not_in_flash_func(pendsv_inject_c)(uint32_t* r4_r11) {
     // PendSV gehoert ausschliesslich dem Gast-Core (Core1). Der emulatoreigene
     // isr_pendsv ueberschreibt das schwache SDK-PendSV-Symbol und ist daher
     // AUCH in Core0s Vektortabelle installiert. Wuerde PendSV jemals auf Core0
@@ -175,24 +200,23 @@ extern "C" void pendsv_inject_c(uint32_t* r4_r11) {
     if (g_systick_pending.exchange(false, std::memory_order_acq_rel)) {
         auto* vt = reinterpret_cast<uint32_t*>(emulator::vtable_base());
         uint32_t h = vt[15];
-        if (h != 0u && (h & ~1u) != 0u) {
-            inject_frame(h);
+        if (h != 0u && (h & ~1u) != 0u && g_inject_depth < MAX_DEPTH) {
+            inject_frame(h, PRIO_SYSTICK, -1);
             return;   // ein Frame pro PendSV-Lauf; IRQs folgen beim naechsten
         }
     }
 
     // Solange Pending+Enabled vorliegt, einen Frame synthetisieren.
     // RE-ENTRANCY-GATE: Injizierte Handler laufen im THREAD-Mode und haben KEINEN
-    // HW-"active"-Schutz wie echte Exceptions. Laeuft bereits ein injizierter
-    // Handler (g_inject_depth>0), darf KEIN weiterer Frame injiziert werden —
-    // sonst preemptet z. B. der UART0-RX-IRQ (der sich im RBR-Read selbst neu
-    // pendet) seinen eigenen, noch laufenden Handler: pro empfangenem Byte ein
-    // neuer Frame auf dem PSP -> unbeschraenkte Rekursion -> PSP-Stack-Overflow
-    // -> Gast-RAM-Korruption -> UNDEFINSTR (bei FT12/knxd-Dauerstrom reproduziert).
-    // Der IRQ bleibt im vNVIC pending und wird beim Ruecksprung des laufenden
-    // Handlers (note_injected_return) nachgeliefert = Tail-Chaining wie in HW.
-    if (g_inject_depth > 0) return;
-
+    // HW-"active"-Schutz wie echte Exceptions. Wie im NVIC darf ein IRQ nur einen
+    // Handler NIEDRIGERER Prioritaet unterbrechen (take_next_irq) - sonst
+    // preemptet z. B. der UART0-RX-IRQ (der sich im RBR-Read selbst neu pendet)
+    // seinen eigenen, noch laufenden Handler: pro empfangenem Byte ein neuer
+    // Frame auf dem PSP -> unbeschraenkte Rekursion -> PSP-Stack-Overflow ->
+    // Gast-RAM-Korruption -> UNDEFINSTR (bei FT12/knxd-Dauerstrom reproduziert).
+    // Gleich- oder niedriger priorisierte IRQs bleiben im vNVIC pending und
+    // werden beim Ruecksprung (note_injected_return) nachgeliefert =
+    // Tail-Chaining wie in HW.
     int8_t n = take_next_irq();
     if (n < 0) return;
 
@@ -202,17 +226,17 @@ extern "C" void pendsv_inject_c(uint32_t* r4_r11) {
         return;
     }
 
-    inject_frame(handler);
+    inject_frame(handler, vnvic::priority(static_cast<uint8_t>(n)), n);
     // KEIN sofortiges Tail-Chain-Re-Pend hier: weitere pending IRQs werden erst
     // beim Ruecksprung DIESES Handlers (note_injected_return) geliefert. Ein
     // sofortiges PENDSVSET wuerde jetzt ohnehin am Tiefen-Gate abprallen.
 }
 
-void note_injected_return() {
+void __not_in_flash_func(note_injected_return)() {
     if (g_inject_depth > 0) --g_inject_depth;
-    // Beim Verlassen des aeussersten injizierten Handlers einen evtl. noch
-    // pendenden IRQ nachliefern (Tail-Chaining). PENDSVSET ist atomar/kontextfrei.
-    if (g_inject_depth == 0 && vnvic::irq_pending())
+    // Einen evtl. noch pendenden IRQ nachliefern, der den jetzt wieder laufenden
+    // Kontext unterbrechen darf (Tail-Chaining). PENDSVSET ist atomar/kontextfrei.
+    if (preempting_irq_pending())
         SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
 }
 
@@ -225,8 +249,12 @@ uint32_t inject_depth_live() {
     return d < 0 ? 0u : static_cast<uint32_t>(d);
 }
 
-bool can_inject_now() {
-    return g_inject_depth == 0 && !vnvic::primask();
+int __not_in_flash_func(active_irq)() {
+    return (g_inject_depth > 0 && g_inject_depth <= MAX_DEPTH) ? g_active_irq[g_inject_depth - 1] : -1;
+}
+
+bool __not_in_flash_func(can_inject_now)() {
+    return !vnvic::primask() && preempting_irq_pending();
 }
 
 void reset_inject_depth() {
@@ -238,7 +266,7 @@ void reset_inject_depth() {
 // ---------------------------------------------------------------------------
 // Naked PendSV-Handler
 // ---------------------------------------------------------------------------
-extern "C" __attribute__((naked)) void isr_pendsv() {
+extern "C" __attribute__((naked, section(".time_critical.isr_pendsv"))) void isr_pendsv() {
     __asm volatile (
         "push  {r4-r11, lr}        \n"   // Gast-r4..r11 fuer den Debug-Halt
         "sub   sp, #4              \n"   // 8-Byte-Alignment

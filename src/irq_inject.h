@@ -53,10 +53,14 @@ uint32_t inject_depth_max();
 // haengt der Gast in einer ISR (z. B. Timer-IRQ-Sturm).
 uint32_t inject_depth_live();
 
-// true, wenn ein pendender IRQ JETZT per PendSV zugestellt werden kann (kein
-// injizierter Handler aktiv, PRIMASK-Schatten frei). Sonst wird er ohnehin beim
-// Handler-Ruecksprung bzw. bei CPSIE nachgeliefert.
+// true, wenn ein pendender IRQ JETZT per PendSV zugestellt werden kann (hoeher
+// priorisiert als ein laufender injizierter Handler, PRIMASK-Schatten frei).
+// Sonst wird er ohnehin beim Handler-Ruecksprung bzw. bei CPSIE nachgeliefert.
 bool can_inject_now();
+
+// LPC-IRQ-Nummer des gerade laufenden (innersten) injizierten Handlers, -1 wenn
+// keiner laeuft (bzw. SysTick).
+int active_irq();
 
 // Injektions-Verschachtelungstiefe auf 0 zuruecksetzen. MUSS bei jedem Gast-
 // (Neu)start gerufen werden: nach einem fatalen Fault innerhalb eines injizierten
