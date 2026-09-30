@@ -10,7 +10,7 @@
 // und stellt sie ueber die CLI ('dbg') sowie als DEBUG.TXT auf dem USB-MSC-
 // Laufwerk bereit.
 //
-// Verwendung im Gast: examples/lpc_debug/lpc_debug.h einbinden und
+// Verwendung im Gast: guest/lpc_debug.h einbinden und
 // dbg_puts()/dbg_kv()/... aufrufen. Die dortige Port-Adresse MUSS mit
 // DEBUG_BRIDGE_PORT hier uebereinstimmen.
 

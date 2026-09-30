@@ -486,8 +486,10 @@ Wichtig:
 * Der Descriptor wird nur erzeugt, wenn bei `app_start` eine plausible
   Vektortabelle erkannt wird (`autodesc=on`). Schon vorhandene gültige
   Descriptoren bleiben unangetastet.
-* Die fertigen Beispiel-HEX-Dateien liegen unter `examples/`
-  (`bootloader_…hex` + `in16-bim112_flashstart_0x3000_…hex`).
+* Fertige HEX-Dateien (Selfbus-Bootloader, Applikationen mit Flash-Start
+  `0x3000`) stammen aus den Selfbus-Projekten
+  ([software-arm-lib](https://github.com/selfbus/software-arm-lib),
+  [software-arm-incubation](https://github.com/selfbus/software-arm-incubation)).
 * Dasselbe geht über das USB-Volume: erst `CONFIG.INI` mit `app_start`/
   `autodesc`/`flash_erase=on` + Bootloader als `BOOT.HEX` ablegen, auswerfen,
   dann ein zweites Mal die App als `BOOT.HEX` ohne `flash_erase` ablegen.

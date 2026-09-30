@@ -102,7 +102,7 @@ Model g;
 // ===========================================================================
 // Reale KNX-TP1-PHY (STKNX/Selfbus diskreter Buskoppler)
 // ===========================================================================
-// Bit-Timing exakt wie sblib (examples/sblib/.../bus_const.h): 9600 Bd,
+// Bit-Timing exakt wie sblib (sblib inc/sblib/eib/bus_const.h): 9600 Bd,
 // 104 us/Bit, "0"-Bit = 35 us aktiver Puls am Bit-Anfang, "1"-Bit = rezessiv.
 // Zeichen = Startbit(0) + 8 Datenbits (LSB-first) + gerade Paritaet + Stopbit(1).
 // TX ueber match_pulse-PIO (Idle-Low, HIGH-Puls) - identisch zur LPC-PWM-Match-

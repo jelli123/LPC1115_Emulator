@@ -1,3 +1,9 @@
 build
 !.vscode/*
 pico_sdk_import.cmake
+
+# Lokale Kopien fremder Projekte (Selfbus sblib, Bootloader, Apps, HEX) und
+# Analyse-/Hilfsskripte - gehoeren nicht ins Repository.
+/examples/
+/tools/
+/devtools/

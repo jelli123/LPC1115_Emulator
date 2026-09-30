@@ -15,7 +15,7 @@ in die letzte Spalte.
 - USB-TTL-Adapter für die emulierte LPC-uart0 (Default GP0=TX/GP1=RX),
   eingestellt auf **19200 8N1** (für die Selbsttests).
 - LED + Vorwiderstand, ein paar Jumperkabel, ggf. Poti für den ADC-Test.
-- Selbsttest-HEX aus [../examples/selftest](../examples/selftest) gebaut.
+- Selbsttest-HEX aus [../test/selftest](../test/selftest) gebaut.
 - Optional: KNX-/SWD-Hardware für die fortgeschrittenen Abschnitte.
 
 Legende: ⬜ offen · ✅ ok · ❌ Fehler
@@ -211,4 +211,4 @@ Beispiel-HEX aus [../examples](../examples).
 | ADC konstant ~512 | ADC-Bridge nicht aktiv (`adc_bridge_en=1`) |
 
 Details: [USERGUIDE.md](USERGUIDE.md) · [TECHNICAL.md](TECHNICAL.md) ·
-Selbsttests: [../examples/selftest/README.md](../examples/selftest/README.md)
+Selbsttests: [../test/selftest/README.md](../test/selftest/README.md)
