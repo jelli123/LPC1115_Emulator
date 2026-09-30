@@ -1,9 +1,10 @@
+#include "fast_time.h"
 #include "ncn5130.h"
 #include "irq_inject.h"
 #include "lpc_irqs.h"
 #include "pio_glue.h"
 
-#include "pico/time.h"          // time_us_64()
+#include "pico.h"
 #include <cstring>
 
 // Virtueller NCN5130 – siehe docs/NCN5130_EMULATION_SPEC.md.
@@ -155,7 +156,7 @@ struct Phy {
     uint8_t  ack_buf;          // Puffer fuer tx_src (1 Byte)
 
     // RX-Dekoder
-    uint32_t rx_prev_counter;
+    uint64_t rx_prev_us;       // absoluter Zeitpunkt der vorigen Flanke
     bool     rx_have_prev;
     bool     rx_expect_falling;// Alternation: Idle-high -> erste Flanke fallend
     uint64_t rx_bus_us;        // akkumulierte Bus-Zeit (us) aus PIO-Deltas
@@ -198,7 +199,7 @@ void phy_queue_ack(uint8_t bits) {
     if (!a && !b && !n) return;                 // nicht adressiert -> kein ACK
     p.ack_octet   = static_cast<uint8_t>((n ? 0x00u : 0xC0u) | (b ? 0x00u : 0x0Cu));
     p.ack_pending = true;
-    uint64_t now  = time_us_64();
+    uint64_t now  = fast_time_us();
     uint64_t sched = p.rx_frame_end_wall + KNX_ACK_DELAY_US;
     p.ack_at_wall = (sched > now) ? sched : now;   // 15 Bitzeiten nach Frame-Ende
 }
@@ -346,7 +347,7 @@ void tx_finalize() {
     // Oktett) + ~5 ms Prioritaets-/ACK-Fenster. Die L_Data.con folgt in poll()
     // (Core1), NICHT synchron im SPI-Exchange.
     uint64_t dur = static_cast<uint64_t>(g.tx_len) * 1150u + 5000u;
-    g.tx_done_us = time_us_64() + dur;
+    g.tx_done_us = fast_time_us() + dur;
 }
 
 // Ein einzelnes vom Host empfangenes Control-Byte dekodieren + ausfuehren.
@@ -536,7 +537,7 @@ void phy_tx_ack(bool ok) {
     }
     if (p.tx_retries_left > 0) {
         --p.tx_retries_left;                     // erneut senden (dasselbe Frame)
-        phy_tx_begin(g.tx_frame, g.tx_len, time_us_64());
+        phy_tx_begin(g.tx_frame, g.tx_len, fast_time_us());
         p.tx_state = TXS_SENDING;
         phy_tx_feed();
         return;
@@ -572,7 +573,7 @@ void phy_finish_char() {
 
 // Frame abschliessen und an den Host zustellen.
 void phy_finish_frame() {
-    uint64_t now = time_us_64();
+    uint64_t now = fast_time_us();
     if (p.rx_buf_len == 1) {
         // Einzelnes Zeichen = Kurz-Acknowledge (L_Ackn), im Normalmodus nicht
         // als L_Data zustellen (nur im Bus-Monitor sichtbar -> hier verworfen).
@@ -596,15 +597,12 @@ void phy_finish_frame() {
 
 void phy_rx_poll(uint64_t now) {
     // Alle vorliegenden Flanken-Timestamps abholen.
-    uint32_t counter;
-    while (pio_glue::ts_read(p.rx_h, counter)) {
-        bool falling = p.rx_expect_falling;   // strikte Alternation ab Idle-high
-        p.rx_expect_falling = !p.rx_expect_falling;
-        if (p.rx_have_prev) {
-            uint32_t dc = p.rx_prev_counter - counter;   // Abwaertszaehler
-            p.rx_bus_us += static_cast<uint64_t>(dc / p.rx_cpu);
-        }
-        p.rx_prev_counter = counter;
+    uint64_t t_edge; bool level;
+    while (pio_glue::ts_read_edge(p.rx_h, t_edge, level)) {
+        const bool falling = !level;          // Pegel nach der Flanke
+        p.rx_expect_falling = level;          // (nur noch informativ)
+        if (p.rx_have_prev) p.rx_bus_us += t_edge - p.rx_prev_us;
+        p.rx_prev_us   = t_edge;
         p.rx_have_prev = true;
 
         // Waehrend eigener Aussendung (Frame/ACK) das eigene Echo verwerfen,
@@ -649,7 +647,7 @@ void phy_rx_poll(uint64_t now) {
 }
 
 void phy_poll_all() {
-    uint64_t now = time_us_64();
+    uint64_t now = fast_time_us();
     if (p.tx_h >= 0) phy_tx_poll(now);
     if (p.rx_h >= 0) phy_rx_poll(now);
     // ACK-Aussendung kann faellig werden, ohne dass RX-Flanken eintreffen.
@@ -720,7 +718,7 @@ bool phy_active() { return p.active; }
 // modellierte Timing abgelaufen ist -> L_Data.con (positiv) und optional
 // Loopback/Monitor-Ruecklauf. Laeuft auf Core1 (aus poll_timed_sources), damit
 // irq_inject::pend greift und der Modellzugriff single-core bleibt.
-void poll() {
+void __not_in_flash_func(poll)() {
     if (!g.enabled) return;
 
     // Reale PHY aktiv -> sie uebernimmt TX (Bitpulse) und RX (Frame-Empfang).
@@ -728,7 +726,7 @@ void poll() {
 
     // Sonst internes Back-End (Software-Loopback/Monitor + Timing-con).
     if (!g.tx_pending) return;
-    if (time_us_64() < g.tx_done_us) return;
+    if (fast_time_us() < g.tx_done_us) return;
 
     // Sendung abgeschlossen: Echo + U_FrameState.ind + L_Data.con (positiv).
     g.tx_pending = false;
@@ -774,7 +772,7 @@ void tx_result(bool positive) {
 
 bool data_ready() { return !resp_empty(); }
 
-bool busy() { return g.enabled && (g.tx_pending || p.active); }
+bool __not_in_flash_func(busy)() { return g.enabled && (g.tx_pending || p.active); }
 
 bool pull_byte(uint8_t& b) {
     if (!g.enabled || resp_empty()) return false;

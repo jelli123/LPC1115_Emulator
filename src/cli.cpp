@@ -17,6 +17,8 @@
 #include "irq_inject.h"
 #include "usb_descriptors.h"
 #include "isp.h"
+#include "fault.h"
+#include "hardware/clocks.h"
 #include "ncn5130.h"
 
 extern "C" void usb_stdio_task(void);
@@ -305,6 +307,12 @@ void cmd_status() {
                             static_cast<unsigned long>(emitted), static_cast<unsigned long>(skip[0]),
                             static_cast<unsigned long>(skip[1]), static_cast<unsigned long>(skip[2]),
                             static_cast<unsigned long>(skip[3]));
+            uint32_t ln, lavg, lmax, llast;
+            peripherals::ct_lat_debug(i, ln, lavg, lmax, llast);
+            if (ln)
+                std::printf("  IRQ->MR0-Write nach Reset: n=%lu mittel=%lu max=%lu letzt=%lu Ticks\n",
+                            static_cast<unsigned long>(ln), static_cast<unsigned long>(lavg),
+                            static_cast<unsigned long>(lmax), static_cast<unsigned long>(llast));
             for (int m = 0; m < 4; ++m) {
                 uint32_t pc, fifo, po, poe;
                 if (pio_glue::tx_debug(peripherals::ct_tx_handle(i, m), pc, fifo, po, poe))
@@ -357,6 +365,26 @@ void cmd_status() {
                     (p_rxl < 0) ? "n/a" : (p_rxl ? "HIGH" : "LOW"),
                     static_cast<unsigned long>(p_cr),
                     static_cast<unsigned long>(p_lcrh));
+    }
+    {
+        const auto fs = faultsys::stats();
+        const uint32_t mhz = clock_get_hz(clk_sys) / 1'000'000u;
+        uint32_t sa, sm; peripherals::sample_cost(sa, sm);
+        uint32_t tp[4]; trap_profile(tp);
+        uint32_t ra[8], rc[8]; trap_region_profile(ra, rc);
+        static const char* rn[8] = {"GPIO","IOCON","SYSCON","SysTick","UART0","CT","NVIC","sonst"};
+        std::printf("Zugriff je Region (Takte x Anzahl):");
+        for (int i = 0; i < 8; ++i) if (rc[i]) std::printf(" %s=%lux%lu", rn[i], static_cast<unsigned long>(ra[i]), static_cast<unsigned long>(rc[i]));
+        std::printf("\n");
+        std::printf("Trap-Profil (Takte): Einsprung..Decode=%lu Decode=%lu Abtastung=%lu Zugriff=%lu\n",
+                    static_cast<unsigned long>(tp[0]), static_cast<unsigned long>(tp[1]),
+                    static_cast<unsigned long>(tp[2]), static_cast<unsigned long>(tp[3]));
+        if (fs.trap_cyc_n && mhz)
+            std::printf("Trap-Dauer: mittel=%lu us max=%lu us (n=%lu) | davon Abtastung mittel=%lu max=%lu Zyklen\n",
+                        static_cast<unsigned long>(fs.trap_cyc_sum / fs.trap_cyc_n / mhz),
+                        static_cast<unsigned long>(fs.trap_cyc_max / mhz),
+                        static_cast<unsigned long>(fs.trap_cyc_n),
+                        static_cast<unsigned long>(sa), static_cast<unsigned long>(sm));
     }
     std::printf("MMIO R=%llu W=%llu  GPIO=%llu  PLL-cfg=%llu  NVIC-W=%llu\n",
                 static_cast<unsigned long long>(s.mmio_reads),
@@ -1118,19 +1146,29 @@ void handle_command(char* line) {
             if (h < 0 || rate <= 0.0f) { std::puts("err: PIO voll"); return; }
             std::printf("[PIO] %ld Flanken auf GP%ld (Startpegel %s, 5 s Timeout)...\n",
                         count, pin_arg, level ? "high" : "low");
-            uint32_t prev = 0; bool have_prev = false; long got = 0;
+            // Erst sammeln, dann ausgeben: printf je Flanke ist langsamer als ein
+            // KNX-Bit, die 8er-FIFO wuerde ueberlaufen (verlorene Flanken).
+            static uint32_t dt_us[1000];
+            static bool     lv[1000];
+            uint64_t prev = 0; bool have_prev = false; long got = 0;
             absolute_time_t deadline = make_timeout_time_ms(5000);
             while (got < count && !time_reached(deadline)) {
-                uint32_t cnt;
-                if (!pio_glue::ts_read(h, cnt)) { usb_stdio_task(); led::poll(); uart_bridge::uart0_cdc_poll(); continue; }
+                uint64_t t; bool lvl;
+                if (!pio_glue::ts_read_edge(h, t, lvl)) {
+                    if (got == 0) { usb_stdio_task(); led::poll(); uart_bridge::uart0_cdc_poll(); }
+                    else          uart_bridge::uart0_cdc_poll();   // Host-Daten zum Gast weiterreichen
+                    continue;
+                }
                 // Das Programm startet in der High-Schleife: bei Startpegel low
                 // meldet es sofort eine (Schein-)Fallflanke -> ueberspringen.
-                if (!have_prev && !level) { level = false; prev = cnt; have_prev = true; continue; }
-                level = !level;
-                const double us = have_prev ? static_cast<double>(prev - cnt) * 1e6 / rate : 0.0;
-                std::printf("  [%ld] %s  +%.1f us\n", got, level ? "steigend" : "fallend ", us);
-                prev = cnt; have_prev = true; ++got;
+                if (!have_prev && !level && !lvl) { prev = t; have_prev = true; continue; }
+                dt_us[got] = have_prev ? static_cast<uint32_t>(t - prev) : 0u;
+                lv[got] = lvl;
+                prev = t; have_prev = true; ++got;
             }
+            for (long i = 0; i < got; ++i)
+                std::printf("  [%ld] %s  +%lu us\n", i, lv[i] ? "steigend" : "fallend ",
+                            static_cast<unsigned long>(dt_us[i]));
             if (got < count) std::printf("  Timeout nach %ld Flanken\n", got);
             pio_glue::ts_teardown(h);
             return;
@@ -1506,6 +1544,7 @@ void run() {
         uart_bridge::poll();
         uart_bridge::uart0_cdc_poll();   // virtuelle LPC-UART0 <-> Serial-CDC
         isp::poll();
+        peripherals::live_map_poll();
         if (emulator::guest_reset_pending()) {
             // Vom Gast angeforderter Soft-Reset (NVIC_SystemReset/WDT). Core1
             // hat geparkt; Core0 fuehrt den eigentlichen Core-Reset aus. Wie am

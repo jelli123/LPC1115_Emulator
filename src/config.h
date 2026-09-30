@@ -65,6 +65,7 @@ inline constexpr const char* KEY_TCAP_PREFIX     = "tcap.";
 inline constexpr const char* KEY_TMAT_PREFIX     = "tmat.";
 inline constexpr const char* KEY_TCAP_PIO        = "tcap_pio";        // "0"/"1" (opt-in)
 inline constexpr const char* KEY_TMATCH_PIO      = "tmatch_pio";      // "0"/"1" (opt-in, Match/PWM)
+inline constexpr const char* KEY_TMATCH_DELAY    = "tmatch_delay";    // us, Latenzausgleich der Match-Pulse
 inline constexpr const char* KEY_WFI_PIN_WAKEUP  = "wfi_pin_wakeup";   // "0"/"1" (opt-in)
 inline constexpr const char* KEY_PRIMASK_SHADOW  = "primask_shadow";   // "0"/"1" (opt-in)
 // Bootloader->Applikation: Erkennungs-/Descriptor-Adressen (hex oder dezimal).
@@ -226,6 +227,14 @@ void        set_tcap_pio(bool v);
 // Nutzbar fuer praezise PWM-/Trigger-/Bit-Timing-Ausgaben (z. B. KNX-Senden).
 bool        tmatch_pio();
 void        set_tmatch_pio(bool v);
+// Latenzausgleich (us, 0..25, Default 20): Match-PIO-Pulse erscheinen um diese
+// feste Zeit verzoegert am Pin. Der Gast-Handler, der MRm fuer die laufende
+// Periode setzt, kommt im Emulator spaeter als am LPC (Trap-Kosten); die
+// Verzoegerung gibt ihm diese Reserve. Das eigene Echo loest dabei keinen
+// eigenen Capture-Interrupt aus. Deutlich unter der KNX-Pulsbreite (35 us):
+// ab ~30 us faellt das Echo zu nah ans Periodenende (sblib sendete fehlerhaft).
+uint32_t    tmatch_delay_us();
+void        set_tmatch_delay_us(uint32_t v);
 // WFI-Pin-Wakeup (opt-in, Default aus): patcht WFI der Gast-Firmware auf
 // einen SVC-Trap, sodass eine reine WFI-Warteschleife durch echte
 // RP2350-Pin-Flanken (und zeitbasierte Modelle) geweckt werden kann.

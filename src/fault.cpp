@@ -115,7 +115,7 @@ void femit(const char* fmt, ...) {
 // (betrifft alle Firmware mit Interrupts, z. B. KNX-Timer/Bus-IRQs).
 // Signatur: PC im EXC_RETURN-Bereich (>=0xFFFFFFE0) UND Fault aus Thread-Mode
 // (Frame liegt auf PSP) UND der Original-Frame ist plausibel (xPSR.T gesetzt).
-bool try_injected_irq_return(uint32_t* frame) {
+bool __not_in_flash_func(try_injected_irq_return)(uint32_t* frame) {
     if ((frame[6] & 0xFFFF'FFE0u) != 0xFFFF'FFE0u) return false;  // PC != EXC_RETURN
     uint32_t psp;
     __asm volatile ("mrs %0, psp" : "=r"(psp));
@@ -225,9 +225,24 @@ void print_exc_diag(const char* tag, const uint32_t* f, const uint32_t* r4_r11) 
 // Zugriffe auf den unprivilegierten Gast-Stack durch privilegierten Code
 // sind erlaubt (PRIVDEFENA=1, MPU schränkt nur unprivileged ein).
 
-extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
+// Misst die Dauer des Trap-Handlers (DWT-Zyklenzaehler) fuer 'stats'.
+uint32_t g_tprof[5];
+uint32_t g_rprof[8][2];   // je Region: Takte, Anzahl   // Summen: bis Decode, Decode, Abtastung, Zugriff, Anzahl MMIO-Traps
+struct TrapTimer {
+    uint32_t t0;
+    TrapTimer() : t0(DWT->CYCCNT) {}
+    ~TrapTimer() {
+        const uint32_t d = DWT->CYCCNT - t0;
+        faultsys::g_stats.trap_cyc_sum += d;
+        ++faultsys::g_stats.trap_cyc_n;
+        if (d > faultsys::g_stats.trap_cyc_max) faultsys::g_stats.trap_cyc_max = d;
+    }
+};
+
+extern "C" void __not_in_flash_func(handle_memfault_c)(trap_decoder::StackedFrame* frame,
                                   uint32_t* r4_r11_lr) {
     using namespace trap_decoder;
+    TrapTimer trap_timer;
 
     // Debugger-Halt-Anforderung von Core0 auf Core1 umsetzen (PendSV).
     target_halt::core1_service();
@@ -280,7 +295,10 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
     uint32_t  guest_sp = reinterpret_cast<uint32_t>(frame) + 0x20;
 
     Access acc{};
-    if (!decode_mem_access(frame, r4_r11, guest_sp, acc)) {
+    const uint32_t tp0 = DWT->CYCCNT;
+    const bool decoded = decode_mem_access(frame, r4_r11, guest_sp, acc);
+    const uint32_t tp1 = DWT->CYCCNT;
+    if (!decoded) {
         ++faultsys::g_stats.real_faults;
         faultsys::g_stats.last_fault_pc   = frame->pc;
         faultsys::g_stats.last_fault_addr = SCB->BFAR;
@@ -516,6 +534,9 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
         }
     }
 
+    const uint32_t tp2 = DWT->CYCCNT;
+    peripherals::begin_access();   // Pins/Capture einmal je Trap abtasten
+    const uint32_t tp3 = DWT->CYCCNT;
     if (acc.is_load) {
         uint32_t value = 0;
         switch (acc.size) {
@@ -538,6 +559,7 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
                 break;
             }
             case AccessSize::W: {
+                if (peripherals::ct_word_access(acc.address, true, value)) break;
                 uint8_t b[4]{};
                 for (int i = 0; i < 4 && ok; ++i)
                     ok = peripherals::mmio_read8(acc.address + i, b[i]);
@@ -568,6 +590,7 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
                                               static_cast<uint8_t>((src_val >> 8) & 0xFFu));
                 break;
             case AccessSize::W:
+                if (peripherals::ct_word_access(acc.address, false, src_val)) break;
                 for (int i = 0; i < 4 && ok; ++i)
                     ok = peripherals::mmio_write8(acc.address + i,
                                                   static_cast<uint8_t>((src_val >> (i*8)) & 0xFFu));
@@ -590,6 +613,21 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
     ++faultsys::g_stats.mem_traps;
     // Post-Hook (z. B. PLL-Re-Konfiguration nach abgeschlossenem 32-bit-Wort).
     if (!acc.is_load) peripherals::on_post_write_hook();
+    {
+        const uint32_t tp4 = DWT->CYCCNT;
+        g_tprof[0] += tp0 - trap_timer.t0; g_tprof[1] += tp1 - tp0;
+        g_tprof[2] += tp3 - tp2; g_tprof[3] += tp4 - tp3; ++g_tprof[4];
+        const uint32_t a = acc.address;
+        const int r = (a >= 0x5000'0000u && a < 0x5004'0000u) ? 0     // GPIO
+                    : (a >= 0x4004'4000u && a < 0x4004'4100u) ? 1     // IOCON
+                    : (a >= 0x4004'8000u && a < 0x4004'8300u) ? 2     // SYSCON
+                    : (a >= 0xE000'E000u && a < 0xE000'E020u) ? 3     // SysTick
+                    : (a >= 0x4000'8000u && a < 0x4000'8100u) ? 4     // UART0
+                    : (a >= 0x4000'C000u && a < 0x4001'C000u) ? 5     // CT16/32
+                    : (a >= 0xE000'E100u && a < 0xE000'E500u) ? 6     // NVIC
+                    : 7;
+        g_rprof[r][0] += tp4 - tp3; ++g_rprof[r][1];
+    }
 
     // Bootloader->App-Handover: SP-Korrektur anwenden, falls der soeben
     // emulierte SYSMEMREMAP-Store den Uebergang ausgeloest hat. Der Bootloader
@@ -616,7 +654,7 @@ extern "C" void handle_memfault_c(trap_decoder::StackedFrame* frame,
 // MemManage und BusFault. UsageFault (z. B. UDF, illegal opcode) und
 // HardFault behandeln wir als echten Fault → Watchdog-Reset.
 
-extern "C" __attribute__((naked)) void isr_busfault() {
+extern "C" __attribute__((naked, section(".time_critical.isr_busfault"))) void isr_busfault() {
     __asm volatile (
         "tst   lr, #4              \n"
         "ite   eq                  \n"
@@ -632,7 +670,7 @@ extern "C" __attribute__((naked)) void isr_busfault() {
     );
 }
 
-extern "C" __attribute__((naked)) void isr_memmanage() {
+extern "C" __attribute__((naked, section(".time_critical.isr_memmanage"))) void isr_memmanage() {
     __asm volatile (
         "tst   lr, #4              \n"
         "ite   eq                  \n"
@@ -733,7 +771,7 @@ extern "C" void hardfault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
     enter_fatal_halt();
 }
 
-extern "C" __attribute__((naked)) void isr_hardfault() {
+extern "C" __attribute__((naked, section(".time_critical.isr_hardfault"))) void isr_hardfault() {
     __asm volatile (
         "tst   lr, #4              \n"
         "ite   eq                  \n"
@@ -756,7 +794,7 @@ extern "C" void usagefault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
     enter_fatal_halt();
 }
 
-extern "C" __attribute__((naked)) void isr_usagefault() {
+extern "C" __attribute__((naked, section(".time_critical.isr_usagefault"))) void isr_usagefault() {
     __asm volatile (
         "tst   lr, #4              \n"
         "ite   eq                  \n"
@@ -783,7 +821,7 @@ extern "C" void debugmon_c(uint32_t* exc_frame, uint32_t* r4_r11) {
     target_halt::on_debug_event(exc_frame, r4_r11);
 }
 
-extern "C" __attribute__((naked)) void isr_debugmon() {
+extern "C" __attribute__((naked, section(".time_critical.isr_debugmon"))) void isr_debugmon() {
     __asm volatile (
         "tst   lr, #4              \n"
         "ite   eq                  \n"
@@ -797,6 +835,14 @@ extern "C" __attribute__((naked)) void isr_debugmon() {
         "pop   {r4-r11, lr}        \n"
         "bx    lr                  \n"
     );
+}
+
+void trap_region_profile(uint32_t avg[8], uint32_t cnt[8]) {
+    for (int i = 0; i < 8; ++i) { cnt[i] = g_rprof[i][1]; avg[i] = cnt[i] ? g_rprof[i][0] / cnt[i] : 0u; }
+}
+
+void trap_profile(uint32_t out[4]) {
+    for (int i = 0; i < 4; ++i) out[i] = g_tprof[4] ? g_tprof[i] / g_tprof[4] : 0u;
 }
 
 void setup_fault_handlers() {

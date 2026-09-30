@@ -1,3 +1,4 @@
+#include "pico.h"
 #include "opcodes.h"
 
 #include <cstdint>
@@ -10,7 +11,7 @@ namespace trap_decoder {
 
 namespace {
 
-uint32_t read_reg(const StackedFrame* f, const uint32_t r4_r11[8],
+uint32_t __not_in_flash_func(read_reg)(const StackedFrame* f, const uint32_t r4_r11[8],
                   uint32_t sp_main, uint8_t r) {
     switch (r) {
         case 0:  return f->r0;
@@ -33,7 +34,7 @@ uint32_t read_reg(const StackedFrame* f, const uint32_t r4_r11[8],
     }
 }
 
-bool decode16(uint16_t op, const StackedFrame* f, const uint32_t r4_r11[8],
+bool __not_in_flash_func(decode16)(uint16_t op, const StackedFrame* f, const uint32_t r4_r11[8],
               uint32_t sp_main, Access& a) {
     a.instr_size = 2;
 
@@ -106,7 +107,7 @@ bool decode16(uint16_t op, const StackedFrame* f, const uint32_t r4_r11[8],
 
 } // namespace
 
-bool decode_mem_access(const StackedFrame* frame,
+bool __not_in_flash_func(decode_mem_access)(const StackedFrame* frame,
                        uint32_t r4_r11[8],
                        uint32_t sp_main,
                        Access& out) {
@@ -114,7 +115,7 @@ bool decode_mem_access(const StackedFrame* frame,
     return decode16(op, frame, r4_r11, sp_main, out);
 }
 
-uint32_t* reg_ptr(StackedFrame* frame, uint32_t r4_r11[8],
+uint32_t* __not_in_flash_func(reg_ptr)(StackedFrame* frame, uint32_t r4_r11[8],
                   uint32_t* sp_main_ptr, uint8_t r) {
     switch (r) {
         case 0:  return &frame->r0;

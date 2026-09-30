@@ -7,7 +7,7 @@
 #include "RP2350.h"
 #include "hardware/sync.h"
 #include "pico/time.h"
-#include "pico/platform.h"
+#include "pico.h"
 
 namespace target_halt {
 namespace {
@@ -111,14 +111,14 @@ void enter_halt(uint32_t* frame, uint32_t* r4_r11) {
     }
 }
 
-void on_pendsv_check(uint32_t* r4_r11) {
+void __not_in_flash_func(on_pendsv_check)(uint32_t* r4_r11) {
     if (!g_halt_request.load(std::memory_order_acquire)) return;
     uint32_t psp;
     __asm volatile ("mrs %0, psp" : "=r"(psp));
     enter_halt(reinterpret_cast<uint32_t*>(psp), r4_r11);
 }
 
-void core1_service() {
+void __not_in_flash_func(core1_service)() {
     if (g_halt_request.load(std::memory_order_relaxed) && !g_halted.load())
         SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
 }
@@ -153,7 +153,7 @@ void request_step() {
     g_resume_request.store(true);
 }
 
-bool is_halted()       { return g_halted.load(); }
+bool __not_in_flash_func(is_halted)()       { return g_halted.load(); }
 bool is_step_pending() { return g_step_request.load(); }
 const Snapshot* snapshot() { return is_halted() ? &g_snap : nullptr; }
 

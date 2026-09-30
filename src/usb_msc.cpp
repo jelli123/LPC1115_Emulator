@@ -377,6 +377,7 @@ bool find_hex_entry(uint16_t& cluster, uint32_t& size,
 //   tmat.<t>.<m>=<rp-gpio>    Timer-Match-Ausgang (KNX-TX), t=0..3, m=0..3
 //   tcap_pio=on|off          Capture flankengenau per PIO (Default on)
 //   tmatch_pio=on|off        Match/PWM-Ausgangspuls hardware-getaktet per PIO (Default on)
+//   tmatch_delay=<us>        Latenzausgleich der Match-Pulse, 0..25 (Default 20)
 //   wfi_pin_wakeup=on|off   (opt-in)
 //   primask_shadow=on|off   (opt-in)
 //
@@ -539,6 +540,8 @@ void parse_config(const char* buf, uint32_t len) {
         } else if (std::strcmp(line, "tmatch_pio") == 0) {
             config::set_tmatch_pio(std::strcmp(eq, "on") == 0 ||
                                    std::strcmp(eq, "1")  == 0);
+        } else if (std::strcmp(line, "tmatch_delay") == 0) {
+            config::set_tmatch_delay_us(static_cast<uint32_t>(std::strtoul(eq, nullptr, 0)));
         } else if (std::strcmp(line, "wfi_pin_wakeup") == 0) {
             config::set_wfi_pin_wakeup(std::strcmp(eq, "on") == 0 ||
                                        std::strcmp(eq, "1")  == 0);
@@ -805,6 +808,10 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     A("#   KNX-Bit-Timing (35-us-Pulse) ungeeignet. Default on.\n");
     A("tcap_pio=%s\n", config::tcap_pio() ? "on" : "off");
     A("tmatch_pio=%s\n", config::tmatch_pio() ? "on" : "off");
+    A("# tmatch_delay: Match-Pulse um diese Zeit (us, 0..25) verzoegert ausgeben.\n");
+    A("#   Reserve fuer den Gast-Handler, der den Puls der laufenden Periode erst\n");
+    A("#   nach dem Timer-Reset setzt (sblib: MR0 bis 69 us danach). Default 20.\n");
+    A("tmatch_delay=%u\n", static_cast<unsigned>(config::tmatch_delay_us()));
     A("# tcap.<t>=<gpio>   Capture-Eingang (Bus-RX), t: 0=CT16B0 1=CT16B1 2=CT32B0 3=CT32B1\n");
     A("# tmat.<t>.<m>=<gpio> Match-Ausgang (Bus-TX), m=0..3\n");
     A("# Pin entfernen/abschalten: Zeile loeschen oder Wert -1.\n");

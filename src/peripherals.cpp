@@ -1,3 +1,4 @@
+#include "fast_time.h"
 #include "peripherals.h"
 #include "config.h"
 #include "vnvic.h"
@@ -68,6 +69,8 @@ extern "C" void peripherals_wdt_reset_guest();
 
 // LPC1115 Peripheral-Adressen (Auswahl).
 // SYSCON Block bei 0x40048000.
+namespace peripherals { int lpc_out_gpio(uint8_t lpc); }   // gecachte RP-GPIO eines LPC-Pins
+
 namespace {
 
 // SYSCON
@@ -186,6 +189,8 @@ constexpr uint32_t I2C_END      = I2C_BASE + 0x100;
 constexpr uint32_t PMU_BASE     = 0x4003'8000;
 constexpr uint32_t PMU_END      = PMU_BASE + 0x100;
 
+inline uint32_t cyccnt() { return *reinterpret_cast<volatile uint32_t*>(0xE000'1004u); }  // DWT->CYCCNT
+
 struct GpioPort {
     uint32_t dir;
     uint32_t data;
@@ -198,6 +203,8 @@ struct GpioPort {
 
 GpioPort        g_gpio[4]{};
 bool            g_gpio_irq_primed = false;
+bool            g_pin_irq_dirty = true;
+uint32_t        g_trap_epoch = 1;          // je MMIO-Trap +1 (Timer nur einmal pro Trap fortschreiben)   // GPIO-IRQ-/Start-Logik-Register geaendert -> neu auswerten
 
 // GPIO-Interrupt-Register relativ zur Port-Basis.
 constexpr uint32_t GPIO_IS_OFFSET  = 0x8004;
@@ -302,11 +309,25 @@ bool bridge_owns_gpio(int g) {
     return false;
 }
 
-void gpio_apply_port(uint8_t port, uint32_t /*old_data*/, uint32_t new_data, uint32_t dir) {
+
+// Nur geaenderte Pins anfassen. Reiner Pegelwechsel eines Ausgangs (der
+// Normalfall: LED, Schaltausgang) -> direkter SIO-Schreibzugriff ueber die
+// gecachte GPIO-Nummer. Richtungswechsel -> volle Konfiguration. Frueher wurden
+// bei JEDEM Byte-Zugriff alle 12 Pins komplett neu konfiguriert (Pinmap-Kopie,
+// Bridge-Pruefung, gpio_init) - mit Abstand der teuerste Trap.
+void gpio_apply_port(uint8_t port, uint32_t old_data, uint32_t new_data,
+                     uint32_t old_dir, uint32_t new_dir) {
+    const uint32_t changed = ((old_data ^ new_data) | (old_dir ^ new_dir)) & 0xFFFu;
+    if (!changed) return;
     for (uint8_t pin = 0; pin < 12; ++pin) {
-        bool out = (dir >> pin) & 1u;
-        bool lvl = (new_data >> pin) & 1u;
-        apply_gpio_to_hw(lpc_pin_idx(port, pin), out, lvl);
+        if (!((changed >> pin) & 1u)) continue;
+        const bool out = (new_dir >> pin) & 1u;
+        const bool lvl = (new_data >> pin) & 1u;
+        const uint8_t lpc = lpc_pin_idx(port, pin);
+        if (((old_dir ^ new_dir) >> pin) & 1u) { apply_gpio_to_hw(lpc, out, lvl); continue; }
+        if (!out) continue;                              // Eingang: Pegel im Schatten egal
+        const int g = peripherals::lpc_out_gpio(lpc);
+        if (g >= 0) gpio_put(static_cast<uint>(g), lvl);
     }
 }
 uint32_t        g_systick_load = 0, g_systick_val = 0, g_systick_ctrl = 0;
@@ -335,7 +356,7 @@ struct SysTick {
     uint32_t rvr;      // 24-bit Reload
     uint32_t cvr;      // 24-bit Current
     uint64_t last_us;  // Zeitpunkt des letzten advance
-    double   frac;     // Rest-Tick-Bruchteil
+    uint32_t frac;     // Rest-Tick-Bruchteil in 1/1e6 Ticks
     // Diagnose:
     uint32_t trap_reads;   // Anzahl getrappter SysTick-Reads
     uint32_t trap_writes;  // Anzahl getrappter SysTick-Writes
@@ -352,8 +373,8 @@ constexpr uint32_t SYST_CSR_COUNTFLAG = 1u << 16;
 // fuer konsistente Gast-Lesewerte). Die tatsaechliche SysTick-Exception liefert
 // der reale Core1-SysTick nativ (systick_hw_sync) — hier wird daher NICHT mehr
 // injiziert. Wird aus poll_timed_sources() und dem SysTick-MMIO-Read aufgerufen.
-void systick_advance() {
-    uint64_t now = time_us_64();
+void __not_in_flash_func(systick_advance)() {
+    uint64_t now = fast_time_us();
     if (!(g_systick.csr & SYST_CSR_ENABLE) || g_systick.rvr == 0) {
         g_systick.last_us = now;
         return;
@@ -361,11 +382,17 @@ void systick_advance() {
     uint64_t dt = now - g_systick.last_us;
     g_systick.last_us = now;
     uint32_t hz = g_current_hz ? g_current_hz : 12'000'000u;
-    // Verstrichene SysTick-Ticks (Prozessortakt) = dt[us] * hz / 1e6.
-    double ticks_f = g_systick.frac +
-        (static_cast<double>(dt) * static_cast<double>(hz)) / 1'000'000.0;
-    uint64_t ticks = static_cast<uint64_t>(ticks_f);
-    g_systick.frac = ticks_f - static_cast<double>(ticks);
+    // Verstrichene SysTick-Ticks (Prozessortakt) = dt[us] * hz / 1e6, ganzzahlig
+    // mit Rest (double/64-Bit-Division laufen auf dem M33 in Software - kostete
+    // ~1400 Takte je Shim-Aufruf). Ganze MHz (Normalfall): nur Multiplikation.
+    uint64_t ticks;
+    if (hz % 1'000'000u == 0u) {
+        ticks = dt * (hz / 1'000'000u);
+    } else {
+        const uint64_t num = dt * hz + g_systick.frac;
+        ticks = num / 1'000'000u;
+        g_systick.frac = static_cast<uint32_t>(num - ticks * 1'000'000u);
+    }
     if (ticks == 0) return;
 
     uint32_t period = (g_systick.rvr & 0xFF'FFFFu) + 1u;   // RELOAD+1 Ticks/Zyklus
@@ -375,8 +402,15 @@ void systick_advance() {
     // koennen mehrere Perioden in einem dt liegen -> alle zaehlen (Nachholen).
     if (ticks > cur) {
         uint64_t after = ticks - (cur + 1u);       // Ticks nach dem 1. Nulldurchgang
-        underflows = 1u + static_cast<uint32_t>(after / period);
-        uint32_t rem = static_cast<uint32_t>(after % period);
+        uint32_t rem;
+        if (after <= 0xFFFF'FFFFull) {             // Normalfall: 32-Bit-Division (Hardware)
+            const uint32_t a32 = static_cast<uint32_t>(after);
+            underflows = 1u + a32 / period;
+            rem = a32 % period;
+        } else {
+            underflows = 1u + static_cast<uint32_t>(after / period);
+            rem = static_cast<uint32_t>(after % period);
+        }
         cur = period - 1u - rem;
     } else {
         cur -= static_cast<uint32_t>(ticks);
@@ -397,7 +431,7 @@ void systick_advance() {
 // Vorwaertsdeklaration: absolute Zeit (time_us_64-Domain) des naechsten
 // faelligen CT-Match-INTERRUPTS, ~0 wenn keiner ansteht. Definition nach
 // ct_advance (braucht CtModel/g_ct). Treibt die adaptive SysTick-Reload-Wahl.
-uint64_t next_ct_irq_deadline_us(uint64_t now);
+uint64_t next_ct_irq_deadline_us();
 
 // Programmiert den ECHTEN Core1-SysTick als HOST-Zeitbasis ("HW-Alarm"). Slot 15
 // zeigt auf unseren isr_systick_shim (emulator.cpp). Nur auf Core1 (SysTick ist
@@ -415,12 +449,13 @@ uint64_t next_ct_irq_deadline_us(uint64_t now);
 // ohne eine starre Hochfrequenz-ISR. Der reale SysTick laeuft, wenn der Gast
 // SysTick+TICKINT nutzt ODER ein CT-Match-Interrupt aussteht; sonst gestoppt
 // (reines MMIO-Polling treibt das Advance dann selbst).
-void systick_program_hw() {
+uint32_t s_cyc_per_us = 0;   // clk_sys-Takte je us (von systick_program_hw gesetzt)
+void __not_in_flash_func(systick_program_hw)() {
     if (get_core_num() != 1u) return;   // SysTick ist per-Core; nur Core1 relevant
-    const uint64_t now = time_us_64();
+    const uint64_t now = fast_time_us();
     const bool guest_en  = (g_systick.csr & SYST_CSR_ENABLE) && (g_systick.rvr != 0u);
     const bool guest_irq = guest_en && (g_systick.csr & SYST_CSR_TICKINT);
-    const uint64_t ct_deadline = next_ct_irq_deadline_us(now);
+    const uint64_t ct_deadline = next_ct_irq_deadline_us();
     const bool ct_pending = (ct_deadline != ~uint64_t(0));
     // Sicherheitsnetz: sind bereits LPC-IRQs pending (z. B. mehrere Timer haben
     // gleichzeitig gematcht, aber pro PendSV-Lauf wird nur einer injiziert), muss
@@ -440,26 +475,44 @@ void systick_program_hw() {
         systick_hw->csr = 0u;           // nichts braucht eine Host-Taktquelle
         return;
     }
-    uint32_t real_hz  = clock_get_hz(clk_sys);
-    if (real_hz == 0u) real_hz = 150'000'000u;
-    uint32_t guest_hz = g_current_hz ? g_current_hz : 12'000'000u;
+    // Takte/Umrechnungen nur bei Aenderung neu bestimmen (64-Bit-Division
+    // laeuft auf dem M33 in Software; clock_get_hz liegt im Flash).
+    static uint32_t s_guest_hz = 0, s_real_hz = 0;
+    static uint32_t s_rvr = ~0u;
+    static uint64_t s_guest_cycles = 0;
+    const uint32_t guest_hz = g_current_hz ? g_current_hz : 12'000'000u;
+    if (guest_hz != s_guest_hz || !s_real_hz) {
+        uint32_t rh = clock_get_hz(clk_sys);
+        s_real_hz    = rh ? rh : 150'000'000u;
+        s_cyc_per_us = s_real_hz / 1'000'000u;
+        s_guest_hz   = guest_hz;
+        s_rvr        = ~0u;
+    }
+    const uint32_t real_hz = s_real_hz;
 
     // Host-Obergrenze: mindestens jede 1 ms ein Advance.
-    uint64_t reload = static_cast<uint64_t>(real_hz) / 1000u;
+    uint64_t reload = real_hz / 1000u;
     if (guest_en) {
-        uint64_t guest_cycles =
-            (static_cast<uint64_t>(g_systick.rvr & 0xFF'FFFFu) + 1u)
-            * static_cast<uint64_t>(real_hz) / guest_hz;
-        if (guest_cycles < reload) reload = guest_cycles;
+        const uint32_t rvr = g_systick.rvr & 0xFF'FFFFu;
+        if (rvr != s_rvr) {
+            s_rvr = rvr;
+            s_guest_cycles = (static_cast<uint64_t>(rvr) + 1u) * real_hz / guest_hz;
+        }
+        if (s_guest_cycles < reload) reload = s_guest_cycles;
     }
     if (ct_pending) {
-        uint64_t d_us     = ct_deadline - now;
-        uint64_t d_cycles = d_us * static_cast<uint64_t>(real_hz) / 1'000'000u;
-        if (d_cycles < reload) reload = d_cycles;
+        const uint64_t d_us = (ct_deadline > now) ? ct_deadline - now : 0u;
+        if (d_us < reload) {                           // reload/cyc_per_us >= 1 ms
+            const uint64_t d_cycles = d_us * s_cyc_per_us;
+            if (d_cycles < reload) reload = d_cycles;
+        }
     }
     // Warten IRQs auf Auslieferung, schnellstmoeglich erneut feuern (Floor).
     if (irq_waiting) reload = 0u;
-    const uint64_t floor_cycles = static_cast<uint64_t>(real_hz) * 30u / 1'000'000u; // ~30 us
+    // Untergrenze: ~30 us fuer das Nachliefern wartender IRQs (Livelock-Schutz,
+    // s. o.), fuer einen Match-Deadline nur ~3 us - der Shim kostet heute
+    // ~10 us, ein 30-us-Boden verspaetete den Periodenreset-IRQ unnoetig.
+    const uint64_t floor_cycles = static_cast<uint64_t>(s_cyc_per_us) * (irq_waiting ? 30u : 3u);
     if (reload < floor_cycles)     reload = floor_cycles;
     if (reload < 1u)               reload = 1u;
     if (reload > 0x0100'0000ull)   reload = 0x0100'0000ull;   // 24-bit RVR + 1
@@ -468,7 +521,7 @@ void systick_program_hw() {
     systick_hw->csr = (1u << 2) | (1u << 1) | (1u << 0);   // CLKSOURCE|TICKINT|ENABLE
 }
 
-uint32_t systick_read32(uint32_t addr) {
+uint32_t __not_in_flash_func(systick_read32)(uint32_t addr) {
     ++g_systick.trap_reads;
     switch (addr & 0xFFu) {
         case 0x10:                          // SYST_CSR
@@ -485,20 +538,20 @@ uint32_t systick_read32(uint32_t addr) {
     }
 }
 
-void systick_write32(uint32_t addr, uint32_t value) {
+void __not_in_flash_func(systick_write32)(uint32_t addr, uint32_t value) {
     ++g_systick.trap_writes;
     switch (addr & 0xFFu) {
         case 0x10:                          // SYST_CSR
             systick_advance();
             g_systick.csr = value & 0x7u;   // ENABLE|TICKINT|CLKSOURCE
-            g_systick.last_us = time_us_64();
-            g_systick.frac = 0.0;
+            g_systick.last_us = fast_time_us();
+            g_systick.frac = 0;
             break;
         case 0x14: g_systick.rvr = value & 0xFF'FFFFu; break;  // SYST_RVR
         case 0x18:                          // SYST_CVR: jeder Write -> 0, COUNTFLAG clear
             g_systick.cvr = 0;
             g_systick.csr &= ~SYST_CSR_COUNTFLAG;
-            g_systick.frac = 0.0;
+            g_systick.frac = 0;
             break;
         default: break;                     // ICTR (RO) / ACTLR: ignorieren
     }
@@ -512,7 +565,7 @@ void systick_write32(uint32_t addr, uint32_t value) {
 struct SysTickCollector { uint32_t aligned; uint8_t bytes[4]; uint8_t mask; };
 SysTickCollector g_systick_collector{0, {0,0,0,0}, 0};
 
-void systick_collect_byte(uint32_t addr, uint8_t val) {
+void __not_in_flash_func(systick_collect_byte)(uint32_t addr, uint8_t val) {
     uint32_t aligned = addr & ~3u;
     if (g_systick_collector.mask != 0 &&
         g_systick_collector.aligned != aligned) {
@@ -607,23 +660,40 @@ constexpr uint16_t IOCON_OFF[4][12] = {
 // Wendet die IOCON-MODE-Bits (Pull-up/-down) eines LPC-Pins auf den gemappten
 // echten RP2350-Pad an. Fuer Output-Pins werden die Pulls deaktiviert (der Pin
 // treibt aktiv). Bridge-Pins (ADC/SPI/Capture/Match) bleiben unberuehrt.
-void apply_pull_to_hw(uint8_t port, uint8_t pin) {
+// Pull-Widerstaende direkt im Pad-Register (RAM-Pfad; die SDK-Funktionen
+// liegen im Flash und kosteten im Trap bis zu ~60 us).
+inline void pad_pulls(uint g, bool up, bool down) {
+    hw_write_masked(&pads_bank0_hw->io[g],
+                    (up ? PADS_BANK0_GPIO0_PUE_BITS : 0u) | (down ? PADS_BANK0_GPIO0_PDE_BITS : 0u),
+                    PADS_BANK0_GPIO0_PUE_BITS | PADS_BANK0_GPIO0_PDE_BITS);
+}
+
+bool g_e9_warned = false;   // Hinweis auf Erratum RP2350-E9 nur einmal
+
+void __not_in_flash_func(apply_pull_to_hw)(uint8_t port, uint8_t pin) {
     if (port >= 4u || pin >= 12u) return;
     uint16_t off = IOCON_OFF[port][pin];
     if (off == IOCON_NONE) return;
-    const auto& pm = config::pin_map();
-    uint8_t lpc = lpc_pin_idx(port, pin);
-    if (lpc >= config::LPC_PIN_COUNT) return;
-    int g = pm.lpc_to_rp[lpc];
-    if (g < 0 || bridge_owns_gpio(g)) return;
+    const int g = peripherals::lpc_out_gpio(lpc_pin_idx(port, pin));   // ohne Bridge-Pads
+    if (g < 0) return;
     if ((g_gpio[port].dir >> pin) & 1u) {            // Output -> kein Pull
-        gpio_disable_pulls(static_cast<uint>(g));
+        pad_pulls(static_cast<uint>(g), false, false);
         return;
     }
     switch ((g_iocon[off] >> 3) & 0x3u) {            // IOCON MODE[1:0]
-        case 0x1: gpio_pull_down(static_cast<uint>(g)); break;   // pull-down
-        case 0x2: gpio_pull_up(static_cast<uint>(g));   break;   // pull-up
-        default:  gpio_disable_pulls(static_cast<uint>(g)); break;// inactive/repeater
+        case 0x1:                                    // pull-down
+            // Erratum RP2350-E9 (Chips bis A2): Ein Eingang mit Pull-down und
+            // aktivem Input-Buffer bleibt nach einem High-Pegel bei ~2 V haengen
+            // und liest weiter 1. Abhilfe nur extern (Pull-down <= 8,2 kOhm).
+            pad_pulls(static_cast<uint>(g), false, true);
+            if (!g_e9_warned) {
+                g_e9_warned = true;
+                std::printf("[GPIO] Hinweis: P%u_%u (GP%d) mit Pull-down - RP2350-Erratum E9: "
+                            "externen Pull-down <= 8,2 kOhm vorsehen\n", port, pin, g);
+            }
+            break;
+        case 0x2: pad_pulls(static_cast<uint>(g), true, false);  break;   // pull-up
+        default:  pad_pulls(static_cast<uint>(g), false, false); break;   // inactive/repeater
     }
 }
 
@@ -637,18 +707,20 @@ void apply_iocon_pull(uint32_t byte_off) {
             }
 }
 
-void apply_gpio_to_hw(uint8_t lpc_pin, bool out, bool level) {
-    auto pm = config::pin_map();
+void __not_in_flash_func(apply_gpio_to_hw)(uint8_t lpc_pin, bool out, bool level) {
     if (lpc_pin >= config::LPC_PIN_COUNT) return;
-    int g = pm.lpc_to_rp[lpc_pin];
+    const int g = peripherals::lpc_out_gpio(lpc_pin);   // ohne ADC/SPI/Timer-/UART-Bridge-Pads
     if (g < 0) return;
-    if (bridge_owns_gpio(g)) return;   // ADC/SPI/Timer-Capture/Match besitzen den Pin
-    gpio_init(static_cast<uint>(g));
-    gpio_set_dir(static_cast<uint>(g), out);
+    // Nur beim ersten Mal (Pad noch nicht SIO) ueber das SDK initialisieren; ein
+    // reiner Richtungswechsel laeuft ueber SIO-/Pad-Register (Firmware schaltet
+    // z. B. Pins zyklisch zwischen Ein- und Ausgang).
+    if (gpio_get_function(static_cast<uint>(g)) != GPIO_FUNC_SIO) gpio_init(static_cast<uint>(g));
     if (out) {
-        gpio_disable_pulls(static_cast<uint>(g));    // Ausgang treibt aktiv
-        gpio_put(static_cast<uint>(g), level);
+        gpio_put(static_cast<uint>(g), level);         // Pegel vor dem Umschalten
+        gpio_set_dir(static_cast<uint>(g), true);
+        pad_pulls(static_cast<uint>(g), false, false); // Ausgang treibt aktiv
     } else {
+        gpio_set_dir(static_cast<uint>(g), false);
         // Eingang: Pull-Konfiguration aus dem IOCON-Schatten anwenden, damit ein
         // Taster gegen GND (PROG-Pin, INPUT|PULL_UP) sauber erkannt wird.
         apply_pull_to_hw(static_cast<uint8_t>(lpc_pin / 12u),
@@ -735,15 +807,15 @@ void syscon_write32(uint32_t addr, uint32_t value) {
         case MAINCLKUEN:
             if (value & 1u) g_pll_reconfig_pending = true;
             break;
-        case STARTAPRP0:    g_start_aprp = value & START_MASK;                                break;
-        case STARTERP0:     g_start_erp  = value & START_MASK;                                break;
-        case STARTRSRP0CLR: g_start_srp &= ~(value & START_MASK);                             break;
+        case STARTAPRP0:    g_start_aprp = value & START_MASK; g_pin_irq_dirty = true;        break;
+        case STARTERP0:     g_start_erp  = value & START_MASK; g_pin_irq_dirty = true;        break;
+        case STARTRSRP0CLR: g_start_srp &= ~(value & START_MASK); g_pin_irq_dirty = true;     break;
         default:
             break;
     }
 }
 
-uint32_t syscon_read32(uint32_t addr) {
+uint32_t __not_in_flash_func(syscon_read32)(uint32_t addr) {
     switch (addr) {
         case SYSPLLCTRL:   return g_syspllctrl;
         case SYSPLLSTAT:   return 1; // PLL locked (immer)
@@ -777,7 +849,7 @@ bool collector_complete(WordCollector& c) {
     return c.written_mask == 0xF;
 }
 
-void syscon_collect_byte(uint32_t addr, uint8_t val) {
+void __not_in_flash_func(syscon_collect_byte)(uint32_t addr, uint8_t val) {
     uint32_t aligned = addr & ~3u;
     if (g_syscon_collector.written_mask != 0 &&
         g_syscon_collector.addr_aligned != aligned) {
@@ -874,7 +946,7 @@ struct SpscRing {
 SpscRing g_uart0_tx;   // Gast -> PC
 SpscRing g_uart0_rx;   // PC -> Gast
 
-bool ring_push(SpscRing& r, uint8_t b) {
+bool __not_in_flash_func(ring_push)(SpscRing& r, uint8_t b) {
     uint32_t h = r.head.load(std::memory_order_relaxed);
     uint32_t n = (h + 1u) & (UART0_RING - 1u);
     if (n == (r.tail.load(std::memory_order_acquire) & (UART0_RING - 1u)))
@@ -883,7 +955,7 @@ bool ring_push(SpscRing& r, uint8_t b) {
     r.head.store(h + 1u, std::memory_order_release);
     return true;
 }
-bool ring_pop(SpscRing& r, uint8_t& b) {
+bool __not_in_flash_func(ring_pop)(SpscRing& r, uint8_t& b) {
     uint32_t t = r.tail.load(std::memory_order_relaxed);
     if ((t & (UART0_RING - 1u)) == (r.head.load(std::memory_order_acquire) & (UART0_RING - 1u)))
         return false;                   // leer
@@ -891,7 +963,7 @@ bool ring_pop(SpscRing& r, uint8_t& b) {
     r.tail.store(t + 1u, std::memory_order_release);
     return true;
 }
-bool ring_empty(const SpscRing& r) {
+bool __not_in_flash_func(ring_empty)(const SpscRing& r) {
     return (r.head.load(std::memory_order_acquire) & (UART0_RING - 1u)) ==
            (r.tail.load(std::memory_order_acquire) & (UART0_RING - 1u));
 }
@@ -1066,7 +1138,7 @@ void uart_hw_boot_init() {
     ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
 }
 
-uint8_t uart0_read_reg(uint32_t addr) {
+uint8_t __not_in_flash_func(uart0_read_reg)(uint32_t addr) {
     bool dlab = (g_uart0.lcr & 0x80u) != 0;
     const bool cdc = config::uart0_cdc_enabled();
     switch (addr) {
@@ -1130,7 +1202,7 @@ uint8_t uart0_read_reg(uint32_t addr) {
     }
 }
 
-void uart0_write_reg(uint32_t addr, uint8_t val) {
+void __not_in_flash_func(uart0_write_reg)(uint32_t addr, uint8_t val) {
     bool dlab = (g_uart0.lcr & 0x80u) != 0;
     switch (addr) {
         case UART0_THR:
@@ -1195,13 +1267,16 @@ void uart0_write_reg(uint32_t addr, uint8_t val) {
 }
 
 // =========================================================================
-// CT16Bx / CT32Bx — Match-Timer mit Soft-Tick aus time_us_64().
+// CT16Bx / CT32Bx — Match-Timer mit Soft-Tick aus fast_time_us().
 // Modelliert generische LPC1115-Timer-Hardware: Match (MCR/MR/EMR), PWM
 // (PWMC) und Capture (CCR/CR0). Die Capture-Eingaenge und Match-/PWM-Ausgaenge
 // koennen optional an echte RP2350-GPIOs gebrueckt werden — nutzbar fuer jede
 // Capture-/PWM-Anwendung (Frequenz-/Pulsbreitenmessung, Servo-/Trigger-PWM,
 // Software-Bus-Treiber wie KNX-Selfbus: Capture = Empfang, Match = Senden).
 // =========================================================================
+// Ein an die Match-PIO gegebener Puls, absolute Zeiten in ns (time_us_64-Basis).
+struct TxPulse { uint64_t base, start, end; };   // base = Periodenbeginn
+
 struct CtModel {
     bool     enabled;
     uint32_t pre;
@@ -1230,11 +1305,26 @@ struct CtModel {
     // PIO-Match (opt-in): Hardware-Puls-Erzeugung je PWM-Match-Kanal. Ein
     // Handle pro Kanal (m=0..3), -1 = Software-PWM (generischer Fallback).
     int      tx_handle[4]; // < 0 = Software-PWM für diesen Kanal
+    int      tx_spare[4];  // geparkte Match-PIO (Pin an SIO zurueckgegeben), < 0 = keine
     float    tx_rate;      // PIO-Zählrate [Counts/s] (für alle Kanäle gleich)
     uint32_t dbg_pends;    // Diagnose: wie oft dieser Timer einen Match-IRQ pendete
     // Diagnose Match-PIO: an die PIO uebergebene Pulse bzw. verworfene Aufrufe
     // (0 = kein Reset-Kanal, 1 = MR>=Periode, 2 = Match schon vorbei, 3 = FIFO voll/kein SM).
     uint32_t dbg_tx_emit, dbg_tx_skip[4];
+    // Zeitplan des Match-PIO-Pulses (absolute Zeit in ns, time_us_64-Basis).
+    // Verspaetung (TC-Ticks) beim ersten MR-Schreiben nach einem Periodenreset
+    // mit Interrupt - zeigt, wie lange Match-IRQ + Handler im Emulator brauchen.
+    uint32_t lat_n, lat_max, lat_last; uint64_t lat_sum; bool lat_armed;
+    uint64_t adv_now_us;   // time_us_64 des letzten ct_advance (Schnellpfad)
+    uint64_t quiet_until_us;   // bis dahin kein Timer-Ereignis (0 = unbekannt)
+    uint32_t ir_unseen;        // Match-Flags, gesetzt nach dem letzten IR-Lesen
+    uint32_t mr_fresh;         // MRm seit dem letzten IR-Lesen neu geschrieben
+    uint32_t ir_fresh;         // ... und danach getroffen (Ereignis der neuen Periode)
+    uint32_t quiet_hz;         // Takt, fuer den quiet_until_us gilt
+    uint32_t adv_epoch;    // Trap-Epoche des letzten Fortschreibens aus ct_read/ct_write
+    TxPulse  txq[4][2];      // an die Match-PIO gegebene Pulse (laufend, wartend)
+    uint8_t  txn[4];
+    TxPulse  echo_last[4];   // zuletzt beendeter Puls (Echo-Zuordnung)
 };
 CtModel g_ct[4];
 
@@ -1247,7 +1337,7 @@ uint64_t g_ct_max_ticks        = 0;
 
 // EMR-External-Match: EM0..3 = Bits 0..3, EMC0..3 = je 2 Bit ab Bit 4.
 // EMC: 0=nichts, 1=Pin löschen(0), 2=Pin setzen(1), 3=Pin toggeln.
-void ct_apply_external_match(CtModel& c, int m) {
+void __not_in_flash_func(ct_apply_external_match)(CtModel& c, int m) {
     uint32_t emc = (c.emr >> (4u + 2u * static_cast<uint32_t>(m))) & 0x3u;
     if (emc == 0) return;
     uint32_t bit = 1u << m;
@@ -1266,11 +1356,17 @@ void ct_apply_external_match(CtModel& c, int m) {
 // high (LPC-Spezialfall). Der Pegel wird zugleich im EMR-EM-Bit gespiegelt,
 // damit getMatchChannelLevel() korrekt liest. Generischer Software-Pfad —
 // greift fuer alle Kanaele, die NICHT von einer Match-PIO getrieben werden.
-void ct_update_pwm(CtModel& c) {
+void __not_in_flash_func(ct_update_pwm)(CtModel& c) {
+    // Match-PIO zustaendig (tmatch_pio + Periodenmodell mit Reset-Kanal): auch
+    // vor ihrer (lazy) Belegung den Pin nicht per Software treiben - sonst gab
+    // es vor dem ersten Puls einen kurzen High-Glitch (TC >= MRm), den z. B. die
+    // sblib als fremdes Startbit sah und ihr erstes Telegramm darauf synchronisierte.
+    const bool pio_model = config::tmatch_pio() &&
+        ((c.mcr & ((1u << 1) | (1u << 4) | (1u << 7) | (1u << 10))) != 0u);
     for (int m = 0; m < 4; ++m) {
         if (!(c.pwmc & (1u << m))) continue;
         // Match-PIO besitzt diesen Pin: kein Software-Bit-Bang (Doppeltreiben).
-        if (c.tx_handle[m] >= 0) continue;
+        if (c.tx_handle[m] >= 0 || (pio_model && c.mat_pin[m] >= 0)) continue;
         bool level = (c.mr[m] == 0u) ? true : (c.tc >= c.mr[m]);
         uint32_t bit = 1u << m;
         bool cur = (c.emr & bit) != 0;
@@ -1292,69 +1388,218 @@ void ct_update_pwm(CtModel& c) {
 // MRm < Periode). Fehlt das Modell, wird der Pin an den generischen
 // Software-PWM-Pfad zurueckgegeben — andere Programme funktionieren so
 // unveraendert, auch ohne Selfbus-typisches Puls-Schema.
-void ct_emit_tx_pulse(CtModel& c, int m) {
-    if (m < 0 || m > 3) return;
-    if (!config::tmatch_pio()) return;
-    if (!(c.pwmc & (1u << static_cast<uint32_t>(m)))) return;
-    if (c.mat_pin[m] < 0) return;
+// Periode des Zaehlers in Ticks: kleinster MR mit Reset-Bit + 1, sonst voller Umlauf.
+uint64_t __not_in_flash_func(ct_period)(const CtModel& c) {
+    const uint64_t mask = c.is32 ? 0xFFFF'FFFFull : 0xFFFFull;
+    uint64_t period = mask + 1u;
+    for (int m = 0; m < 4; ++m)
+        if (((c.mcr >> (m * 3)) & 0x2u) && (static_cast<uint64_t>(c.mr[m]) + 1u) < period)
+            period = static_cast<uint64_t>(c.mr[m]) + 1u;
+    return period;
+}
 
-    uint32_t mask   = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
-    uint32_t mr_pwm = c.mr[m] & mask;
+// TC-Wert zum (vergangenen) Zeitpunkt t_us - Grundlage fuer CR0. Rechnet vom
+// aktuellen Modellstand (c.tc gilt ab c.last_us) zurueck, inklusive Periodenresets.
+uint32_t __not_in_flash_func(ct_tc_at)(const CtModel& c, uint64_t t_us) {
+    if (!c.enabled || t_us >= c.last_us) return c.tc;
+    const uint64_t hz    = g_current_hz ? static_cast<uint64_t>(g_current_hz) : 1u;
+    const uint64_t back  = (c.last_us - t_us) * hz / (1'000'000ull * (static_cast<uint64_t>(c.pre) + 1u));
+    const uint64_t period = ct_period(c);
+    const uint64_t tc    = c.tc % period;
+    return static_cast<uint32_t>((tc + period - (back % period)) % period);
+}
 
-    // Periode = erster Match-Kanal mit RESET-Bit (MCR Bit 1 je Kanal×3).
-    uint32_t mr_reset = 0; bool have_reset = false;
-    for (int r = 0; r < 4; ++r) {
-        if ((c.mcr >> (r * 3)) & 0x2u) { mr_reset = c.mr[r] & mask; have_reset = true; break; }
+// Match-/PWM-Puls per PIO planen (tmatch_pio). Der LPC-PWM-Ausgang ist high von
+// TC == MRm bis zum Periodenende (Reset-Match): Breite = MRreset + 1 - MRm Ticks.
+// Neu geplant wird bei jeder Aenderung von MR/MCR/TC/TCR/PR/PWMC und laufend aus
+// ct_advance (reine Hardware-PWM wiederholt sich jede Periode).
+//
+// Je Kanal fuehrt txq[] die an die PIO gegebenen Pulse (hoechstens zwei: ein
+// laufender und ein wartender). Ein Puls gehoert ueber `base` (Periodenbeginn)
+// zu genau einer Timer-Periode. Aendert die Firmware MRm/MRreset derselben
+// Periode nachtraeglich (sblib: erst MR0, dann MR2 - oder umgekehrt), wird der
+// Plan ohne Pegelsprung neu aufgebaut: ein schon laufender Puls bleibt high und
+// endet zum neuen Zeitpunkt, ein wartender wird ersetzt. Frueher wurde dabei der
+// laufende Puls abgeschnitten bzw. endete mit dem alten Periodenende (Pulse von
+// 400 us statt 35 us).
+namespace {
+// PIO-Taktkosten (match_pulse): Flanke nach X+6 Counts, Pulsbreite Y+2; ein
+// Neuaufbau mit laufendem Puls haelt den Pegel und faellt nach Y+8 Counts.
+// Zaehlrate 1 MHz (tx_setup) -> 1 Count = 1000 ns; 32 Bit reicht (< 4 s).
+int64_t __not_in_flash_func(tx_counts)(const CtModel& c, uint64_t ns) {
+    if (c.tx_rate > 999'999.0f && c.tx_rate < 1'000'001.0f && ns < 0xFFFF'FFFFull)
+        return static_cast<int64_t>((static_cast<uint32_t>(ns) + 500u) / 1000u);
+    return static_cast<int64_t>(static_cast<float>(ns) * (c.tx_rate / 1e9f) + 0.5f);
+}
+
+bool __not_in_flash_func(tx_emit_rel)(CtModel& c, int m, uint64_t ref, const TxPulse& p) {
+    const uint64_t start = (p.start > ref) ? p.start : ref;   // verspaetet: sofort
+    if (p.end <= start) { ++c.dbg_tx_skip[2]; return false; }
+    const int64_t d = tx_counts(c, start - ref) - 6;
+    const int64_t w = tx_counts(c, p.end - start) - 2;
+    if (!pio_glue::tx_emit(c.tx_handle[m], static_cast<uint32_t>(d > 0 ? d : 0),
+                           static_cast<uint32_t>(w > 0 ? w : 0))) { ++c.dbg_tx_skip[3]; return false; }
+    ++c.dbg_tx_emit;
+    return true;
+}
+
+// Plan txq[m] vollstaendig neu an die PIO geben (Pegel bleibt erhalten).
+void __not_in_flash_func(tx_rebuild)(CtModel& c, int m, uint64_t now_ns) {
+    const int h = c.tx_handle[m];
+    bool running = c.txn[m] && c.txq[m][0].start <= now_ns;
+    // Endet der laufende Puls ohnehin gleich, sein Ende abwarten: ein Anhalten der
+    // SM kurz vor der fallenden Flanke liesse ihn sonst bis zu 8 us zu lang stehen.
+    if (running && c.txq[m][0].end <= now_ns + 9000u) {
+        while (fast_time_us() * 1000u < c.txq[m][0].end) { }
+        now_ns = fast_time_us() * 1000u;
+        c.echo_last[m] = c.txq[m][0];
+        c.txq[m][0] = c.txq[m][1]; --c.txn[m];
+        running = false;
+    }
+    pio_glue::tx_rebuild_begin(h, running);
+    uint64_t ref = now_ns;
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < c.txn[m]; ++i) {
+        const TxPulse& p = c.txq[m][i];
+        bool ok;
+        if (i == 0 && running) {
+            const int64_t w = tx_counts(c, p.end > now_ns ? p.end - now_ns : 0) - 8;
+            ok = pio_glue::tx_emit(h, 0u, static_cast<uint32_t>(w > 0 ? w : 0));
+        } else {
+            ok = tx_emit_rel(c, m, ref, p);
+        }
+        if (!ok) break;
+        c.txq[m][n++] = p;
+        ref = p.end;
+    }
+    c.txn[m] = n;
+    pio_glue::tx_rebuild_end(h);
+}
+} // namespace
+
+// Match-PIO parken: Pin (low) an SIO/Software-PWM zurueck, SM bleibt fuer die
+// naechste Nutzung reserviert (tx_setup waere im Trap zu teuer).
+void __not_in_flash_func(ct_tx_park)(CtModel& c, int m) {
+    pio_glue::tx_park(c.tx_handle[m]);
+    c.tx_spare[m]  = c.tx_handle[m];
+    c.tx_handle[m] = -1;
+    c.txn[m] = 0;
+}
+
+void __not_in_flash_func(ct_tx_schedule)(CtModel& c, int m) {
+    if (m < 0 || m > 3 || c.mat_pin[m] < 0) return;
+    const bool pwm = config::tmatch_pio() && (c.pwmc & (1u << static_cast<uint32_t>(m)));
+
+    uint32_t reset_ch = 4;
+    for (int r = 0; r < 4; ++r)
+        if ((c.mcr >> (r * 3)) & 0x2u) { reset_ch = static_cast<uint32_t>(r); break; }
+
+    // Ohne Reset-Kanal kein Periodenmodell -> Pin an die Software-PWM zurueck.
+    if (pwm && reset_ch > 3) {
+        ++c.dbg_tx_skip[0];
+        if (c.tx_handle[m] >= 0) ct_tx_park(c, m);
+        return;
+    }
+    if (!pwm && c.tx_handle[m] < 0) return;
+    // Schnell raus: nichts geplant und MRm liegt ausserhalb der Periode.
+    if (pwm && !c.txn[m] && reset_ch <= 3) {
+        const uint32_t mask32 = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
+        if ((c.mr[m] & mask32) > (c.mr[reset_ch] & mask32)) { ++c.dbg_tx_skip[1]; return; }
     }
 
-    // Kein Periodenmodell -> Pin an Software-PWM zurueckgeben (Handle freigeben).
-    if (!have_reset) {
-        ++c.dbg_tx_skip[0];
-        if (c.tx_handle[m] >= 0) {
-            pio_glue::tx_teardown(c.tx_handle[m]);
-            c.tx_handle[m] = -1;
-            gpio_init(static_cast<uint>(c.mat_pin[m]));
-            gpio_set_dir(static_cast<uint>(c.mat_pin[m]), true);  // Software treibt Pegel
+    const uint64_t now_ns = fast_time_us() * 1000u;
+    while (c.txn[m] && c.txq[m][0].end <= now_ns) {            // vorbei
+        c.echo_last[m] = c.txq[m][0];
+        c.txq[m][0] = c.txq[m][1]; --c.txn[m];
+    }
+
+    // Gewuenschter Puls dieser (oder, falls vorbei, der naechsten) Periode.
+    // ns je Tick einmal berechnen, danach nur Multiplikationen (64-Bit-Division
+    // und double laufen auf dem M33 in Software).
+    bool want = false;
+    TxPulse p{};
+    if (pwm && c.enabled) {
+        const uint32_t mask   = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
+        const uint64_t period = static_cast<uint64_t>(c.mr[reset_ch] & mask) + 1u;
+        const uint64_t mr_pwm = c.mr[m] & mask;
+        if (mr_pwm < period) {
+            const uint32_t hz   = g_current_hz ? g_current_hz : 1u;
+            const uint64_t nspt = (1'000'000'000ull * (static_cast<uint64_t>(c.pre) + 1u)) / hz;
+            const uint32_t tcp  = (period <= 0xFFFF'FFFFull) ? (c.tc % static_cast<uint32_t>(period)) : c.tc;
+            // Latenzausgleich: Puls fest um tmatch_delay verzoegert ausgeben
+            // (Reserve fuer den im Emulator verspaeteten Gast-Handler).
+            const uint64_t dly = static_cast<uint64_t>(config::tmatch_delay_us()) * 1000u;
+            p.base  = c.last_us * 1000u - tcp * nspt + dly;
+            p.start = p.base + mr_pwm * nspt;
+            p.end   = p.base + period * nspt;
+            if (p.end <= now_ns) { p.base += period * nspt; p.start += period * nspt; p.end += period * nspt; }
+            want = true;
+        } else {
+            ++c.dbg_tx_skip[1];
         }
+    }
+
+    auto near = [](uint64_t a, uint64_t b) { return (a > b ? a - b : b - a) < 1000u; };
+    int same = -1;                                               // Puls derselben Periode
+    if (want)
+        for (int i = 0; i < c.txn[m]; ++i)
+            if (near(c.txq[m][i].base, p.base)) { same = i; break; }
+
+    if (same >= 0) {
+        const TxPulse& q = c.txq[m][same];
+        if (near(q.start, p.start) && near(q.end, p.end)) return;   // unveraendert
+        if (q.start <= now_ns) p.start = q.start;                    // laeuft schon: nur Ende anpassen
+        c.txq[m][same] = p;
+        c.txn[m] = static_cast<uint8_t>(same + 1);                   // spaetere Perioden verwerfen
+        tx_rebuild(c, m, now_ns);
+        return;
+    }
+    if (!want) {
+        // Kein Puls mehr gewuenscht: wartende (noch nicht begonnene) Pulse verwerfen.
+        uint8_t keep = 0;
+        while (keep < c.txn[m] && c.txq[m][keep].start <= now_ns) ++keep;
+        if (keep != c.txn[m]) { c.txn[m] = keep; tx_rebuild(c, m, now_ns); }
         return;
     }
 
-    // MRm >= Periode: in diesem Zyklus kein Puls (z. B. MR=0xffff = "aus").
-    // Handle bleibt belegt; die PIO haelt den Pin idle-low. Kein Teardown,
-    // damit kein Claim/Unclaim-Churn bei pulsweisem Senden entsteht.
-    if (mr_pwm >= mr_reset) { ++c.dbg_tx_skip[1]; return; }
-
-    uint32_t delay_ticks = (mr_pwm - c.tc) & mask;     // bis zur steigenden Flanke
-    if (delay_ticks > (mask >> 1)) { ++c.dbg_tx_skip[2]; return; }   // Match bereits vorbei
-    uint32_t width_ticks = (mr_reset - mr_pwm) & mask;
-    if (width_ticks == 0) return;
-
-    double f_tc = static_cast<double>(g_current_hz) / static_cast<double>(c.pre + 1u);
-    if (f_tc <= 0.0) return;
-
-    // Lazy-Allokation: SM erst beim ersten gueltigen Puls belegen.
+    // Lazy-Allokation der State-Machine.
+    if (c.tx_handle[m] < 0 && c.tx_spare[m] >= 0) {          // geparkte SM wieder uebernehmen
+        pio_glue::tx_unpark(c.tx_spare[m]);
+        c.tx_handle[m] = c.tx_spare[m];
+        c.tx_spare[m]  = -1;
+        c.txn[m] = 0;
+    }
     if (c.tx_handle[m] < 0) {
         float rate = 0.0f;
         int h = pio_glue::tx_setup(static_cast<uint8_t>(c.mat_pin[m]), rate);
-        if (h >= 0) { c.tx_handle[m] = h; c.tx_rate = rate; }
+        if (h < 0 || rate <= 0.0f) { ++c.dbg_tx_skip[3]; return; }
+        c.tx_handle[m] = h; c.tx_rate = rate;
+        c.txn[m] = 0;
     }
-    if (c.tx_handle[m] < 0 || c.tx_rate <= 0.0f) { ++c.dbg_tx_skip[3]; return; }  // Fallback: Software-PWM
 
-    double cnt_per_tick = static_cast<double>(c.tx_rate) / f_tc;
-    uint32_t delay_cnt = static_cast<uint32_t>(static_cast<double>(delay_ticks) * cnt_per_tick);
-    uint32_t width_cnt = static_cast<uint32_t>(static_cast<double>(width_ticks) * cnt_per_tick);
-    if (pio_glue::tx_emit(c.tx_handle[m], delay_cnt, width_cnt)) ++c.dbg_tx_emit;
-    else ++c.dbg_tx_skip[3];
+    // Neue Periode: hinter den letzten Puls haengen (bzw. ab jetzt).
+    if (c.txn[m] >= 2) { ++c.dbg_tx_skip[3]; return; }
+    const uint64_t ref = c.txn[m] ? c.txq[m][c.txn[m] - 1].end : now_ns;
+    if (p.end <= ref) { ++c.dbg_tx_skip[2]; return; }
+    if (p.start < ref) p.start = ref;
+    if (tx_emit_rel(c, m, ref, p)) c.txq[m][c.txn[m]++] = p;
 }
 
-uint32_t ct_idx_for(uint32_t addr) {
+void __not_in_flash_func(ct_tx_schedule_all)(CtModel& c) {
+    for (int m = 0; m < 4; ++m)
+        if ((c.pwmc & (1u << static_cast<uint32_t>(m))) || c.tx_handle[m] >= 0) {
+            ct_tx_schedule(c, m);
+        }
+}
+
+uint32_t __not_in_flash_func(ct_idx_for)(uint32_t addr) {
     if (addr >= CT16B0_BASE && addr < CT16B0_BASE + CT_BLOCK_SIZE) return 0;
     if (addr >= CT16B1_BASE && addr < CT16B1_BASE + CT_BLOCK_SIZE) return 1;
     if (addr >= CT32B0_BASE && addr < CT32B0_BASE + CT_BLOCK_SIZE) return 2;
     if (addr >= CT32B1_BASE && addr < CT32B1_BASE + CT_BLOCK_SIZE) return 3;
     return 0xFFFFFFFFu;
 }
-uint32_t ct_base_for(uint32_t i) {
+uint32_t __not_in_flash_func(ct_base_for)(uint32_t i) {
     static const uint32_t b[4] = { CT16B0_BASE, CT16B1_BASE, CT32B0_BASE, CT32B1_BASE };
     return b[i];
 }
@@ -1369,20 +1614,33 @@ uint32_t ct_base_for(uint32_t i) {
 // mit Prescaler 0 = 48000 Iterationen/ms -> Runaway, Gast verhungert). Die
 // analytische Form berechnet Treffer/Endstand direkt und ist unabhaengig von dt
 // immer billig.
-void ct_advance(CtModel& c) {
-    if (!c.enabled) { c.last_us = time_us_64(); ct_update_pwm(c); return; }
-    uint64_t now = time_us_64();
+void __not_in_flash_func(ct_advance)(CtModel& c) {
+    if (!c.enabled) { c.last_us = fast_time_us(); ct_update_pwm(c); return; }
+    uint64_t now = fast_time_us();
+    // Schneller Pfad: seit dem letzten Aufruf keine volle us vergangen (z. B. die
+    // 4 Byte-Zugriffe eines 32-Bit-Registers) -> nichts zu tun.
+    if (now == c.adv_now_us) return;
+    c.adv_now_us = now;
+    // Ereignisfreies Intervall (1 Tick = 1 us, s. u.): bis zum naechsten Match,
+    // Reset oder Ueberlauf aendert sich nur TC - der volle Durchlauf kostete je
+    // Trap ~450 Takte (sblib-Sendehandler: 5 Timer-Traps je Bit).
+    if (now < c.quiet_until_us && c.quiet_hz == g_current_hz) {
+        c.tc += static_cast<uint32_t>(now - c.last_us);
+        c.last_us = now;
+        return;
+    }
     // Underflow-Schutz: last_us>now (Zeit-Diskontinuitaet) -> als Glitch resyncen.
     if (c.last_us > now) { c.last_us = now; ++g_ct_underflow_guards; ct_update_pwm(c); return; }
     uint64_t dt    = now - c.last_us;
     uint64_t hz    = g_current_hz ? static_cast<uint64_t>(g_current_hz) : 1u;
     uint64_t denom = 1'000'000ull * static_cast<uint64_t>(c.pre + 1u);
-    uint64_t ticks = (dt * hz) / denom;
+    // Haeufigster Fall (KNX: 48 MHz, PR=47): 1 Tick = 1 us -> ohne 64-Bit-Division.
+    uint64_t ticks = (hz == denom) ? dt : (dt * hz) / denom;
     // last_us NUR um die konsumierte (ganzzahlige) Tick-Zeit vorstellen, damit
     // die Sub-Tick-Restzeit erhalten bleibt (sonst bei schnellem Pollen mit
     // grossem Prescaler kein Fortschritt). Bei ticks==0 last_us unveraendert.
     if (!ticks) { ct_update_pwm(c); return; }
-    c.last_us += (ticks * denom) / hz;
+    c.last_us += (hz == denom) ? ticks : (ticks * denom) / hz;
     if (ticks > g_ct_max_ticks) g_ct_max_ticks = ticks;   // Diagnose
 
     const uint64_t mask = c.is32 ? 0xFFFF'FFFFull : 0xFFFFull;
@@ -1397,59 +1655,113 @@ void ct_advance(CtModel& c) {
             period = static_cast<uint64_t>(c.mr[m]) + 1u;
     }
 
+    // Rechenweg: 32 Bit, wenn Periode und Tick-Zahl hineinpassen (16-Bit-Timer
+    // immer) - 64-Bit-Division/Modulo laeuft auf dem M33 in Software und war der
+    // groesste Kostenpunkt je Trap. Sonst (32-Bit-Timer ohne Reset) 64 Bit.
+    const bool fast = (period <= 0xFFFF'FFFFull) && (ticks <= 0xFFFF'FFFFull);
+    auto hits = [&](uint32_t m, uint64_t& k0_out, uint64_t& fires_out) -> bool {
+        if (c.mr[m] >= period) return false;          // TC erreicht MRm nie (wie am LPC)
+        if (fast) {
+            const uint32_t p32 = static_cast<uint32_t>(period), t32 = static_cast<uint32_t>(ticks);
+            const uint32_t mr  = c.mr[m];
+            const uint32_t tcm = tc0 % p32;
+            uint32_t k0 = (mr >= tcm) ? (mr - tcm) : (mr + (p32 - tcm));
+            if (k0 == 0) k0 = p32;                     // Treffer erst nach vollem Umlauf
+            if (k0 > t32) return false;
+            k0_out = k0; fires_out = 1u + (t32 - k0) / p32;
+            return true;
+        }
+        const uint64_t mr = c.mr[m];
+        uint64_t k0 = (mr + period - tc0 % period) % period;
+        if (k0 == 0) k0 = period;
+        if (k0 > ticks) return false;
+        k0_out = k0; fires_out = 1u + (ticks - k0) / period;
+        return true;
+    };
+
     // Stop-on-Match (MCR Bit2): der erste erreichte Stop-Match haelt den Zaehler
     // an. Fruehesten Stop-Zeitpunkt suchen und die betrachtete Tick-Zahl kappen.
     bool stopped = false;
-    for (int m = 0; m < 4; ++m) {
+    for (uint32_t m = 0; m < 4; ++m) {
         if (!((c.mcr >> (m * 3)) & 0x4u)) continue;
-        uint32_t mr = static_cast<uint32_t>(c.mr[m] % period);
-        uint64_t k0 = (static_cast<uint64_t>(mr) + period - tc0 % period) % period;
-        if (k0 == 0) k0 = period;                 // Treffer erst nach vollem Umlauf
-        if (k0 <= ticks) { ticks = k0; stopped = true; }
+        uint64_t k0, fires;
+        if (hits(m, k0, fires)) { ticks = k0; stopped = true; }
     }
 
     // Jeden Match-Kanal analytisch abarbeiten: Anzahl Treffer in 'ticks' Schritten.
-    for (int m = 0; m < 4; ++m) {
-        uint32_t mcr = (c.mcr >> (m * 3)) & 0x7u;
-        uint32_t mr  = static_cast<uint32_t>(c.mr[m] % period);
-        uint64_t k0  = (static_cast<uint64_t>(mr) + period - tc0 % period) % period;
-        if (k0 == 0) k0 = period;
-        if (k0 > ticks) continue;                 // in diesem Intervall kein Treffer
-        uint64_t fires = 1u + (ticks - k0) / period;
+    for (uint32_t m = 0; m < 4; ++m) {
+        const uint32_t mcr = (c.mcr >> (m * 3)) & 0x7u;
+        const uint32_t emc = (c.emr >> (4u + 2u * m)) & 0x3u;
+        if (!(mcr & 0x1u) && !emc) continue;      // weder IRQ noch Pin -> nichts zu tun
+        uint64_t k0, fires;
+        if (!hits(m, k0, fires)) continue;        // in diesem Intervall kein Treffer
         if (mcr & 0x1u) {
-            // LEVEL-getriggert (wie echter NVIC): nur eine IRQ-Anforderung
-            // erzeugen, wenn das IR-Match-Flag NEU von 0->1 geht. Ist es bereits
-            // gesetzt, hat der Gast die vorige Anforderung noch nicht per IR-Write
-            // quittiert (ISR laeuft/steht aus) -> die Anforderung bleibt bestehen,
-            // aber wir injizieren KEINEN weiteren Frame. Ohne das pumpte ein Timer
-            // mit kurzer Periode (KNX-Bus-Timer CT16B1) pro Match einen weiteren
-            // Inject und hungerte den Gast-Thread aus (live=1 dauerhaft, PC klebt
-            // in der ISR, serial.begin() kommt nie zurueck).
-            if (!(c.ir & (1u << m))) {
-                c.ir |= (1u << m);
+            // LEVEL-getriggert (wie echter NVIC): eine IRQ-Anforderung nur fuer ein
+            // NEUES Ereignis - Flag geht 0->1 oder die Firmware hat IR seit dem
+            // letzten Ereignis gelesen (sonst IRQ-Sturm bei kurzer Periode, z. B.
+            // KNX-Bus-Timer CT16B1, wenn der Gast IR nie liest). Der zweite Fall
+            // tritt ein, wenn der Handler laenger laeuft als eine Periode und sein
+            // eigenes Flag noch nicht geloescht hat (s. IR-Schreibzugriff).
+            const uint32_t bit = 1u << m;
+            if (!(c.ir & bit) || !(c.ir_unseen & bit)) {
+                c.ir |= bit;
+                c.ir_unseen |= bit;
+                if (c.mr_fresh & bit) c.ir_fresh |= bit;
                 irq_inject::pend(c.irq_num);
                 ++c.dbg_pends;
+                if (mcr & 0x2u) c.lat_armed = true;   // Reset+IRQ: Latenz des naechsten MR0-Writes messen
             }
         }
-        // EMR/PWM-Pin: Endzustand annaehern. Toggle haengt von der Trefferparitaet
-        // ab, Set/Clear ist idempotent -> jeweils passend oft anwenden.
-        uint32_t emc = (c.emr >> (4u + 2u * static_cast<uint32_t>(m))) & 0x3u;
-        if (emc == 3u) { if (fires & 1u) ct_apply_external_match(c, m); }
-        else if (emc)  { ct_apply_external_match(c, m); }
+        // EMR-Pin: Toggle haengt von der Trefferparitaet ab, Set/Clear ist idempotent.
+        if (emc == 3u) { if (fires & 1u) ct_apply_external_match(c, static_cast<int>(m)); }
+        else if (emc)  { ct_apply_external_match(c, static_cast<int>(m)); }
     }
 
     // Endstand des Zaehlers (alle Resets via Modulo beruecksichtigt).
-    c.tc = static_cast<uint32_t>((static_cast<uint64_t>(tc0) + ticks) % period)
+    c.tc = (fast ? (tc0 + static_cast<uint32_t>(ticks)) % static_cast<uint32_t>(period)
+                 : static_cast<uint32_t>((static_cast<uint64_t>(tc0) + ticks) % period))
            & static_cast<uint32_t>(mask);
     if (stopped) c.enabled = false;
+    // Naechstes Ereignis bestimmen (nur 1 Tick = 1 us, der KNX-/sblib-Fall):
+    // Match mit IRQ/Reset/Stop/externem Match, Software-PWM-Flanke oder Umlauf.
+    c.quiet_until_us = 0;
+    if (hz == denom && c.enabled && period <= 0xFFFF'FFFFull) {
+        const uint32_t p32 = static_cast<uint32_t>(period);
+        const uint32_t tcn = c.tc;
+        uint32_t kmin = p32 - tcn;                                   // Reset bzw. Ueberlauf
+        for (uint32_t m = 0; m < 4; ++m) {
+            const bool act = ((c.mcr >> (m * 3)) & 0x7u) || ((c.emr >> (4u + 2u * m)) & 0x3u) ||
+                             ((c.pwmc >> m) & 1u);
+            if (!act || c.mr[m] >= p32) continue;
+            uint32_t k = (c.mr[m] > tcn) ? c.mr[m] - tcn : c.mr[m] + (p32 - tcn);
+            if (k == 0) k = p32;
+            if (k < kmin) kmin = k;
+        }
+        c.quiet_until_us = c.last_us + kmin;
+        c.quiet_hz = g_current_hz;
+    }
     ct_update_pwm(c);
+    // Reine Hardware-PWM (Reset-Kanal OHNE Interrupt): Folgepuls selbst
+    // einplanen. Loest der Reset-Kanal einen Interrupt aus, bestimmt die Firmware
+    // jede Periode selbst (sblib-KNX-Sender schreibt MR0/MR2 im Handler) -> nur
+    // bei ihren Registerzugriffen planen. Sonst wuerde hier der Puls der neuen
+    // Periode schon mit dem ALTEN MR0 ausgegeben, bevor der (im Emulator
+    // spaeter als am LPC zugestellte) Handler ihn aendern kann.
+    if (c.pwmc && config::tmatch_pio()) {
+        bool reset_irq = false, have_reset = false;
+        for (int r = 0; r < 4 && !have_reset; ++r) {
+            const uint32_t mcr_r = (c.mcr >> (r * 3)) & 0x7u;
+            if (mcr_r & 0x2u) { have_reset = true; reset_irq = (mcr_r & 0x1u) != 0; }
+        }
+        if (have_reset && !reset_irq) ct_tx_schedule_all(c);
+    }
 }
 
 // Ermittelt die absolute Zeit (time_us_64-Domain) des naechsten faelligen
 // Match-INTERRUPTS ueber alle aktiven CT-Timer, ~0 wenn keiner ansteht. Nur
 // Matches mit gesetztem MCR-Interrupt-Bit zaehlen (die einen Wakeup aus __WFI()
 // erfordern). Grundlage der adaptiven SysTick-Reload-Berechnung (Sub-ms-Matches).
-uint64_t next_ct_irq_deadline_us(uint64_t now) {
+uint64_t __not_in_flash_func(next_ct_irq_deadline_us)() {
     uint64_t best = ~uint64_t(0);
     uint32_t hz = g_current_hz ? g_current_hz : 12'000'000u;
     for (auto& c : g_ct) {
@@ -1457,18 +1769,33 @@ uint64_t next_ct_irq_deadline_us(uint64_t now) {
         uint64_t mask   = c.is32 ? 0xFFFF'FFFFull : 0xFFFFull;
         uint64_t period = mask + 1u;
         // Ganzzahlig (kein Soft-Float-double im Shim): us = delta*(pre+1)*1e6/hz.
+        // Naechsten Interrupt-Match je Timer in Ticks bestimmen, dann EINMAL
+        // umrechnen; bei ganzzahligen Ticks/us (Normalfall) nur 32-Bit-Division.
+        uint64_t dmin = ~uint64_t(0);
         for (int m = 0; m < 4; ++m) {
             uint32_t mcr_m = (c.mcr >> (m * 3)) & 0x7u;
             if (!(mcr_m & 0x1u)) continue;                 // nur Interrupt-Matches
             uint64_t delta = (static_cast<uint64_t>(c.mr[m]) - c.tc) & mask;
             if (delta == 0u) delta = period;               // gerade getroffen -> ganzer Zyklus
-            const uint64_t ticks = delta * (static_cast<uint64_t>(c.pre) + 1u);
-            const uint64_t d_us  = (ticks < ~uint64_t(0) / 1'000'000u)
-                                       ? (ticks * 1'000'000u + hz / 2u) / hz
-                                       : (ticks / hz) * 1'000'000u;   // Ueberlaufschutz
-            uint64_t deadline = now + d_us;
-            if (deadline < best) best = deadline;
+            if (delta < dmin) dmin = delta;
         }
+        if (dmin == ~uint64_t(0)) continue;
+        const uint32_t pre1    = c.pre + 1u;
+        const uint32_t tick_hz = pre1 ? hz / pre1 : 0u;
+        uint64_t d_us;
+        if (tick_hz && hz % pre1 == 0u && tick_hz % 1'000'000u == 0u && dmin <= 0xFFFF'FFFFull) {
+            const uint32_t k = tick_hz / 1'000'000u;       // Ticks je us
+            d_us = (static_cast<uint32_t>(dmin) + k / 2u) / k;
+        } else {
+            const uint64_t ticks = dmin * pre1;
+            d_us = (ticks < ~uint64_t(0) / 1'000'000u)
+                       ? (ticks * 1'000'000u + hz / 2u) / hz
+                       : (ticks / hz) * 1'000'000u;       // Ueberlaufschutz
+        }
+        // Bezug ist der Modellstand (c.tc gilt ab c.last_us), nicht 'now' -
+        // sonst feuerte der Host-SysTick um (now - last_us) zu spaet.
+        const uint64_t deadline = c.last_us + d_us;
+        if (deadline < best) best = deadline;
     }
     return best;
 }
@@ -1478,7 +1805,7 @@ uint64_t next_ct_irq_deadline_us(uint64_t now) {
 // setzt IR-Bit 4 und pendet den Timer-IRQ (falls CAP0I gesetzt). Wird mit der
 // gleichen Kadenz wie sample_pin_interrupts() aufgerufen (jeder MMIO-Trap und
 // die WFI-Warteschleife). Zeitliche Auflösung der Flanken = Sampling-Kadenz.
-void ct_sample_capture_sw(CtModel& c) {
+void __not_in_flash_func(ct_sample_capture_sw)(CtModel& c) {
     bool rise_arm = (c.ccr & 0x1u) != 0;
     bool fall_arm = (c.ccr & 0x2u) != 0;
     bool level = gpio_get(static_cast<uint>(c.cap_pin));
@@ -1500,99 +1827,150 @@ void ct_sample_capture_sw(CtModel& c) {
 // Die Zählerdifferenz wird in TC-Ticks umgerechnet und auf CR0 akkumuliert,
 // sodass die vom Gast ausgewerteten CR0-Differenzen exakt stimmen — unabhängig
 // davon, wann die CPU die FIFO ausliest (kein Jitter, keine verlorenen Flanken).
-void ct_sample_capture_pio(CtModel& c) {
-    bool rise_arm = (c.ccr & 0x1u) != 0;
-    bool fall_arm = (c.ccr & 0x2u) != 0;
-    uint32_t raw;
-    while (pio_glue::ts_read(c.pio_handle, raw)) {
-        bool rising = c.pio_dir_rising;
-        c.pio_dir_rising = !c.pio_dir_rising;     // Flanken alternieren strikt
+// Eigenes Echo: Flanken innerhalb eines selbst per Match-PIO erzeugten Pulses
+// (Bus-Echo des Senders). Mit Latenzausgleich (tmatch_delay > 0) liegen sie um
+// diese Zeit spaeter am Pin als im Timer-Modell geplant -> fuer CR0 auf den
+// Modellzeitpunkt zurueckrechnen, damit die Firmware ihr Echo exakt an MRm sieht
+// (sblib vergleicht CR0 mit MR0). Fremde Flanken bleiben unveraendert.
+bool __not_in_flash_func(ct_is_own_echo)(const CtModel& c, uint64_t t_us) {
+    const uint64_t t_ns = t_us * 1000u;
+    auto in = [&](const TxPulse& p) { return p.end && t_ns + 2000u >= p.start && t_ns <= p.end + 3000u; };
+    for (int m = 0; m < 4; ++m) {
+        if (c.tx_handle[m] < 0) continue;
+        if (in(c.echo_last[m])) return true;
+        for (int i = 0; i < c.txn[m]; ++i)
+            if (in(c.txq[m][i])) return true;
+    }
+    return false;
+}
 
-        if (!c.pio_have_prev) {
-            c.pio_prev = raw;
-            c.pio_have_prev = true;
-            ct_advance(c);                        // CR0-Anker = aktueller TC
-            c.cr0 = c.tc;
-        } else {
-            // Abwärtszähler: verstrichene Counts = prev - raw (mod 2^32).
-            uint32_t delta = c.pio_prev - raw;
-            c.pio_prev = raw;
-            double f_tc = static_cast<double>(g_current_hz)
-                          / static_cast<double>(c.pre + 1u);
-            double tc_delta = (c.pio_rate > 0.0f)
-                ? static_cast<double>(delta) * f_tc / static_cast<double>(c.pio_rate)
-                : 0.0;
-            uint32_t mask = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
-            c.cr0 = static_cast<uint32_t>(
-                        (static_cast<uint64_t>(c.cr0) +
-                         static_cast<uint64_t>(tc_delta)) & mask);
-        }
-
-        if ((rising && rise_arm) || (!rising && fall_arm)) {
+void __not_in_flash_func(ct_sample_capture_pio)(CtModel& c) {
+    // Jede Flanke kommt mit absolutem Zeitstempel und Pegel aus der PIO. CR0 ist
+    // der TC-Wert ZUM FLANKENZEITPUNKT (nicht zum Verarbeitungszeitpunkt), damit
+    // die sblib ihr eigenes Echo korrekt gegen MR0 pruefen kann. Frueher wurde
+    // CR0 nur aus Flankenabstaenden aufaddiert (Timer-Resets ignoriert, Anker =
+    // Verarbeitungszeit) -> jede Sendung endete als "Kollision".
+    const bool rise_arm = (c.ccr & 0x1u) != 0;
+    const bool fall_arm = (c.ccr & 0x2u) != 0;
+    uint64_t t_edge; bool level;
+    bool advanced = false;
+    while (pio_glue::ts_read_edge(c.pio_handle, t_edge, level)) {
+        if (!advanced) { ct_advance(c); advanced = true; }
+        if ((level && rise_arm) || (!level && fall_arm)) {
+            const uint32_t dly = config::tmatch_delay_us();
+            const bool own = dly && ct_is_own_echo(c, t_edge);
+            c.cr0 = ct_tc_at(c, own ? t_edge - dly : t_edge);
             c.ir |= (1u << 4);
-            if (c.ccr & 0x4u) irq_inject::pend(c.irq_num);  // CAP0I
+            // Latenzausgleich: das eigene Echo loest keinen eigenen Interrupt
+            // aus - das Flag liest der ohnehin folgende Perioden-Interrupt mit.
+            // Am LPC ist der Echo-Handler in ~1 us durch; im Emulator kostet
+            // jeder Handlerlauf ~50 us und verschob den MR0-Schreibzugriff der
+            // naechsten Periode ueber die Pulsflanke hinaus.
+            if ((c.ccr & 0x4u) && !own) irq_inject::pend(c.irq_num);  // CAP0I
         }
     }
 }
-
-void ct_sample_capture(CtModel& c) {
+void __not_in_flash_func(ct_sample_capture)(CtModel& c) {
     if (c.cap_pin < 0) return;
     if (c.pio_handle >= 0) ct_sample_capture_pio(c);
     else                   ct_sample_capture_sw(c);
 }
 
-uint8_t ct_read_byte(uint32_t idx, uint32_t off) {
+uint32_t __not_in_flash_func(ct_read_reg)(uint32_t idx, uint32_t reg) {
     CtModel& c = g_ct[idx];
-    ct_advance(c);
-    ct_sample_capture(c);
-    auto byte_of = [&](uint32_t v) {
-        return static_cast<uint8_t>((v >> ((off & 3u) * 8)) & 0xFFu);
-    };
-    switch (off & ~3u) {
-        case 0x00: return byte_of(c.ir);
-        case 0x04: return byte_of(c.enabled ? 1u : 0u);
-        case 0x08: return byte_of(c.tc);
-        case 0x0C: return byte_of(c.pre);
-        case 0x10: return byte_of(c.pc);
-        case 0x14: return byte_of(c.mcr);
-        case 0x18: return byte_of(c.mr[0]);
-        case 0x1C: return byte_of(c.mr[1]);
-        case 0x20: return byte_of(c.mr[2]);
-        case 0x24: return byte_of(c.mr[3]);
-        case 0x28: return byte_of(c.ccr);
-        case 0x2C: return byte_of(c.cr0);
-        case 0x3C: return byte_of(c.emr);
-        case 0x74: return byte_of(c.pwmc);
+    // Einmal pro Trap fortschreiben (Byte-/Halbwortzugriffe eines Traps teilen
+    // sich den Stand). Capture wurde in begin_access() fuer diesen Trap schon abgetastet.
+    if (c.adv_epoch != g_trap_epoch) { ct_advance(c); c.adv_epoch = g_trap_epoch; }
+    switch (reg) {
+        case 0x00: c.ir_unseen = 0; c.mr_fresh = 0; c.ir_fresh = 0; return c.ir;
+        case 0x04: return c.enabled ? 1u : 0u;
+        case 0x08: return c.tc;
+        case 0x0C: return c.pre;
+        case 0x10: return c.pc;
+        case 0x14: return c.mcr;
+        case 0x18: return c.mr[0];
+        case 0x1C: return c.mr[1];
+        case 0x20: return c.mr[2];
+        case 0x24: return c.mr[3];
+        case 0x28: return c.ccr;
+        case 0x2C: return c.cr0;
+        case 0x3C: return c.emr;
+        case 0x74: return c.pwmc;
         default:   return 0;
     }
 }
 
-void ct_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
+uint8_t __not_in_flash_func(ct_read_byte)(uint32_t idx, uint32_t off) {
+    return static_cast<uint8_t>(ct_read_reg(idx, off & ~3u) >> ((off & 3u) * 8u));
+}
+
+void __not_in_flash_func(ct_note_latency)(CtModel& c) {
+    if (!c.lat_armed) return;
+    c.lat_armed = false;
+    c.lat_last = c.tc;                        // Ticks seit dem Periodenreset
+    c.lat_sum += c.tc; ++c.lat_n;
+    if (c.tc > c.lat_max) c.lat_max = c.tc;
+}
+
+// Von ct_write_byte markiert, in on_post_write_hook() einmal je Trap abgearbeitet.
+uint32_t g_ct_dirty = 0;   // Bit idx: timing-relevantes Register geschrieben -> PWM, Puls nachziehen
+bool     g_ct_dl_dirty = false;   // Interrupt-Termin kann sich geaendert haben -> Host-SysTick
+
+// Registerschreibzugriff; mask waehlt die geschriebenen Bytes (Wort: alle,
+// STRB/STRH: nur deren Lanes). Ein Wortzugriff laeuft so EINMAL durch das
+// Modell statt viermal byteweise (Trap-Kosten, sblib-Sendetakt).
+void __not_in_flash_func(ct_write_reg)(uint32_t idx, uint32_t reg, uint32_t val, uint32_t mask) {
     CtModel& c = g_ct[idx];
-    ct_advance(c);
-    auto patch = [&](uint32_t& v) {
-        uint32_t lane = (off & 3u) * 8;
-        v = (v & ~(0xFFu << lane)) | (static_cast<uint32_t>(val) << lane);
-    };
+    if (c.adv_epoch != g_trap_epoch) { ct_advance(c); c.adv_epoch = g_trap_epoch; }
+    auto patch = [&](uint32_t& v) { v = (v & ~mask) | (val & mask); };
+    const uint32_t off = reg;
+    c.quiet_until_us = 0;          // Registeraenderung: naechstes Ereignis neu bestimmen
     switch (off & ~3u) {
-        case 0x00: { uint32_t m = 0; patch(m); c.ir &= ~m; break; }
+        case 0x00: {                                                 // Write-1-to-clear
+            uint32_t m = 0; patch(m);
+            // Latenzausgleich: Loescht der eigene Handler ein Match-Flag, das erst
+            // NACH seinem letzten IR-Lesen gesetzt wurde, hat er dieses Ereignis
+            // nie gesehen - es fiel nur wegen der im Emulator laengeren Handler-
+            // laufzeit (Traps) noch in den Handler. Am LPC waere der Handler
+            // laengst fertig und der Match loeste einen neuen Interrupt aus.
+            // Flag stehen lassen; der noch pendende IRQ wird nach dem Ruecksprung
+            // zugestellt (sblib: resetFlags() am Handlerende verlor sonst den
+            // naechsten Periodenreset -> ein Bit fehlte im Telegramm).
+            // Nur Treffer mit dem im Handler NEU gesetzten MRm zaehlen: ein Treffer
+            // des alten Werts (Handler schrieb MRm zu spaet) ist ein Artefakt und
+            // wird wie am LPC geloescht.
+            if (irq_inject::active_irq() == static_cast<int>(c.irq_num))
+                m &= ~(c.ir_unseen & c.ir_fresh & 0xFu);
+            c.ir &= ~m;
+            // Pegel-Interrupt: steht kein freigegebenes Flag mehr an, auch die noch
+            // pendende Anforderung zuruecknehmen (sonst liefe der Handler ohne
+            // Ereignis erneut und werte z. B. ein altes CR0 aus).
+            {
+                uint32_t act = 0;
+                for (uint32_t k = 0; k < 4; ++k)
+                    if ((c.ir & (1u << k)) && ((c.mcr >> (k * 3u)) & 1u)) act = 1;
+                if ((c.ir & (1u << 4)) && (c.ccr & 0x4u)) act = 1;
+                if (!act) vnvic::clear_pending(static_cast<uint8_t>(c.irq_num));
+            }
+            break;
+        }
         case 0x04: {
             uint32_t v = c.enabled ? 1u : 0u;
             patch(v);
             bool was = c.enabled;
             c.enabled = (v & 0x1u) != 0;
             if (v & 0x2u) { c.tc = 0; c.pc = 0; }
-            if (!was && c.enabled) c.last_us = time_us_64();
+            if (!was && c.enabled) c.last_us = fast_time_us();
             break;
         }
         case 0x08: patch(c.tc);    break;
         case 0x0C: patch(c.pre);   break;
         case 0x10: patch(c.pc);    break;
         case 0x14: patch(c.mcr);   break;
-        case 0x18: patch(c.mr[0]); if ((off & 3u) == 3u) ct_emit_tx_pulse(c, 0); break;
-        case 0x1C: patch(c.mr[1]); if ((off & 3u) == 3u) ct_emit_tx_pulse(c, 1); break;
-        case 0x20: patch(c.mr[2]); if ((off & 3u) == 3u) ct_emit_tx_pulse(c, 2); break;
-        case 0x24: patch(c.mr[3]); if ((off & 3u) == 3u) ct_emit_tx_pulse(c, 3); break;
+        case 0x18: patch(c.mr[0]); c.mr_fresh |= 1u; if (mask & 0xFF00'0000u) ct_note_latency(c); break;
+        case 0x1C: patch(c.mr[1]); c.mr_fresh |= 2u; break;
+        case 0x20: patch(c.mr[2]); c.mr_fresh |= 4u; break;
+        case 0x24: patch(c.mr[3]); c.mr_fresh |= 8u; break;
         case 0x28: patch(c.ccr);   break;
         case 0x2C: /* CR0 read-only */ break;
         case 0x3C: {
@@ -1613,25 +1991,31 @@ void ct_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
             // Kanal aus dem PWM-Modus genommen -> evtl. belegte Match-PIO
             // freigeben und Pin an Software-PWM/GPIO zurueckgeben.
             for (int m = 0; m < 4; ++m) {
-                if (!(c.pwmc & (1u << static_cast<uint32_t>(m))) && c.tx_handle[m] >= 0) {
-                    pio_glue::tx_teardown(c.tx_handle[m]);
-                    c.tx_handle[m] = -1;
-                    if (c.mat_pin[m] >= 0) {
-                        gpio_init(static_cast<uint>(c.mat_pin[m]));
-                        gpio_set_dir(static_cast<uint>(c.mat_pin[m]), true);
-                    }
-                }
+                if (!(c.pwmc & (1u << static_cast<uint32_t>(m))) && c.tx_handle[m] >= 0)
+                    ct_tx_park(c, m);
             }
             break;
         }
         default: break;
     }
-    ct_update_pwm(c);   // MRm-/PWMC-Schreibzugriff kann den PWM-Pegel ändern
-    // Timer-Konfiguration geaendert (Enable/MCR/MR ...) -> Host-SysTick-"Alarm"
-    // neu berechnen, damit ein (ggf. Sub-ms-)Match-Interrupt rechtzeitig einen
-    // Wakeup bekommt, auch wenn der Gast danach in __WFI() idlet (und selbst
-    // wenn der Gast den SysTick gar nicht nutzt).
-    systick_program_hw();
+    // Folgearbeit (PWM-Pegel, Pulsplanung, Host-SysTick) erst nach dem ganzen
+    // Zugriff in on_post_write_hook() (STRB/STRH kommen byteweise an, und
+    // systick_program_hw() allein kostet mehrere hundert Takte).
+    // Nur timing-relevante Register (TCR/TC/PR/MCR/MR0-3/PWMC); IR-, EMR- und
+    // CCR-Schreibzugriffe aendern weder PWM-Pegel noch Deadlines.
+    if (reg == 0x04 || reg == 0x08 || reg == 0x0C || reg == 0x14 ||
+        (reg >= 0x18 && reg <= 0x24) || reg == 0x74)
+        g_ct_dirty |= 1u << idx;
+    // Host-SysTick nur neu setzen, wenn sich ein Interrupt-Termin aendern kann:
+    // TCR/TC/PR/MCR oder ein MRm mit Match-Interrupt (sblib-PWM-MR0 hat keinen).
+    if (reg == 0x04 || reg == 0x08 || reg == 0x0C || reg == 0x14 ||
+        (reg >= 0x18 && reg <= 0x24 && ((c.mcr >> (((reg - 0x18u) >> 2) * 3u)) & 0x1u)))
+        g_ct_dl_dirty = true;
+}
+
+void __not_in_flash_func(ct_write_byte)(uint32_t idx, uint32_t off, uint8_t val) {
+    const uint32_t lane = (off & 3u) * 8u;
+    ct_write_reg(idx, off & ~3u, static_cast<uint32_t>(val) << lane, 0xFFu << lane);
 }
 
 // =========================================================================
@@ -1648,9 +2032,9 @@ struct WdtModel {
 };
 WdtModel g_wdt{};
 
-void wdt_advance() {
-    if ((g_wdt.mod & 0x1u) == 0) { g_wdt.last_us = time_us_64(); return; }
-    uint64_t now = time_us_64();
+void __not_in_flash_func(wdt_advance)() {
+    if ((g_wdt.mod & 0x1u) == 0) { g_wdt.last_us = fast_time_us(); return; }
+    uint64_t now = fast_time_us();
     uint64_t dt  = now - g_wdt.last_us;
     uint32_t hz = g_wdt.wdt_clk_hz ? g_wdt.wdt_clk_hz : 500'000u;
     uint64_t ticks = (dt * static_cast<uint64_t>(hz)) / 1'000'000ull;
@@ -1673,7 +2057,7 @@ void wdt_advance() {
     }
 }
 
-uint8_t wdt_read_byte(uint32_t addr) {
+uint8_t __not_in_flash_func(wdt_read_byte)(uint32_t addr) {
     wdt_advance();
     uint32_t lane = (addr & 3u) * 8u;
     switch (addr & ~3u) {
@@ -1684,7 +2068,7 @@ uint8_t wdt_read_byte(uint32_t addr) {
     }
 }
 
-void wdt_write_byte(uint32_t addr, uint8_t val) {
+void __not_in_flash_func(wdt_write_byte)(uint32_t addr, uint8_t val) {
     wdt_advance();
     uint32_t lane  = (addr & 3u) * 8u;
     uint32_t base  = addr & ~3u;
@@ -1704,7 +2088,7 @@ void wdt_write_byte(uint32_t addr, uint8_t val) {
             if ((val & 0x8u) && (lane == 0)) g_wdt.mod &= ~0x8u;
             if ((g_wdt.mod & 0x1u) && !(old & 0x1u)) {
                 g_wdt.tv = g_wdt.tc ? g_wdt.tc : 0xFFu;
-                g_wdt.last_us = time_us_64();
+                g_wdt.last_us = fast_time_us();
             }
             break;
         }
@@ -1716,7 +2100,7 @@ void wdt_write_byte(uint32_t addr, uint8_t val) {
             else if (g_wdt.feed_state == 1 && val == 0x55u) {
                 g_wdt.tv = g_wdt.tc ? g_wdt.tc : 0xFFu;
                 g_wdt.feed_state = 0;
-                g_wdt.last_us = time_us_64();
+                g_wdt.last_us = fast_time_us();
             } else g_wdt.feed_state = 0;
             break;
         }
@@ -1784,6 +2168,10 @@ void ct_bridge_init() {
                 pio_glue::tx_teardown(g_ct[t].tx_handle[m]);
                 g_ct[t].tx_handle[m] = -1;
             }
+            if (g_ct[t].tx_spare[m] >= 0) {
+                pio_glue::tx_teardown(g_ct[t].tx_spare[m]);
+                g_ct[t].tx_spare[m] = -1;
+            }
         }
         g_ct[t].pio_have_prev  = false;
         g_ct[t].pio_dir_rising = false;
@@ -1814,6 +2202,17 @@ void ct_bridge_init() {
                 gpio_init(static_cast<uint>(mp));
                 gpio_set_dir(static_cast<uint>(mp), true);  // Ausgang
                 gpio_put(static_cast<uint>(mp), false);
+                // Match-PIO schon hier (Core0) anlegen und parken: die Anlage im
+                // Trap kostete ~110 us und verdarb das erste Telegramm nach dem Boot.
+                if (config::tmatch_pio()) {
+                    float rate = 0.0f;
+                    const int h = pio_glue::tx_setup(static_cast<uint8_t>(mp), rate);
+                    if (h >= 0 && rate > 0.0f) {
+                        g_ct[t].tx_rate = rate;
+                        pio_glue::tx_park(h);
+                        g_ct[t].tx_spare[m] = h;
+                    }
+                }
             }
         }
     }
@@ -1950,14 +2349,14 @@ bool ssp_is_bridged(uint32_t idx) {
     return g_spi_ready && static_cast<int>(idx) == g_spi_lpc;
 }
 
-uint32_t ssp_idx_for(uint32_t addr) {
+uint32_t __not_in_flash_func(ssp_idx_for)(uint32_t addr) {
     if (addr >= SSP0_BASE && addr < SSP0_BASE + SSP_BLOCK) return 0;
     if (addr >= SSP1_BASE && addr < SSP1_BASE + SSP_BLOCK) return 1;
     return 0xFFFFFFFFu;
 }
 uint32_t ssp_base_for(uint32_t i) { return i ? SSP1_BASE : SSP0_BASE; }
 
-void ssp_rx_push(SspModel& s, uint16_t v) {
+void __not_in_flash_func(ssp_rx_push)(SspModel& s, uint16_t v) {
     if (s.rx_count >= 8u) { s.ris |= 0x1u; return; }      // RORRIS: Ueberlauf
     s.rxq[(s.rx_head + s.rx_count) & 7u] = v;
     ++s.rx_count;
@@ -1968,7 +2367,7 @@ void ssp_rx_push(SspModel& s, uint16_t v) {
 // Virtueller NCN5130 als SPI-Master: anstehende Bytes (Antworten, Indications,
 // Empfangsframes) taktet er von sich aus zum Host - ohne dass der Gast etwas
 // schreiben muss. Bei Platz im RX-FIFO werden sie dort abgelegt.
-void ssp_ncn_pump(uint32_t idx) {
+void __not_in_flash_func(ssp_ncn_pump)(uint32_t idx) {
     if (!ncn5130::enabled(static_cast<int>(idx))) return;
     // Zeitgesteuerten Fortschritt (Sende-Abschluss, PHY) auch hier treiben:
     // ein Gast, der per Polling auf L_Data.con wartet, laeuft sonst nur weiter,
@@ -1979,7 +2378,7 @@ void ssp_ncn_pump(uint32_t idx) {
     while (s.rx_count < 8u && ncn5130::pull_byte(b)) ssp_rx_push(s, b);
 }
 
-uint8_t ssp_read_byte(uint32_t idx, uint32_t off) {
+uint8_t __not_in_flash_func(ssp_read_byte)(uint32_t idx, uint32_t off) {
     SspModel& s = g_ssp[idx];
     uint32_t lane = (off & 3u) * 8u;
     switch (off & ~3u) {
@@ -2013,7 +2412,7 @@ uint8_t ssp_read_byte(uint32_t idx, uint32_t off) {
     }
 }
 
-void ssp_write_byte(uint32_t idx, uint32_t off, uint8_t val) {
+void __not_in_flash_func(ssp_write_byte)(uint32_t idx, uint32_t off, uint8_t val) {
     SspModel& s = g_ssp[idx];
     uint32_t lane = (off & 3u) * 8u;
     auto patch = [&](uint32_t& v) {
@@ -2287,6 +2686,7 @@ ShadowEntry g_mmio_shadow[SHADOW_SLOTS]{};
 namespace peripherals {
 
 void init() {
+    live_map_poll(true);   // vor reset(): die Pin-Tabelle wird dort schon gebraucht
     reset();
     uart_hw_boot_init();   // uart0/uart1 EINMALIG (Core0) aus dem Reset holen
     i2c_bridge_init();
@@ -2295,17 +2695,19 @@ void init() {
     ct_bridge_init();
     ncn5130::init();
     ncn_bridge_init();
+    live_map_poll(true);   // Bridges belegen ggf. Pads
 }
 
-void i2c_bridge_reinit() { i2c_bridge_init(); }
-void spi_bridge_reinit() { spi_bridge_init(); }
-void adc_bridge_reinit() { adc_bridge_init(); }
-void ct_bridge_reinit()  { ct_bridge_init(); }
+void i2c_bridge_reinit() { i2c_bridge_init(); live_map_poll(true); }
+void spi_bridge_reinit() { spi_bridge_init(); live_map_poll(true); }
+void adc_bridge_reinit() { adc_bridge_init(); live_map_poll(true); }
+void ct_bridge_reinit()  { ct_bridge_init(); live_map_poll(true); }
 void ncn_bridge_reinit() { ncn_bridge_init(); }
 
 void reset() {
     std::memset(g_gpio, 0, sizeof g_gpio);
     g_gpio_irq_primed = false;
+    g_pin_irq_dirty = true;
     // IOCON-Resetwerte (UM10398 Kap. 7.4): Pin-Register 0xD0 (FUNC=0, Pull-up),
     // I2C-Pins PIO0_4/PIO0_5 (0x030/0x034) 0x00, Pin-Lokalisierung ab 0x0B0 = 0.
     std::memset(g_iocon, 0, sizeof g_iocon);
@@ -2313,7 +2715,7 @@ void reset() {
         if (off != 0x030u && off != 0x034u) g_iocon[off] = 0xD0u;
     g_systick_load = g_systick_val = g_systick_ctrl = 0;
     g_systick = {};
-    g_systick.last_us = time_us_64();
+    g_systick.last_us = fast_time_us();
     g_systick_collector = {0, {0,0,0,0}, 0};
     systick_program_hw();   // realen Core1-SysTick (Host-Zeitbasis) neu setzen (falls Core1)
     g_syspllctrl   = 0;
@@ -2345,6 +2747,7 @@ void reset() {
         c.pio_have_prev = false;
         c.pio_dir_rising = false;   // Idle high → erste Flanke fallend
         for (auto& h : c.tx_handle) h = -1;
+        for (auto& h : c.tx_spare) h = -1;
     }
 
     g_wdt = {};
@@ -2387,6 +2790,8 @@ void guest_reset() {
         for (int m = 0; m < 4; ++m) {
             c.mat_pin[m]   = keep[t].mat_pin[m];
             c.tx_handle[m] = keep[t].tx_handle[m];
+            c.tx_spare[m]  = keep[t].tx_spare[m];
+            if (c.tx_handle[m] >= 0) pio_glue::tx_cancel(c.tx_handle[m]);   // alten Pulsplan verwerfen
             if (c.mat_pin[m] >= 0 && c.tx_handle[m] < 0)
                 gpio_put(static_cast<uint>(c.mat_pin[m]), false);
         }
@@ -2400,9 +2805,23 @@ extern "C" void peripherals_wdt_reset_guest() {
     emulator::request_guest_reset();
 }
 
-void on_post_write_hook() {
+void __not_in_flash_func(on_post_write_hook)() {
     if (g_in_post_hook) return;
     g_in_post_hook = true;
+    if (g_ct_dirty) {
+        const uint32_t dirty = g_ct_dirty;
+        g_ct_dirty = 0;
+        for (uint32_t i = 0; i < 4; ++i) {
+            if (!(dirty & (1u << i))) continue;
+            ct_update_pwm(g_ct[i]);   // MRm-/PWMC-Schreibzugriff kann den PWM-Pegel aendern
+            ct_tx_schedule_all(g_ct[i]);
+        }
+        // Timer-Konfiguration geaendert (Enable/MCR/MR ...) -> Host-SysTick-
+        // "Alarm" neu berechnen, damit ein (ggf. Sub-ms-)Match-Interrupt
+        // rechtzeitig einen Wakeup bekommt, auch wenn der Gast danach in
+        // __WFI() idlet (und selbst wenn der Gast den SysTick nicht nutzt).
+        if (g_ct_dl_dirty) { g_ct_dl_dirty = false; systick_program_hw(); }
+    }
     if (g_pll_reconfig_pending) {
         g_pll_reconfig_pending = false;
         uint32_t target = recompute_target_hz();
@@ -2421,14 +2840,14 @@ uint32_t current_cpu_hz() { return g_current_hz; }
 // Direkt-gemappte Tabelle (Kollision = Overwrite), ausreichend für die
 // üblichen Konfig-Register-Rücklesemuster. (Datendefinition siehe oben.)
 // =========================================================================
-inline uint32_t shadow_slot(uint32_t addr) {
+inline uint32_t __not_in_flash_func(shadow_slot)(uint32_t addr) {
     return (addr * 2654435761u) >> 22;   // 32→10 Bit
 }
-void shadow_store(uint32_t addr, uint8_t val) {
+void __not_in_flash_func(shadow_store)(uint32_t addr, uint8_t val) {
     ShadowEntry& e = g_mmio_shadow[shadow_slot(addr)];
     e.addr = addr; e.val = val; e.used = true;
 }
-bool shadow_load(uint32_t addr, uint8_t& out) {
+bool __not_in_flash_func(shadow_load)(uint32_t addr, uint8_t& out) {
     const ShadowEntry& e = g_mmio_shadow[shadow_slot(addr)];
     if (e.used && e.addr == addr) { out = e.val; return true; }
     return false;
@@ -2438,34 +2857,108 @@ bool shadow_load(uint32_t addr, uint8_t& out) {
 // GPIO-Eingänge: echte RP2350-Pins lesen (für Input-konfigurierte LPC-Pins).
 // Output-Pins kommen weiter aus dem Schatten g_gpio[].data.
 // =========================================================================
-uint32_t gpio_live_port_data(uint32_t port) {
-    if (port >= 4) return 0;
-    uint32_t dir  = g_gpio[port].dir;
-    uint32_t data = g_gpio[port].data;
+// Cache: welche LPC-Eingaenge auf welchem RP-GPIO liegen (Pinmap abzueglich der
+// von Bridges belegten Pads). Die Pruefung pro Pin (bridge_owns_gpio mit vielen
+// Config-Abfragen) war pro Trap x 4 Byte x 48 Pins der groesste Einzelposten der
+// Trap-Dauer. Neuaufbau alle 50 ms auf Core0 (live_map_poll) in den freien
+// von zwei Puffern, danach Umschalten - Pinmap-/Config-Aenderungen wirken damit
+// spaetestens nach 50 ms. Frueher baute Core1 die Tabelle selbst im Trap
+// (Config-Abfragen aus dem Flash): alle 50 ms ein Trap von 20-60 us, der die
+// Zustellung des KNX-Bit-Timer-Interrupts verzoegerte.
+struct LiveMap {
+    uint8_t n[4];                  // Anzahl gemappter Eingaenge je Port
+    uint8_t pin[4][12];            // LPC-Pinnummer
+    uint8_t gpio[4][12];           // RP-GPIO
+    int8_t  any[48];               // RP-GPIO je LPC-Pin (auch Ausgaenge), -1 = keiner/Bridge
+};
+LiveMap g_live_buf[2]{};
+volatile uint32_t g_live_idx = 0;     // aktiver Puffer (Core1 liest nur diesen)
+uint32_t g_live_built_us = 0;
+
+void live_map_build(LiveMap& lm) {
     const auto& pm = config::pin_map();
-    for (uint8_t pin = 0; pin < 12; ++pin) {
-        if ((dir >> pin) & 1u) continue;            // Output → Schatten
-        uint8_t lpc = lpc_pin_idx(static_cast<uint8_t>(port), pin);
-        if (lpc >= config::LPC_PIN_COUNT) continue;
-        int g = pm.lpc_to_rp[lpc];
-        if (g < 0) continue;
-        if (bridge_owns_gpio(g)) continue;          // ADC/SPI/Capture/Match-Pin
-        bool lvl = gpio_get(static_cast<uint>(g));
-        data = (data & ~(1u << pin)) | (static_cast<uint32_t>(lvl) << pin);
+    for (uint32_t port = 0; port < 4; ++port) {
+        uint8_t k = 0;
+        for (uint8_t pin = 0; pin < 12; ++pin) {
+            const uint8_t lpc = lpc_pin_idx(static_cast<uint8_t>(port), pin);
+            int g = (lpc < config::LPC_PIN_COUNT) ? pm.lpc_to_rp[lpc] : -1;
+            if (g >= 0 && bridge_owns_gpio(g)) g = -1;
+            lm.any[port * 12u + pin] = static_cast<int8_t>(g);
+            if (g < 0) continue;
+            lm.pin[port][k] = pin; lm.gpio[port][k] = static_cast<uint8_t>(g); ++k;
+        }
+        lm.n[port] = k;
     }
-    return data;
+}
+
+inline const LiveMap& live_map() { return g_live_buf[g_live_idx & 1u]; }
+
+// Alle vier Ports mit einem Pad-Zugriff: Eingaenge live, Ausgaenge aus dem Schatten.
+void __not_in_flash_func(gpio_live_all)(uint32_t live[4]) {
+    const LiveMap& g_live = live_map();
+    const uint64_t in = gpio_get_all64();
+    for (uint32_t port = 0; port < 4; ++port) {
+        uint32_t data = g_gpio[port].data;
+        const uint32_t dir = g_gpio[port].dir;
+        for (uint8_t k = 0; k < g_live.n[port]; ++k) {
+            const uint8_t pin = g_live.pin[port][k];
+            if ((dir >> pin) & 1u) continue;               // Output -> Schatten
+            const uint32_t lvl = static_cast<uint32_t>((in >> g_live.gpio[port][k]) & 1u);
+            data = (data & ~(1u << pin)) | (lvl << pin);
+        }
+        live[port] = data;
+    }
+}
+
+int __not_in_flash_func(lpc_out_gpio)(uint8_t lpc) {
+    return (lpc < 48) ? live_map().any[lpc] : -1;
+}
+
+// Core0 (Hauptloop): Pin-Tabelle alle 50 ms neu aufbauen (bzw. sofort mit
+// force) und atomar umschalten.
+void live_map_poll(bool force) {
+    const uint32_t now = time_us_32();
+    if (!force && now - g_live_built_us < 50'000u) return;
+    g_live_built_us = now;
+    const uint32_t next = (g_live_idx + 1u) & 1u;
+    live_map_build(g_live_buf[next]);
+    __sync_synchronize();   // Tabelle vollstaendig, bevor Core1 sie sieht
+    g_live_idx = next;
+}
+
+uint32_t __not_in_flash_func(gpio_live_port_data)(uint32_t port) {
+    if (port >= 4) return 0;
+    uint32_t live[4];
+    gpio_live_all(live);
+    return live[port];
 }
 
 // Wird bei jedem MMIO-Trap aufgerufen: liest echte Eingänge, erkennt Flanken
 // und pendet GPIO- und Start-Logik-IRQs. Da der Gast nativ ohne Host-Loop läuft, ist der
 // MMIO-Trap der einzige synchrone Injektionspunkt — eine reine WFI-Warteschleife
 // ganz ohne MMIO-Zugriff lässt sich so nicht wecken (Architektur-Grenze).
-void sample_pin_interrupts() {
-    uint32_t live[4];
-    for (uint32_t p = 0; p < 4; ++p) live[p] = gpio_live_port_data(p);
-
+void __not_in_flash_func(sample_pin_interrupts)() {
     // --- Timer-Capture (KNX-Bus-Empfang): Flanken am CAP0-Pin timestampen. ---
     for (auto& c : g_ct) ct_sample_capture(c);
+
+    // Ohne freigegebenen GPIO- oder Start-Logik-Interrupt gibt es nichts
+    // auszuwerten (spart das Einlesen aller Pins je Trap). Die Flanken-Basis
+    // wird beim spaeteren Freigeben neu aufgenommen (primed=false), damit keine
+    // veralteten Pegel als Flanke erscheinen.
+    if (!(g_gpio[0].ie | g_gpio[1].ie | g_gpio[2].ie | g_gpio[3].ie) && !g_start_erp) {
+        g_gpio_irq_primed = false;
+        g_start_primed    = false;
+        return;
+    }
+    uint32_t live[4];
+    gpio_live_all(live);
+
+    // GPIO-/Start-Logik nur auswerten, wenn sich Pegel oder deren Register
+    // geaendert haben (sonst ergibt sich exakt dasselbe Ergebnis).
+    static uint32_t s_prev_live[4] = {0xFFFF'FFFFu, 0, 0, 0};
+    if (!g_pin_irq_dirty && std::memcmp(s_prev_live, live, sizeof s_prev_live) == 0) return;
+    std::memcpy(s_prev_live, live, sizeof s_prev_live);
+    g_pin_irq_dirty = false;
 
     // --- LPC111x-GPIO-Interrupts: Port n -> IRQ PIO_n (EINT0..3 = IRQ 31..28).
     if (!g_gpio_irq_primed) {
@@ -2510,7 +3003,7 @@ void sample_pin_interrupts() {
 // Treibt die zeitbasierten Modelle (CT16/CT32, WWDT) weiter und pendet
 // fällige IRQs. ct_advance/wdt_advance/g_ct/g_wdt liegen im anonymen
 // Namespace oben, sind in dieser TU aber sichtbar.
-void poll_timed_sources() {
+void __not_in_flash_func(poll_timed_sources)() {
     for (auto& c : g_ct) { ct_advance(c); ct_sample_capture(c); }
     wdt_advance();
     systick_advance();
@@ -2549,10 +3042,37 @@ bool capture_armed() {
     return false;
 }
 
-bool mmio_read8(uint32_t addr, uint8_t& out) {
+// Einmal pro Trap (vor den Byte-Zugriffen) aufgerufen: Pin-Interrupts und
+// Capture abtasten. Frueher geschah das in JEDEM mmio_read8/write8, also 4x je
+// 32-Bit-Zugriff.
+uint64_t g_samp_cyc_sum = 0; uint32_t g_samp_n = 0, g_samp_max = 0;
+void __not_in_flash_func(begin_access)() {
+    ++g_trap_epoch;
+    const uint32_t t0 = cyccnt();
+    sample_pin_interrupts();
+    const uint32_t d = cyccnt() - t0;
+    g_samp_cyc_sum += d; ++g_samp_n; if (d > g_samp_max) g_samp_max = d;
+}
+void sample_cost(uint32_t& avg_cyc, uint32_t& max_cyc) {
+    avg_cyc = g_samp_n ? static_cast<uint32_t>(g_samp_cyc_sum / g_samp_n) : 0u;
+    max_cyc = g_samp_max;
+}
+
+// Wortzugriff auf CT16/CT32 ohne Byte-Zerlegung (fault.cpp, LDR/STR). false =
+// keine Timer-Adresse -> byteweiser Standardpfad.
+bool __not_in_flash_func(ct_word_access)(uint32_t addr, bool is_load, uint32_t& value) {
+    const uint32_t idx = ct_idx_for(addr);
+    if (idx >= 4 || (addr & 3u)) return false;
+    const uint32_t reg = addr - ct_base_for(idx);
+    g_last_mmio_addr = addr; g_last_mmio_write = !is_load;
+    if (is_load) { g_stats.mmio_reads += 4; value = ct_read_reg(idx, reg); }
+    else         { g_stats.mmio_writes += 4; ct_write_reg(idx, reg, value, 0xFFFF'FFFFu); }
+    return true;
+}
+
+bool __not_in_flash_func(mmio_read8)(uint32_t addr, uint8_t& out) {
     ++g_stats.mmio_reads;
     g_last_mmio_addr = addr; g_last_mmio_write = false;
-    sample_pin_interrupts();
 
     if (addr >= GPIO_BASE && addr < GPIO_PORTS_END) {
         uint32_t port_off = addr - GPIO_BASE;
@@ -2649,10 +3169,9 @@ bool mmio_read8(uint32_t addr, uint8_t& out) {
     return true;
 }
 
-bool mmio_write8(uint32_t addr, uint8_t val) {
+bool __not_in_flash_func(mmio_write8)(uint32_t addr, uint8_t val) {
     ++g_stats.mmio_writes;
     g_last_mmio_addr = addr; g_last_mmio_write = true;
-    sample_pin_interrupts();
 
     if (addr >= GPIO_BASE && addr < GPIO_PORTS_END) {
         uint32_t port_off = addr - GPIO_BASE;
@@ -2689,16 +3208,17 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
                     g_gpio[port].data = (old & ~(0xFFu << shift)) | (new_b << shift);
                     ++g_stats.gpio_writes;
                     gpio_apply_port(static_cast<uint8_t>(port), old,
-                                    g_gpio[port].data, g_gpio[port].dir);
+                                    g_gpio[port].data, g_gpio[port].dir, g_gpio[port].dir);
                 }
                 return true;
             }
             if (local >= GPIO_DIR_OFFSET && local < GPIO_DIR_OFFSET + 4) {
                 uint32_t shift = (addr & 3u) * 8u;
+                const uint32_t old_dir = g_gpio[port].dir;
                 g_gpio[port].dir = (g_gpio[port].dir & ~(0xFFu << shift)) |
                                    (static_cast<uint32_t>(val) << shift);
                 gpio_apply_port(static_cast<uint8_t>(port), g_gpio[port].data,
-                                g_gpio[port].data, g_gpio[port].dir);
+                                g_gpio[port].data, old_dir, g_gpio[port].dir);
                 return true;
             }
             GpioPort& g = g_gpio[port];
@@ -2707,6 +3227,7 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
             auto patch = [&](uint32_t& r) {
                 r = ((r & ~(0xFFu << shift)) | lane) & 0xFFFu;
             };
+            g_pin_irq_dirty = true;
             switch (local & ~3u) {
                 case GPIO_IS_OFFSET:  patch(g.is);  break;
                 case GPIO_IBE_OFFSET: patch(g.ibe); break;
@@ -2723,10 +3244,12 @@ bool mmio_write8(uint32_t addr, uint8_t val) {
     }
     if (addr >= IOCON_BASE && addr < IOCON_END) {
         uint32_t off = addr - IOCON_BASE;
+        const uint8_t prev = g_iocon[off];
         g_iocon[off] = val;
-        // MODE-Bits (Pull-up/-down) liegen in Byte 0 des 32-bit-Registers.
-        // Nach jedem Byte-Write den Pull des zugehoerigen Pins nachziehen.
-        apply_iocon_pull(off & ~3u);
+        // MODE-Bits (Pull-up/-down) liegen in Byte 0 des 32-bit-Registers; den
+        // Pull nur bei tatsaechlicher Aenderung nachziehen (Firmware schreibt
+        // IOCON oft zyklisch mit gleichem Wert).
+        if (prev != val && (off & 3u) == 0u) apply_iocon_pull(off);
         return true;
     }
     if (addr >= SYSCON_BASE && addr < SYSCON_BASE + 0x300) {
@@ -2888,6 +3411,12 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks) {
 // Diagnose je CT-Timer (0=CT16B0,1=CT16B1,2=CT32B0,3=CT32B1): Grundzustand +
 // Match-IRQ-Pend-Zaehler. Erlaubt zu sehen, WELCHER Timer wie oft einen IRQ
 // pendet (Runaway-/Sturm-Erkennung) und mit welcher Konfiguration (pre/MR0/MCR).
+void ct_lat_debug(int idx, uint32_t& n, uint32_t& avg, uint32_t& max, uint32_t& last) {
+    const CtModel& c = g_ct[idx & 3];
+    n = c.lat_n; max = c.lat_max; last = c.lat_last;
+    avg = c.lat_n ? static_cast<uint32_t>(c.lat_sum / c.lat_n) : 0u;
+}
+
 int ct_tx_handle(int idx, int m) { return g_ct[idx & 3].tx_handle[m & 3]; }
 
 void ct_tx_debug(int idx, uint32_t& emitted, uint32_t skip[4]) {
@@ -2923,12 +3452,12 @@ void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit) {
 
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-
 // SysTick auf den naechsten Deadline (adaptiver "HW-Alarm").
-void systick_hw_rearm() { systick_program_hw(); }
+void __not_in_flash_func(systick_hw_rearm)() { systick_program_hw(); }
 
 // Vom Host-SysTick-Shim konsumiert: Anzahl seit dem letzten Aufruf faelliger
 // Gast-SysTick-Perioden (die der Shim durch entsprechend viele Aufrufe des
 // Gast-Handlers nachholt). Zeroing beim Lesen.
-uint32_t systick_take_guest_ticks() {
+uint32_t __not_in_flash_func(systick_take_guest_ticks)() {
     uint32_t n = g_systick.guest_ticks_pending;
     g_systick.guest_ticks_pending = 0;
     return n;

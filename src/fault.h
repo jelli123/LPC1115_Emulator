@@ -18,6 +18,9 @@ struct Stats {
     uint64_t real_faults;        // nicht decodierbare / unzulässige Faults
     uint32_t last_fault_pc;
     uint32_t last_fault_addr;
+    // Trap-Dauer (Zyklen, CPU-Takt) fuer Timing-Analysen: Summe/Anzahl/Maximum.
+    uint64_t trap_cyc_sum;
+    uint32_t trap_cyc_n, trap_cyc_max;
 };
 
 void init();
@@ -35,5 +38,9 @@ uint32_t    report_length();    // Laenge ohne NUL
 void        clear_report();      // vom Konsumenten (Core0) nach Abholung
 
 } // namespace faultsys
+
+// Diagnose: mittlere Takte je MMIO-Trap [bis Decode, Decode, Abtastung, Zugriff].
+void trap_profile(uint32_t out[4]);
+void trap_region_profile(uint32_t avg[8], uint32_t cnt[8]);
 
 void setup_fault_handlers();

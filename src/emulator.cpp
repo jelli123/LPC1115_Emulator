@@ -1,3 +1,4 @@
+#include "fast_time.h"
 #include "emulator.h"
 #include "mmu.h"
 #include "fault.h"
@@ -50,7 +51,7 @@ std::atomic<uint32_t>        g_pc_sample_pos{0};
 // nicht mehr (realer SysTick gestoppt/maskiert). last_us = Zeit des letzten Eintritts.
 std::atomic<uint32_t>        g_shim_enter{0};
 std::atomic<uint32_t>        g_shim_exit{0};
-std::atomic<uint64_t>        g_shim_last_us{0};
+std::atomic<uint32_t>        g_shim_last_us{0};   // untere 32 Bit (64-Bit-Atomics liegen als Bibliotheksaufruf im Flash)
 
 // Vom Gast (Core1) angeforderter Soft-Reset (NVIC_SystemReset/WDT). Wird vom
 // Core0-Loop konsumiert, der den eigentlichen Core1-Reset ausfuehrt — ein
@@ -146,8 +147,7 @@ extern "C" void svc_dispatch_c(uint32_t* frame) {
     }
 }
 
-__attribute__((naked))
-void isr_svc() {
+__attribute__((naked, section(".time_critical.isr_svc"))) void isr_svc() {
     __asm volatile (
         "tst   lr, #4              \n"   // EXC_RETURN bit2: 0=MSP, 1=PSP
         "ite   eq                  \n"
@@ -173,7 +173,7 @@ void isr_svc() {
 // ein CMSIS-Handler ist eine gewoehnliche C-Funktion, das ist zulaessig. Beim
 // Exception-Return dieses Shims wird ein evtl. gependeter LPC-IRQ per PendSV
 // (tail-chained) in den Gast injiziert.
-extern "C" void isr_systick_shim() {
+extern "C" void __not_in_flash_func(isr_systick_shim)() {
     g_shim_enter.fetch_add(1, std::memory_order_relaxed);
     // Debugger-Halt: Anforderung umsetzen; ist der Gast angehalten (Halt im
     // PendSV), weder Gast-Handler noch Zeitmodelle weiterlaufen lassen.
@@ -183,7 +183,7 @@ extern "C" void isr_systick_shim() {
         g_shim_exit.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    g_shim_last_us.store(time_us_64(), std::memory_order_relaxed);
+    g_shim_last_us.store(static_cast<uint32_t>(fast_time_us()) | 1u, std::memory_order_relaxed);
     // PC-Sampler: der unterbrochene Gast lief in Thread-Mode auf PSP; die HW hat
     // dort {r0,r1,r2,r3,r12,lr,pc,xpsr} gestackt -> psp[6] = Gast-PC. Als
     // LPC-Offset (PC - load_base) merken. Nur gueltige Thread-Frames (Gast lief,
@@ -578,7 +578,8 @@ void core1_main() {
         // DebugMonitor aktivieren: BKPT (Software-Breakpoints) und Einzelschritt
         // loesen dann die DebugMonitor-Exception aus statt eines HardFaults.
         CoreDebug->DEMCR = (CoreDebug->DEMCR & ~CoreDebug_DEMCR_MON_STEP_Msk)
-                         | CoreDebug_DEMCR_MON_EN_Msk;
+                         | CoreDebug_DEMCR_MON_EN_Msk | CoreDebug_DEMCR_TRCENA_Msk;
+        DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;   // Zyklenzaehler fuer Trap-Timing ('stats')
 
         // Sprung in den Gast — kommt nicht zurück.
         g_pc.store(reset_h);
@@ -724,25 +725,25 @@ uint32_t pc_samples(uint32_t* out, uint32_t max) {
 void shim_debug(uint32_t& enter, uint32_t& exit, uint32_t& age_ms) {
     enter = g_shim_enter.load(std::memory_order_relaxed);
     exit  = g_shim_exit.load(std::memory_order_relaxed);
-    uint64_t last = g_shim_last_us.load(std::memory_order_relaxed);
-    uint64_t now  = time_us_64();
-    age_ms = (last && now > last) ? static_cast<uint32_t>((now - last) / 1000u) : 0u;
+    uint32_t last = g_shim_last_us.load(std::memory_order_relaxed);
+    uint32_t now  = static_cast<uint32_t>(fast_time_us());
+    age_ms = last ? (now - last) / 1000u : 0u;   // 32-Bit-Differenz, wrap-fest
 }
 
-uint32_t load_base() {
+uint32_t __not_in_flash_func(load_base)() {
     return reinterpret_cast<uint32_t>(g_firmware_image);
 }
 
-uint32_t guest_ram_base() {
+uint32_t __not_in_flash_func(guest_ram_base)() {
     return reinterpret_cast<uint32_t>(g_guest_ram);
 }
 
-uint32_t vtable_base() {
+uint32_t __not_in_flash_func(vtable_base)() {
     uint32_t v = g_vtable_base.load(std::memory_order_acquire);
     return v ? v : reinterpret_cast<uint32_t>(g_firmware_image);
 }
 
-bool take_handover_sp_fixup(uint32_t& raw, uint32_t& reloc) {
+bool __not_in_flash_func(take_handover_sp_fixup)(uint32_t& raw, uint32_t& reloc) {
     if (!g_sp_fixup_pending.exchange(false, std::memory_order_acquire))
         return false;
     raw   = g_sp_fixup_raw.load(std::memory_order_relaxed);

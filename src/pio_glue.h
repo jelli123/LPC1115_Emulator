@@ -29,11 +29,30 @@ void init();
 // claim_pin=false: nur mitlesen (Pin-Funktion/-Richtung bleiben unveraendert).
 int  ts_setup(uint8_t rp_gpio, float& out_rate_hz, bool claim_pin = true);
 
-// Zieht genau einen Flanken-Timestamp aus der FIFO. false = FIFO leer.
-bool ts_read(int handle, uint32_t& counter);
+// Zieht genau eine Flanke aus der FIFO: absoluter Zeitpunkt (time_us_64-
+// Zeitbasis, ~1 us genau) und Pegel NACH der Flanke (1 = steigend).
+// false = FIFO leer.
+bool ts_read_edge(int handle, uint64_t& t_us, bool& level);
 
 // Gibt die State-Machine wieder frei (vor Neukonfiguration).
 void ts_teardown(int handle);
+
+// Verwirft einen noch nicht ausgegebenen Puls (FIFO + laufende Wartezeit),
+// Pin geht auf low. Fuer Neuplanung, wenn sich MR/MCR/TC nachtraeglich aendern.
+void tx_cancel(int handle);
+
+// Neuaufbau des Pulsplans OHNE Pegelsprung: SM anhalten, FIFO leeren, an den
+// Programmanfang - der Pin behaelt seinen Pegel (ein laufender Puls bleibt
+// high). keep_high=false zieht den Pin sofort auf low. Danach tx_emit() fuer
+// die (Rest-)Pulse und tx_rebuild_end() zum Starten.
+void tx_rebuild_begin(int handle, bool keep_high);
+// SM anhalten und den Pin (low, Ausgang) an SIO zurueckgeben, ohne die SM
+// freizugeben; tx_unpark() holt ihn wieder. Die Neuanlage (tx_setup) laeuft
+// ueber SDK-Funktionen im Flash und kostete ~110 us - zu viel im Trap am
+// Telegrammbeginn (sblib verlaesst im Ruhezustand den PWM-Modus).
+void tx_park(int handle);
+void tx_unpark(int handle);
+void tx_rebuild_end(int handle);
 
 // Diagnose Match-Puls-SM: Programmzaehler (relativ), TX-FIFO-Fuellstand,
 // PIO-Ausgangspegel und -Treiberfreigabe des Pins.

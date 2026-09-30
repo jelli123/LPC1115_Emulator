@@ -32,7 +32,13 @@ void ncn_bridge_reinit();
 // Vom Trap-Handler nach erfolgter Emulation aufgerufen — Stats/PLL-Folgen.
 void on_post_write_hook();
 
+// Einmal je MMIO-Trap vor den Byte-Zugriffen (Pin-/Capture-Abtastung).
+void begin_access();
+void sample_cost(uint32_t& avg_cyc, uint32_t& max_cyc);   // Diagnose
 bool mmio_read8 (uint32_t addr, uint8_t&  out);
+// Wortzugriff auf die Timer CT16/CT32 in einem Schritt (LDR/STR); false = keine
+// Timer-Adresse (dann byteweise ueber mmio_read8/mmio_write8).
+bool ct_word_access(uint32_t addr, bool is_load, uint32_t& value);
 bool mmio_write8(uint32_t addr, uint8_t   val);
 
 // Aktuelle resultierende CPU-Frequenz, die per SYSCON-Schreibvorgängen
@@ -49,6 +55,9 @@ void sample_pin_interrupts();
 // pendet fällige IRQs. Wird aus dem WFI-Warte-Handler periodisch gepollt,
 // da diese Modelle sonst nur bei MMIO-Zugriffen voranschreiten.
 void poll_timed_sources();
+// Core0-Hauptloop: Tabelle LPC-Pin -> RP-GPIO (Pinmap ohne Bridge-Pads) alle
+// 50 ms neu aufbauen; force = sofort (nach Pinmap-/Bridge-Aenderung).
+void live_map_poll(bool force = false);
 
 // True, sobald mindestens ein Timer-Capture-Kanal scharf ist (CCR-Flanke
 // aktiv und Pin gebunden). Der WFI-Warte-Handler pollt dann eng (ohne die
@@ -125,7 +134,9 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks);
 // (Runaway-/Sturm-Erkennung) und mit welcher Konfiguration (pre/MR0..3/MCR/TC/IR).
 // Match-PIO-Diagnose: uebergebene Pulse + Verwerfungsgruende (siehe peripherals.cpp).
 void ct_tx_debug(int idx, uint32_t& emitted, uint32_t skip[4]);
-int  ct_tx_handle(int idx, int m);   // Match-PIO-Handle des Kanals (-1 = keins)
+int  ct_tx_handle(int idx, int m);
+// Verspaetung (TC-Ticks) des ersten MR0-Writes nach Reset-Match mit IRQ.
+void ct_lat_debug(int idx, uint32_t& n, uint32_t& avg, uint32_t& max, uint32_t& last);   // Match-PIO-Handle des Kanals (-1 = keins)
 void ct_debug(int idx, bool& enabled, uint32_t& pre, uint32_t& mr0,
               uint32_t& mcr, uint32_t& tc, uint32_t& ir, uint32_t& pends,
               uint32_t& mr1, uint32_t& mr2, uint32_t& mr3);

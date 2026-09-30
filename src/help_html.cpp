@@ -137,7 +137,7 @@ GP25 = Status-LED; GP26&ndash;29 sind die ADC-Eingaenge.</p>
 <table><tr><th>Funktion</th><th>Konfiguration</th></tr>
 <tr><td>GPIO des Gasts</td><td><code>pin.&lt;port&gt;_&lt;pin&gt;=&lt;gpio&gt;</code></td></tr>
 <tr><td>LPC-UART0</td><td><code>uart0_tx</code>/<code>uart0_rx</code> (RP-UART-Pads) oder <code>uart0_cdc=on</code> (virtuell)</td></tr>
-<tr><td>KNX-Bus (Timer)</td><td><code>tcap.&lt;t&gt;=&lt;gpio&gt;</code> (RX), <code>tmat.&lt;t&gt;.&lt;m&gt;=&lt;gpio&gt;</code> (TX); <code>tcap_pio</code>/<code>tmatch_pio=on</code> (Default) fuer flankengenaues Timing</td></tr>
+<tr><td>KNX-Bus (Timer)</td><td><code>tcap.&lt;t&gt;=&lt;gpio&gt;</code> (RX), <code>tmat.&lt;t&gt;.&lt;m&gt;=&lt;gpio&gt;</code> (TX); <code>tcap_pio</code>/<code>tmatch_pio=on</code> (Default) fuer flankengenaues Timing; <code>tmatch_delay=20</code> (0..25 us) Latenzausgleich der Sendepulse</td></tr>
 <tr><td>RESET / ISP</td><td><code>pin.0_0</code> + <code>reset_in=on</code>, <code>pin.0_1</code> + <code>isp_pins=on</code></td></tr>
 </table>
 <p><small>LPC1115-Emulator &middot; generiert auf dem Geraet &middot; Details in CONFIG.INI</small></p>

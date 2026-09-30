@@ -1,5 +1,6 @@
 #include "config.h"
 #include "storage.h"
+#include "pico.h"   // __not_in_flash_func (Getter im Core1-Hot-Path)
 
 #include <cstdio>
 #include <cstdlib>
@@ -61,6 +62,7 @@ int8_t   g_ct_mat[4][4] = {
 };
 bool     g_tcap_pio = true;     // PIO: noetig fuer KNX-Bit-Timing (Software-Pfad zu grob)
 bool     g_tmatch_pio = true;
+uint32_t g_tmatch_delay_us = 20;
 
 constexpr int      MAX_GPIO    = 47;          // RP2350-Pinanzahl konservativ
 
@@ -159,6 +161,7 @@ void apply_defaults() {
     }
     g_tcap_pio = true;
     g_tmatch_pio = true;
+    g_tmatch_delay_us = 20;
 }
 
 // Weist einem LPC-Pin einen RP2350-GPIO zu und erzwingt dabei Eindeutigkeit:
@@ -371,6 +374,10 @@ bool apply_from_store() {
     if (storage::config_get(KEY_TMATCH_PIO, buf, sizeof buf)) {
         g_tmatch_pio = (buf[0] == '1');
     }
+    if (storage::config_get(KEY_TMATCH_DELAY, buf, sizeof buf)) {
+        uint32_t v;
+        if (parse_uint32(buf, v)) set_tmatch_delay_us(v);
+    }
     load_pin_map_from_storage();
     return true;
 }
@@ -510,6 +517,8 @@ bool sync_to_store() {
     if (!storage::config_set(KEY_TCAP_PIO, buf)) return false;
     std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_tmatch_pio ? 1 : 0));
     if (!storage::config_set(KEY_TMATCH_PIO, buf)) return false;
+    std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(g_tmatch_delay_us));
+    if (!storage::config_set(KEY_TMATCH_DELAY, buf)) return false;
     char key[24];
     for (std::size_t i = 0; i < LPC_PIN_COUNT; ++i) {
         if (g_pin_map.lpc_to_rp[i] < 0) continue;
@@ -586,7 +595,7 @@ int  uart_bridge_tx_pin()            { return g_uart_bridge_tx; }
 void set_uart_bridge_tx_pin(int gpio){ g_uart_bridge_tx = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
 int  uart_bridge_rx_pin()            { return g_uart_bridge_rx; }
 void set_uart_bridge_rx_pin(int gpio){ g_uart_bridge_rx = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
-bool uart0_cdc_enabled()             { return g_uart0_cdc; }
+bool __not_in_flash_func(uart0_cdc_enabled)()             { return g_uart0_cdc; }
 void set_uart0_cdc_enabled(bool v)   { g_uart0_cdc = v; }
 int  uart0_tx_gpio()                 { return g_uart0_tx_gpio; }
 void set_uart0_tx_gpio(int gpio)     { g_uart0_tx_gpio = (gpio >= -1 && gpio <= MAX_GPIO) ? gpio : -1; }
@@ -648,15 +657,17 @@ void set_ct_match_pin(int t, int m, int gpio) {
     g_ct_mat[t][m] = (gpio >= 0 && gpio <= MAX_GPIO) ? static_cast<int8_t>(gpio) : -1;
 }
 
-bool tcap_pio()            { return g_tcap_pio; }
+bool __not_in_flash_func(tcap_pio)()            { return g_tcap_pio; }
 void set_tcap_pio(bool v)  { g_tcap_pio = v; }
-bool tmatch_pio()            { return g_tmatch_pio; }
+bool __not_in_flash_func(tmatch_pio)()            { return g_tmatch_pio; }
 void set_tmatch_pio(bool v)  { g_tmatch_pio = v; }
+uint32_t __not_in_flash_func(tmatch_delay_us)() { return g_tmatch_delay_us; }
+void set_tmatch_delay_us(uint32_t v) { g_tmatch_delay_us = (v > 25u) ? 25u : v; }
 
-bool wfi_pin_wakeup()                { return g_wfi_pin_wakeup; }
+bool __not_in_flash_func(wfi_pin_wakeup)()                { return g_wfi_pin_wakeup; }
 void set_wfi_pin_wakeup(bool v)      { g_wfi_pin_wakeup = v; }
 
-bool primask_shadow()                { return g_primask_shadow; }
+bool __not_in_flash_func(primask_shadow)()                { return g_primask_shadow; }
 void set_primask_shadow(bool v)      { g_primask_shadow = v; }
 
 uint32_t app_start_addr()            { return g_app_start; }
