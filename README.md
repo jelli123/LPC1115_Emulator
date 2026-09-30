@@ -258,7 +258,14 @@ arm-none-eabi-gdb fw.elf -ex "target extended-remote :3333"
   z. B. die 35-µs-Pulse des KNX-Senders.
 
 Beide sind per Default aktiv; der Software-Pfad (`tcap_pio`/`tmatch_pio=off`)
-taugt nur für langsame Signale.
+taugt nur für langsame Signale. `tmatch_delay` (0..25 µs, Default 20) gibt die
+Match-Pulse fest verzögert aus und verschafft dem Gast-Handler Reserve (KNX:
+MR0 muss < 69 µs nach dem Bit-Reset stehen); Einzelheiten und Messwerte in
+[docs/TECHNICAL.md §20](docs/TECHNICAL.md#20-timer-capture-match-und-knx-sendetakt).
+
+**RP2350-Erratum E9:** Eingänge mit internem Pull-down können nach einem
+High-Pegel hängen bleiben (liest weiter 1). Für Pull-down-Eingänge einen
+externen Widerstand ≤ 8,2 kΩ vorsehen; der Emulator weist beim Setzen darauf hin.
 
 ## Build
 

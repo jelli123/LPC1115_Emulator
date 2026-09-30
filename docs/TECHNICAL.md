@@ -162,6 +162,14 @@ Frame an und legt so den darunter liegenden Original-Frame frei — der Gast set
 nahtlos fort. `pendsv_inject_c()` läuft nur auf Core 1 (Guard `get_core_num()`),
 da das überschriebene PendSV-Symbol auch in Core 0s Vektortabelle steht.
 
+**Prioritäten:** Wie im NVIC wird der höchstpriore zustellbare IRQ zuerst
+injiziert (`IPR`, 2 Bit; Gleichstand → kleinste IRQ-Nummer). Ein injizierter
+Handler kann nur von einem IRQ **höherer** Priorität unterbrochen werden
+(Stapel der aktiven Prioritäten in `irq_inject.cpp`); gleich oder niedriger
+priorisierte IRQs bleiben pending und werden beim Rücksprung nachgeliefert
+(Tail-Chaining). So unterbricht z. B. der KNX-Bit-Timer (sblib: höchste
+Priorität) einen laufenden UART-Handler.
+
 IRQ-Tabelle: [src/lpc_irqs.h](../src/lpc_irqs.h) (UM10398 Tab. 51).
 
 ---
@@ -820,3 +828,62 @@ Die Bridge versucht **PIO1**, dann **PIO2**. PIO0 bleibt für
 | `uart_bridge_rx=<gpio>`  | RX-Pin (Datenrichtung: extern→RP)    |
 
 CLI: `uart start <tx> <rx>`, `uart stop`, `uart status`.
+
+---
+
+## 20. Timer-Capture/-Match und KNX-Sendetakt
+
+Der sblib-KNX-Sender verlangt Echtzeit: Der Timer (CT16B1) wird an der
+steigenden Flanke jedes Bits zurückgesetzt, und der Interrupt-Handler muss
+MR0 (Pulsbeginn) **innerhalb von 69 µs** setzen – am LPC dauert das wenige µs,
+im Emulator kostet jeder Registerzugriff einen MMIO-Trap. Das Timer-Modell
+ist deshalb auf kurze Trap-Zeiten und ein zeitlich konsistentes Echo ausgelegt.
+
+**Zeitbasis.** `ct_advance()` rechnet TC analytisch aus der Wall-Clock-Zeit.
+Zwischen zwei Ereignissen (Match mit IRQ/Reset/Stop/EMR, Software-PWM-Flanke,
+Überlauf) wird nur TC fortgeschrieben (`quiet_until_us`, bei 1 Tick = 1 µs);
+jeder Registerschreibzugriff verwirft diesen Cache. 32-Bit-Zugriffe (LDR/STR)
+laufen als ganzes Wort durch das Modell (`ct_word_access`), Folgearbeit
+(PWM-Pegel, Pulsplanung, Host-SysTick) einmal je Trap im Post-Hook, den
+Host-SysTick nur, wenn sich ein Interrupt-Termin ändern kann.
+
+**Capture (`timer_edge_ts`, `tcap_pio`).** Jede Flanke kommt mit Zeitstempel
+und Pegel aus der PIO; CR0 ist der TC-Wert *zum Flankenzeitpunkt*
+(`ct_tc_at`), nicht zur Verarbeitungszeit.
+
+**Match (`match_pulse`, `tmatch_pio`).** Je PWM-Kanal führt `txq[]` höchstens
+zwei an die PIO gegebene Pulse (laufend + wartend), jeweils einer
+Timer-Periode zugeordnet. Schreibt die Firmware MRm/MRreset derselben Periode
+nachträglich um (sblib: erst MR0, dann MR2), wird der PIO-Plan ohne
+Pegelsprung neu aufgebaut: ein laufender Puls bleibt high und endet zum neuen
+Zeitpunkt. Die State-Machine wird beim Boot angelegt und bei Nichtgebrauch
+nur geparkt (Pin an SIO) – die Anlage aus dem Trap kostete ~110 µs.
+Solange die Match-PIO zuständig ist, treibt die Software-PWM den Pin nicht
+(sonst ein High-Glitch vor dem ersten Puls, den sblib als fremdes Startbit sah).
+
+**Latenzausgleich (`tmatch_delay`, 0..25 µs, Default 20).** Die Pulse
+erscheinen um diese feste Zeit verzögert am Pin; das gibt dem Handler Reserve.
+Flanken innerhalb eines eigenen Pulses (Bus-Echo) werden für CR0 um dieselbe
+Zeit zurückgerechnet und lösen **keinen eigenen Capture-Interrupt** aus – das
+Flag liest der ohnehin folgende Perioden-Interrupt mit (am LPC ist der
+Echo-Handler in ~1 µs fertig, im Emulator kostete jeder Handlerlauf ~50 µs).
+Ab ~30 µs fällt das Echo zu nah ans Periodenende; daher die Obergrenze.
+
+**Handler länger als eine Periode.** Liest der Handler IR und trifft danach
+ein Match mit dem *im Handler neu gesetzten* MRm (nächster Periodenreset,
+bevor der Handler per `resetFlags()` alle Flags löscht), wird dieses Flag vom
+Löschen ausgenommen und der Interrupt nach dem Rücksprung erneut zugestellt –
+am LPC wäre der Handler längst fertig gewesen. Treffer mit dem *alten* Wert
+(Handler schrieb MRm zu spät) werden wie am LPC gelöscht; bleibt kein
+freigegebenes Flag, wird auch die pendende Anforderung zurückgenommen.
+
+**Messwerte** (RP2350 150 MHz, TPUART2-Emu v0.10, Brücke GP3→GP4): MR0 im
+Mittel 62 µs nach dem Reset geschrieben (max. ~106 µs);
+mit `tmatch_delay` 0/10/20/25 µs jeweils alle Telegramme bitgenau (128 bei 20 µs), mit 30/34 µs
+nicht mehr (`pio capture` + Dekoder). Diagnose: `stats`
+(„IRQ->MR0-Write nach Reset“, Trap-Profil, Kosten je Region).
+
+**Erratum RP2350-E9.** Eingänge mit internem Pull-down und aktivem
+Input-Buffer bleiben nach einem High-Pegel bei ~2 V hängen und lesen weiter 1.
+Wählt die Firmware per IOCON einen Pull-down, meldet der Emulator das einmalig;
+Abhilfe nur extern (Pull-down ≤ 8,2 kΩ).
