@@ -1,0 +1,7 @@
+// GENERIERT von CMake aus src/board_profile.cpp.in - nicht bearbeiten.
+// Board-Profil = boards/@PICO_BOARD@.ini (leer, wenn nicht vorhanden).
+#include <cstdint>
+
+extern "C" const char emu_board_name[] = "@PICO_BOARD@";
+extern "C" const char emu_board_ini[]  = R"EMUINI(@EMU_BOARD_INI@)EMUINI";
+extern "C" const uint32_t emu_board_ini_len = sizeof(emu_board_ini) - 1;

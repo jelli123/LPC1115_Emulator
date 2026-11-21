@@ -44,6 +44,22 @@ int main() {
     // solange USB laeuft).
     storage::init();
     config::load();
+    {
+        // INI-Import-Sektor (scripts/mkimage.py, per SWD/UF2 geschrieben): einmalig
+        // uebernehmen und persistieren. ini_crc verhindert ein erneutes Anwenden
+        // bei jedem Boot (spaetere CLI-/CONFIG.INI-Aenderungen bleiben erhalten).
+        // Core1 laeuft noch nicht -> Flash-Schreiben hier unkritisch.
+        uint32_t len = 0, crc = 0;
+        const char* ini = storage::ini_import(len, crc);
+        if (ini && crc != config::ini_import_crc()) {
+            const uint32_t n = config::apply_ini(ini, len, nullptr, /*authoritative=*/false);
+            config::set_ini_import_crc(crc);
+            const bool ok = config::save();
+            std::printf("[CFG] INI-Import uebernommen (%lu Zeilen, crc=0x%08lx) %s\n",
+                        static_cast<unsigned long>(n), static_cast<unsigned long>(crc),
+                        ok ? "und gespeichert" : "- SPEICHERN FEHLGESCHLAGEN");
+        }
+    }
     usb_stdio_init();
 
     // Kein Warten auf ein Terminal mehr (frueher bis zu 6 s, die den Autostart
@@ -66,6 +82,9 @@ int main() {
                     ci.loaded_valid ? "geladen" : "LEER->Defaults",
                     static_cast<unsigned long>(ci.sequence),
                     static_cast<unsigned long>(ci.key_count));
+        std::printf("[CFG] Board=%s%s INI-Import@0x%06lx\n", config::board_name(),
+                    config::board_profile_active() ? " (Board-Profil aktiv, nicht gespeichert)" : "",
+                    static_cast<unsigned long>(storage::ini_import_flash_offset()));
     }
     peripherals::init();
     pio_glue::init();

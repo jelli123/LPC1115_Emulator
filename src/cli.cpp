@@ -176,6 +176,7 @@ const char* const HELP_LINES[] = {
     "  cfg set <key> <value>      Wert setzen",
     "  cfg save                   RAM-Snapshot in Flash schreiben",
     "  cfg clear                  alle Einstellungen auf Default zuruecksetzen",
+    "  cfg board                  Board-Profil (boards/<board>.ini) setzen + speichern",
     "  pinmap show                Tabelle LPC-Pin -> RP2350-GPIO",
     "  pinmap set <port_pin> <rp> Pin zuweisen (z.B. pinmap set 1_8 17)",
     "  pinmap reset               Default-Tabelle wiederherstellen",
@@ -541,7 +542,8 @@ constexpr Word TOP[] = {
 // Sub-Optionen je Befehl (kanonisch + Aliase).
 constexpr Word SUB_DBG[]    = {{"clear","clear"},{"save","save"},{"auto","auto"}};
 constexpr Word SUB_CFG[]    = {{"show","show"},{"list","show"},{"dump","show"},
-                               {"get","get"},{"set","set"},{"save","save"},{"clear","clear"}};
+                               {"get","get"},{"set","set"},{"save","save"},{"clear","clear"},
+                               {"board","board"}};
 constexpr Word SUB_PINMAP[] = {{"show","show"},{"list","show"},{"set","set"},{"reset","reset"}};
 constexpr Word SUB_GDB[]    = {{"on","on"},{"off","off"},{"status","status"}};
 constexpr Word SUB_SWD[]    = {{"start","start"},{"stop","stop"},{"status","status"}};
@@ -1007,6 +1009,25 @@ void handle_command(char* line) {
             bool ok = config::save();
             usb_msc::note_config_persisted();  // deferred-Flush erledigt
             std::puts(ok ? "saved" : "err");
+            return;
+        }
+        if (std::strcmp(tokens[1], "board") == 0) {
+            // Board-Profil (eingebettete boards/<PICO_BOARD>.ini) als neue
+            // Konfiguration uebernehmen und speichern. ini_crc bleibt erhalten,
+            // damit ein bereits uebernommener INI-Import nicht erneut greift.
+            if (!config::board_profile_available()) {
+                std::printf("kein Board-Profil fuer Board '%s' eingebaut\n", config::board_name());
+                return;
+            }
+            emulator::FlashPauseGuard _fp;
+            const uint32_t crc = config::ini_import_crc();
+            config::apply_board_profile();
+            config::set_ini_import_crc(crc);
+            const bool ok = config::save();
+            usb_msc::note_config_persisted();
+            usb_msc::refresh_config_volume();
+            std::printf("Board-Profil '%s' %s (wirkt vollstaendig nach 'reset' bzw. Neustart)\n",
+                        config::board_name(), ok ? "gesetzt + gespeichert" : "gesetzt, SPEICHERN FEHLGESCHLAGEN");
             return;
         }
         if (std::strcmp(tokens[1], "clear") == 0) {

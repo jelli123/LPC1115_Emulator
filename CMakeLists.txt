@@ -25,6 +25,10 @@ cmake_minimum_required(VERSION 3.21)
 
 set(PICO_PLATFORM rp2350 CACHE STRING "")
 set(PICO_BOARD    pico2  CACHE STRING "RP2350-basiertes Board (Pico 2 / RP2354).")
+# Eigene Board-Header (boards/<name>.h), z. B. -DPICO_BOARD=selfbus_io8_rp2354.
+# Optional je Board: boards/<name>.cmake (Build-Optionen) und boards/<name>.ini
+# (Board-Profil = Default-Konfiguration, wird ins Image eingebettet).
+list(APPEND PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards)
 
 if(NOT DEFINED ENV{PICO_SDK_PATH} AND NOT PICO_SDK_PATH)
     include(FetchContent)
@@ -47,6 +51,28 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 pico_sdk_init()
+
+# --- Board-Optionen + Board-Profil ------------------------------------------
+set(EMU_BOARD_DIR ${CMAKE_CURRENT_LIST_DIR}/boards)
+if(EXISTS ${EMU_BOARD_DIR}/${PICO_BOARD}.cmake)
+    include(${EMU_BOARD_DIR}/${PICO_BOARD}.cmake)
+endif()
+option(EMU_STDIO_UART "CLI/stdio zusaetzlich auf PICO_DEFAULT_UART (Boards ohne USB)" OFF)
+
+# Board-Profil-INI als C-String einbetten (leer, wenn keine vorhanden).
+set(EMU_BOARD_INI_FILE ${EMU_BOARD_DIR}/${PICO_BOARD}.ini)
+if(EXISTS ${EMU_BOARD_INI_FILE})
+    file(READ ${EMU_BOARD_INI_FILE} EMU_BOARD_INI)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${EMU_BOARD_INI_FILE})
+    if(EMU_BOARD_INI MATCHES "\\)EMUINI\"")
+        message(FATAL_ERROR "${EMU_BOARD_INI_FILE} enthaelt den Raw-String-Begrenzer )EMUINI\"")
+    endif()
+    message(STATUS "Board-Profil: ${EMU_BOARD_INI_FILE}")
+else()
+    set(EMU_BOARD_INI "")
+endif()
+configure_file(${CMAKE_CURRENT_LIST_DIR}/src/board_profile.cpp.in
+               ${CMAKE_CURRENT_BINARY_DIR}/board_profile.cpp @ONLY)
 
 add_executable(emulator
     src/main.cpp
@@ -77,9 +103,14 @@ add_executable(emulator
     src/led.cpp
     src/debug_bridge.cpp
     src/isp.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/board_profile.cpp
 )
 
 target_include_directories(emulator PRIVATE src)
+# Board-spezifische Defines aus boards/<board>.cmake (z. B. Lage der CLI-UART).
+if(EMU_BOARD_DEFINITIONS)
+    target_compile_definitions(emulator PRIVATE ${EMU_BOARD_DEFINITIONS})
+endif()
 
 # PIO-Programm fuer flankengenaues Capture-Timestamping (KNX-Empfang).
 # pioasm erzeugt den Header timer_edge_ts.pio.h ins Build-Verzeichnis.
@@ -133,6 +164,13 @@ target_link_libraries(emulator PRIVATE
 # tusb_config.h mitbringen würde, die mit unseren 2×CDC + MSC-Descriptoren
 # kollidiert. UART-stdio bleibt aus.
 pico_enable_stdio_usb(emulator 0)
-pico_enable_stdio_uart(emulator 0)
+if(EMU_STDIO_UART)
+    # Zusaetzlicher stdio-Treiber auf PICO_DEFAULT_UART (Board-Header). Die CLI
+    # liest/schreibt ueber stdio und ist damit auch ohne USB erreichbar.
+    pico_enable_stdio_uart(emulator 1)
+    target_compile_definitions(emulator PRIVATE EMU_STDIO_UART=1)
+else()
+    pico_enable_stdio_uart(emulator 0)
+endif()
 
 pico_add_extra_outputs(emulator)

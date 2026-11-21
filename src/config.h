@@ -50,6 +50,9 @@ inline constexpr const char* KEY_SPI_BRIDGE_MOSI = "spi_bridge_mosi";  // GPIO-N
 inline constexpr const char* KEY_SPI_BRIDGE_MISO = "spi_bridge_miso";  // GPIO-Nummer
 inline constexpr const char* KEY_SPI_BRIDGE_HZ   = "spi_bridge_hz";    // Bus-Takt in Hz
 inline constexpr const char* KEY_ADC_BRIDGE_EN   = "adc_bridge_en";    // "0"/"1"
+inline constexpr const char* KEY_ADC_PREFIX      = "adc.";             // adc.<lpc-ch>=<gpio 26..29|-1>
+// CRC der zuletzt aus dem INI-Import-Sektor uebernommenen INI (siehe storage.h).
+inline constexpr const char* KEY_INI_CRC         = "ini_crc";
 // Virtueller NCN5130 (KNX-Sekundaerinterface am LPC-SSP). Siehe
 // docs/NCN5130_EMULATION_SPEC.md. ncn_ssp = welcher LPC-SSP (0/1) der NCN ist.
 inline constexpr const char* KEY_NCN_EN          = "ncn_en";           // "0"/"1"
@@ -84,6 +87,12 @@ struct PinMap {
 };
 
 bool load();                         // ruft storage::config_load + bedient Defaults
+                                     // (leerer Slot -> Board-Profil, falls vorhanden)
+// Board-Profil (boards/<PICO_BOARD>.ini, zur Build-Zeit eingebettet).
+const char* board_name();            // PICO_BOARD des Builds
+bool        board_profile_available();
+bool        board_profile_active();  // letzte load(): Werte aus dem Board-Profil
+bool        apply_board_profile();   // Defaults + Board-INI live setzen (ohne save)
 bool save();
 // KV-Tabelle (RAM) <-> Live-Werte ohne Flash-Zugriff: sync_to_store() schreibt
 // die Live-Werte in die Tabelle, apply_from_store() uebernimmt die Tabelle in die
@@ -183,11 +192,26 @@ uint32_t    spi_bridge_hz();
 void        set_spi_bridge_hz(uint32_t hz);
 
 // ADC-Bridge-Konfiguration (LPC-ADC-Kanäle → RP2350-Hardware-ADC).
-// Mapping ist fix durch die RP2350-Hardware vorgegeben: LPC-Kanal 0..3 →
-// RP2350-ADC-Eingang 0..3 (GPIO26..29). Kanäle 4..7 haben keinen RP2350-
-// ADC-Pin und liefern weiterhin den Mittenwert. Nur Enable konfigurierbar.
+// adc_gpio(ch): RP2350-ADC-GPIO (26..29) fuer LPC-Kanal AD<ch>, -1 = keiner
+// (Kanal liefert den Mittenwert). Default AD0..3 -> GP26..29, AD4..7 -> -1;
+// per CONFIG.INI adc.<ch>=<gpio> umzuordnen (z. B. adc.7=29).
 bool        adc_bridge_enabled();
 void        set_adc_bridge_enabled(bool v);
+int         adc_gpio(int ch);
+void        set_adc_gpio(int ch, int gpio);
+
+// CRC der zuletzt aus dem INI-Import-Sektor uebernommenen INI (0 = keine).
+uint32_t    ini_import_crc();
+void        set_ini_import_crc(uint32_t crc);
+
+// Wertet INI-Text im CONFIG.INI-Format aus und setzt die Live-Werte (nicht
+// persistiert; danach ggf. save()). authoritative=true (CONFIG.INI, Board-
+// Profil): Pinmap/Timer/ADC-Zuordnung vorher auf Default -> fehlende Zeilen
+// verschwinden. false (INI-Import): nur ergaenzen/ueberschreiben, Entfernen per
+// Wert -1. erase_request (optional) meldet flash_erase=on.
+// Rueckgabe: Anzahl ausgewerteter Zeilen.
+uint32_t    apply_ini(const char* buf, uint32_t len, bool* erase_request = nullptr,
+                      bool authoritative = true);
 
 // Virtueller NCN5130 (KNX-Sekundaerinterface). ncn_ssp = LPC-SSP-Instanz (0/1),
 // die als NCN5130 (SPI-Master, LPC=Slave) modelliert wird; die andere SSP bleibt

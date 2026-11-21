@@ -989,6 +989,19 @@ void uart0_apply_pins() {
 
     uart_inst_t* inst = nullptr;
     gpio_function_t tx_func, rx_func;
+#if defined(EMU_STDIO_UART)
+    // Die CLI-UART des Boards ist tabu: weder ihre Pads noch ihr Peripheral.
+    if (tx == PICO_DEFAULT_UART_TX_PIN || tx == PICO_DEFAULT_UART_RX_PIN ||
+        rx == PICO_DEFAULT_UART_TX_PIN || rx == PICO_DEFAULT_UART_RX_PIN ||
+        (resolve_uart_pins(tx, rx, inst, tx_func, rx_func) &&
+         inst == (PICO_DEFAULT_UART == 0 ? rp2350_hw::inst0() : rp2350_hw::inst1()))) {
+        std::printf("[UART0] WARN: GP%d/GP%d bzw. uart%d gehoeren der CLI - kein Routing\n",
+                    tx, rx, PICO_DEFAULT_UART);
+        g_uart0_tx_gpio = -1;
+        g_uart0_rx_gpio = -1;
+        return;
+    }
+#endif
     if (!resolve_uart_pins(tx, rx, inst, tx_func, rx_func)) {
         std::printf("[UART0] WARN: GP%d/GP%d ist kein gueltiges RP-UART-Paar "
                     "(uart0 TX 0/12/16 RX 1/13/17; uart1 TX 4/8/20/24 RX 5/9/21/25; "
@@ -1133,8 +1146,15 @@ void uart_hw_boot_init() {
     // wodurch das Makro 'uart0' auf 0x40008000 statt die echte RP2350-uart0
     // (0x40070000) zeigen wuerde -> uart_init/uart_get_hw traefen die falsche
     // Adresse, die HW-UART0 bliebe stumm (cr/lcr_h lesen 0). Siehe rp2350_hw oben.
+    // Die CLI/stdio-UART des Boards (EMU_STDIO_UART, PICO_DEFAULT_UART) hat
+    // stdio_init_all() schon eingerichtet -> nicht erneut zuruecksetzen. Die
+    // Gast-UART0 kann dann nur das andere Peripheral nutzen.
+#if !(defined(EMU_STDIO_UART) && PICO_DEFAULT_UART == 0)
     uart_init(rp2350_hw::inst0(), 115200);
+#endif
+#if !(defined(EMU_STDIO_UART) && PICO_DEFAULT_UART == 1)
     uart_init(rp2350_hw::inst1(), 115200);
+#endif
     ++g_uart_init_exit;                  // nur erreicht, wenn beide zurueckkehrten
 }
 
@@ -2137,12 +2157,15 @@ void adc_bridge_init() {
 
 // Liefert einen 10-Bit-Sample (0..0x3FF) für LPC-ADC-Kanal `ch`.
 uint16_t adc_sample_channel(int ch) {
-    if (g_adc_ready && ch >= 0 && ch <= 3) {
-        if (!(g_adc_gpio_inited & (1u << ch))) {
-            adc_gpio_init(static_cast<uint>(26 + ch));   // ADC0..3 = GPIO26..29
-            g_adc_gpio_inited |= (1u << ch);
+    // LPC-Kanal -> RP2350-ADC-GPIO laut config (adc.<ch>=<gpio>, 26..29).
+    const int gpio = config::adc_gpio(ch);
+    if (g_adc_ready && gpio >= 26 && gpio <= 29) {
+        const unsigned in = static_cast<unsigned>(gpio - 26);  // RP-ADC-Eingang 0..3
+        if (!(g_adc_gpio_inited & (1u << in))) {
+            adc_gpio_init(static_cast<uint>(gpio));
+            g_adc_gpio_inited |= (1u << in);
         }
-        adc_select_input(static_cast<uint>(ch));
+        adc_select_input(in);
         return static_cast<uint16_t>(adc_read() >> 2);   // 12-Bit → 10-Bit
     }
     return 0x200;                                          // Mittenwert-Fallback

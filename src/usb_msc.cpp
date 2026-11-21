@@ -385,187 +385,10 @@ bool find_hex_entry(uint16_t& cluster, uint32_t& size,
 // newlib-nano stark stack-hungrig und kann in tiefen Aufrufkontexten den
 // knappen Core0-Stack sprengen (gleiche Klasse wie der fruehere CLI-Hang).
 
-// Eine vorzeichenlose Dezimalzahl am Anfang von s parsen. Liefert false, wenn
-// dort keine Ziffer steht; setzt *endp hinter die Zahl (falls endp != nullptr).
-bool cfg_parse_int(const char* s, int& out, const char** endp = nullptr) {
-    char* end = nullptr;
-    long v = std::strtol(s, &end, 10);
-    if (end == s) return false;
-    out = static_cast<int>(v);
-    if (endp) *endp = end;
-    return true;
-}
-
 void parse_config(const char* buf, uint32_t len) {
-    // CONFIG.INI ist fuer die Pin-Zuordnungen (Pinmap + Timer-Capture/Match)
-    // AUTORITATIV: vor dem Einlesen auf Default zuruecksetzen, damit ein aus der
-    // Datei ENTFERNTER (oder mit '#' auskommentierter) Eintrag wirklich
-    // verschwindet. Sonst bliebe eine alte Zuordnung (z. B. tmat.2.1) aus dem
-    // vorherigen Zustand haengen. Die vom Geraet generierte CONFIG.INI enthaelt
-    // stets alle aktiven Zuordnungen -> beim Editieren gehen keine verloren.
-    // Skalare Keys (autostart/freq/Bridges) bleiben Merge (eindeutig, kein
-    // Loesch-Problem).
-    config::reset_pin_mappings();
-
-    char line[96];
-    uint32_t i = 0;
-    while (i < len) {
-        uint32_t j = 0;
-        while (i < len && j < sizeof(line) - 1 && buf[i] != '\n') {
-            if (buf[i] != '\r') line[j++] = buf[i];
-            ++i;
-        }
-        line[j] = 0;
-        if (i < len) ++i;
-        if (line[0] == '#' || line[0] == ';' || line[0] == 0) continue;
-        char* eq = std::strchr(line, '=');
-        if (!eq) continue;
-        *eq++ = 0;
-        // Whitespace trimmen
-        while (*line == ' ' || *line == '\t') {
-            char* p = line; do { p[0] = p[1]; } while (*p++);
-        }
-        char* end = line + std::strlen(line);
-        while (end > line && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
-
-        ++g_stats.parsed_lines;
-        if (std::strncmp(line, "pin.", 4) == 0) {
-            // pin.<port>_<pin>=<rp-gpio>
-            int port = 0, pin = 0, rp = 0;
-            const char* p = nullptr;
-            if (cfg_parse_int(line + 4, port, &p) && *p == '_' &&
-                cfg_parse_int(p + 1, pin) && cfg_parse_int(eq, rp)) {
-                // Still (verbose=false): CONFIG.INI ist autoritativ + wird als
-                // Batch neu eingelesen -> etwaige GPIO-Kollisionen sind kein
-                // Nutzer-Fehler, sondern werden deterministisch aufgeloest.
-                config::set_pin_map(static_cast<uint8_t>(port * 12 + pin), rp,
-                                    /*verbose=*/false);
-            }
-        } else if (std::strncmp(line, "tcap.", 5) == 0) {
-            // tcap.<t>=<rp-gpio>
-            int t = 0, rp = 0;
-            if (cfg_parse_int(line + 5, t) && cfg_parse_int(eq, rp)) {
-                config::set_ct_capture_pin(t, rp);
-            }
-        } else if (std::strncmp(line, "tmat.", 5) == 0) {
-            // tmat.<t>.<m>=<rp-gpio>
-            int t = 0, m = 0, rp = 0;
-            const char* p = nullptr;
-            if (cfg_parse_int(line + 5, t, &p) && *p == '.' &&
-                cfg_parse_int(p + 1, m) && cfg_parse_int(eq, rp)) {
-                config::set_ct_match_pin(t, m, rp);
-            }
-        } else if (std::strcmp(line, "autostart") == 0) {
-            config::set_autostart(std::strcmp(eq, "on") == 0 ||
-                                  std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "cli_enable") == 0) {
-            config::set_cli_enabled(std::strcmp(eq, "on") == 0 ||
-                                    std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "gdb_enable") == 0) {
-            config::set_gdb_enabled(std::strcmp(eq, "on") == 0 ||
-                                    std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "serial_enable") == 0) {
-            config::set_serial_cdc_enabled(std::strcmp(eq, "on") == 0 ||
-                                           std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "uart_bridge_en") == 0) {
-            config::set_uart_bridge_enabled(std::strcmp(eq, "on") == 0 ||
-                                            std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "uart_bridge_tx") == 0) {
-            config::set_uart_bridge_tx_pin(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "uart_bridge_rx") == 0) {
-            config::set_uart_bridge_rx_pin(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "isp_enable") == 0) {
-            config::set_isp_cdc_enabled(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
-        } else if (std::strcmp(line, "isp_dtr_rts") == 0) {
-            config::set_isp_dtr_rts(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
-        } else if (std::strcmp(line, "isp_autosync") == 0) {
-            config::set_isp_autosync(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
-        } else if (std::strcmp(line, "isp_pins") == 0) {
-            config::set_isp_pins(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
-        } else if (std::strcmp(line, "reset_in") == 0) {
-            config::set_reset_in(std::strcmp(eq, "on") == 0 || std::strcmp(eq, "1") == 0);
-        } else if (std::strcmp(line, "isp_baud") == 0) {
-            config::set_isp_baud(static_cast<uint32_t>(std::strtoul(eq, nullptr, 0)));
-        } else if (std::strcmp(line, "uart0_cdc") == 0) {
-            config::set_uart0_cdc_enabled(std::strcmp(eq, "on") == 0 ||
-                                          std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "uart0_tx") == 0) {
-            config::set_uart0_tx_gpio(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "uart0_rx") == 0) {
-            config::set_uart0_rx_gpio(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "i2c_bridge_en") == 0) {
-            config::set_i2c_bridge_enabled(std::strcmp(eq, "on") == 0 ||
-                                           std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "i2c_bridge_inst") == 0) {
-            config::set_i2c_bridge_instance(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "i2c_bridge_sda") == 0) {
-            config::set_i2c_bridge_sda_pin(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "i2c_bridge_scl") == 0) {
-            config::set_i2c_bridge_scl_pin(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "i2c_bridge_hz") == 0) {
-            config::set_i2c_bridge_hz(static_cast<uint32_t>(std::atol(eq)));
-        } else if (std::strcmp(line, "spi_bridge_en") == 0) {
-            config::set_spi_bridge_enabled(std::strcmp(eq, "on") == 0 ||
-                                           std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "spi_bridge_inst") == 0) {
-            config::set_spi_bridge_instance(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "spi_bridge_lpc") == 0) {
-            config::set_spi_bridge_lpc(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "spi_bridge_sck") == 0) {
-            config::set_spi_bridge_sck_pin(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "spi_bridge_mosi") == 0) {
-            config::set_spi_bridge_mosi_pin(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "spi_bridge_miso") == 0) {
-            config::set_spi_bridge_miso_pin(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "spi_bridge_hz") == 0) {
-            config::set_spi_bridge_hz(static_cast<uint32_t>(std::atol(eq)));
-        } else if (std::strcmp(line, "adc_bridge_en") == 0) {
-            config::set_adc_bridge_enabled(std::strcmp(eq, "on") == 0 ||
-                                           std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "ncn_en") == 0) {
-            config::set_ncn_enabled(std::strcmp(eq, "on") == 0 ||
-                                    std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "ncn_ssp") == 0) {
-            config::set_ncn_ssp(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "ncn_rx_pin") == 0) {
-            config::set_ncn_rx_pin(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "ncn_tx_pin") == 0) {
-            config::set_ncn_tx_pin(static_cast<int>(std::atol(eq)));
-        } else if (std::strcmp(line, "ncn_loopback") == 0) {
-            config::set_ncn_loopback(std::strcmp(eq, "on") == 0 ||
-                                     std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "tcap_pio") == 0) {
-            config::set_tcap_pio(std::strcmp(eq, "on") == 0 ||
-                                 std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "tmatch_pio") == 0) {
-            config::set_tmatch_pio(std::strcmp(eq, "on") == 0 ||
-                                   std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "tmatch_delay") == 0) {
-            config::set_tmatch_delay_us(static_cast<uint32_t>(std::strtoul(eq, nullptr, 0)));
-        } else if (std::strcmp(line, "wfi_pin_wakeup") == 0) {
-            config::set_wfi_pin_wakeup(std::strcmp(eq, "on") == 0 ||
-                                       std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "primask_shadow") == 0) {
-            config::set_primask_shadow(std::strcmp(eq, "on") == 0 ||
-                                       std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "app_start") == 0) {
-            config::set_app_start_addr(
-                static_cast<uint32_t>(std::strtoul(eq, nullptr, 0)));
-        } else if (std::strcmp(line, "desc_addr") == 0) {
-            config::set_descriptor_addr(
-                static_cast<uint32_t>(std::strtoul(eq, nullptr, 0)));
-        } else if (std::strcmp(line, "autodesc") == 0) {
-            config::set_autodesc(std::strcmp(eq, "on") == 0 ||
-                                 std::strcmp(eq, "1")  == 0);
-        } else if (std::strcmp(line, "flash_erase") == 0 ||
-                   std::strcmp(line, "erase") == 0) {
-            // Loescht den gesamten Firmware-Slot, bevor eine evtl. ebenfalls
-            // abgelegte BOOT.HEX angewendet wird. Ohne diesen Schluessel wird
-            // BOOT.HEX additiv (mergend) in den Slot geschrieben.
-            g_erase_request = (std::strcmp(eq, "on") == 0 ||
-                               std::strcmp(eq, "1")  == 0);
-        }
-    }
+    // Parser liegt in config::apply_ini() (auch fuer Board-Profil und
+    // INI-Import-Sektor genutzt). flash_erase=on setzt g_erase_request.
+    g_stats.parsed_lines += config::apply_ini(buf, len, &g_erase_request);
 }
 
 // FNV-1a-Hash ueber den gesamten Volume-Inhalt. Dient als Aenderungs-Detektor:
@@ -786,8 +609,15 @@ void build_config_ini(char* buf, uint32_t cap, uint32_t& out_len) {
     }
     A("\n");
 
-    A("# --- ADC-Bridge (LPC-ADC 0..3 -> RP2350 ADC an GP26..29) -------\n");
-    A("adc_bridge_en=%s\n\n", config::adc_bridge_enabled() ? "on" : "off");
+    A("# --- ADC-Bridge (LPC-ADC -> RP2350 ADC an GP26..29) ------------\n");
+    A("adc_bridge_en=%s\n", config::adc_bridge_enabled() ? "on" : "off");
+    A("# adc.<lpc-kanal>=<gpio 26..29 | -1>  (Default AD0..3 -> GP26..29)\n");
+    {
+        static const int8_t def[8] = { 26, 27, 28, 29, -1, -1, -1, -1 };
+        for (int c = 0; c < 8; ++c)
+            if (config::adc_gpio(c) != def[c]) A("adc.%d=%d\n", c, config::adc_gpio(c));
+    }
+    A("\n");
 
     A("# --- Virtueller NCN5130 (KNX-Sekundaerinterface am LPC-SSP) -----\n");
     A("# ncn_ssp: 0=SSP0,1=SSP1 (NCN=SPI-Master, LPC=Slave). rx/tx_pin: Bus-GPIOs.\n");
