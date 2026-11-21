@@ -308,12 +308,40 @@ void cmd_status() {
                             static_cast<unsigned long>(emitted), static_cast<unsigned long>(skip[0]),
                             static_cast<unsigned long>(skip[1]), static_cast<unsigned long>(skip[2]),
                             static_cast<unsigned long>(skip[3]));
+            {
+                uint32_t cn, co, hn, ha, hm, ta, tm;
+                peripherals::ct_rx_debug(i, cn, co, hn, ha, hm, ta, tm);
+                uint32_t qq, qp, qd, qf, qm;
+                peripherals::ct_capq_debug(i, qq, qp, qd, qf, qm);
+                uint32_t tcn, tcl; peripherals::ct_tccomp_debug(i, tcn, tcl);
+                if (tcn) std::printf("  TC-Latenzausgleich: n=%lu letzt=+%lu Ticks\n",
+                                     static_cast<unsigned long>(tcn), static_cast<unsigned long>(tcl));
+                if (qq || qm)
+                    std::printf("  Capture-Queue: eingereiht=%lu max-Tiefe=%lu verworfen=%lu Notfall-Flush=%lu Matches-zurueckgehalten=%lu\n",
+                                static_cast<unsigned long>(qq), static_cast<unsigned long>(qp),
+                                static_cast<unsigned long>(qd), static_cast<unsigned long>(qf),
+                                static_cast<unsigned long>(qm));
+                if (cn || hn)
+                    std::printf("  Capture: n=%lu ueberschrieben=%lu | Gast-Handler: n=%lu mittel=%lu max=%lu us, Traps mittel=%lu max=%lu\n",
+                                static_cast<unsigned long>(cn), static_cast<unsigned long>(co),
+                                static_cast<unsigned long>(hn), static_cast<unsigned long>(ha),
+                                static_cast<unsigned long>(hm), static_cast<unsigned long>(ta),
+                                static_cast<unsigned long>(tm));
+            }
             uint32_t ln, lavg, lmax, llast;
             peripherals::ct_lat_debug(i, ln, lavg, lmax, llast);
             if (ln)
                 std::printf("  IRQ->MR0-Write nach Reset: n=%lu mittel=%lu max=%lu letzt=%lu Ticks\n",
                             static_cast<unsigned long>(ln), static_cast<unsigned long>(lavg),
                             static_cast<unsigned long>(lmax), static_cast<unsigned long>(llast));
+            if (ln) {
+                uint32_t sa[3], sm[3];
+                peripherals::ct_lat_split(i, sa, sm);
+                std::printf("    davon Erkennung=%lu/%lu  Injektion=%lu/%lu  Handler=%lu/%lu us (mittel/max)\n",
+                            static_cast<unsigned long>(sa[0]), static_cast<unsigned long>(sm[0]),
+                            static_cast<unsigned long>(sa[1]), static_cast<unsigned long>(sm[1]),
+                            static_cast<unsigned long>(sa[2]), static_cast<unsigned long>(sm[2]));
+            }
             for (int m = 0; m < 4; ++m) {
                 uint32_t pc, fifo, po, poe;
                 if (pio_glue::tx_debug(peripherals::ct_tx_handle(i, m), pc, fifo, po, poe))
@@ -536,7 +564,7 @@ constexpr Word TOP[] = {
     {"gdb","gdb"}, {"bp","bp"}, {"regs","regs"}, {"mem","mem"},
     {"pio","pio"}, {"swd","swd"}, {"cdc","cdc"}, {"gpio","gpio"},
     {"uart","uart"}, {"i2c","i2c"}, {"isp","isp"}, {"resetpin","resetpin"},
-    {"ncn","ncn"},
+    {"ncn","ncn"}, {"ct","ct"},
 };
 
 // Sub-Optionen je Befehl (kanonisch + Aliase).
@@ -1148,6 +1176,12 @@ void handle_command(char* line) {
         return;
     }
 
+    if (std::strcmp(tokens[0], "ct") == 0 && n >= 2 && std::strcmp(tokens[1], "trace") == 0) {
+        // ct trace <timer 0..3>: Aufzeichnung starten; ct trace: ausgeben + stoppen
+        if (n >= 3) { peripherals::ct_trace_start(std::atoi(tokens[2]), n >= 4 && !std::strcmp(tokens[3], "tx")); std::puts("[CT] Trace laeuft"); }
+        else        peripherals::ct_trace_dump();
+        return;
+    }
     if (std::strcmp(tokens[0], "pio") == 0 && n >= 2) {
         if (std::strcmp(tokens[1], "capture") == 0 && n >= 4) {
             // Flanken-Logger ueber das Zeitstempel-Programm (wie beim KNX-

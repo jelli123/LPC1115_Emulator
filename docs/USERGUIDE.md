@@ -495,6 +495,16 @@ Wichtig:
   dann ein zweites Mal die App als `BOOT.HEX` ohne `flash_erase` ablegen.
 * Alternativ: nur den Bootloader laden und die App per **OTA über den
   KNX-Bus** in den emulierten Bootloader programmieren (Abschnitt 7).
+* **Für OTA/Bus-Updater Bootloader ≥ v1.20 (sblib 2.10) verwenden.** Der
+  ältere `bootloader_release_(lpc11xx)_v1.11_libv2.02.hex` empfängt zwar, sendet
+  im Emulator aber zu langsam (verstümmelte ACKs, Updater meldet „0 Device(s)“).
+  `examples/bootloader_release_(lpc11xx)_v1.20_libv2.10.hex` ist ein lokaler
+  Release-Build (11,5 KB, App-Start `0x3000`) und mit Selfbus-Updater 1.20
+  getestet: Erkennung im Programmiermodus, UID-Unlock, Flashen von 32 KB
+  (~110 B/s) und Start der App. Selbst bauen: Release-Konfiguration aus
+  `software-arm-lib/firmware_updater/bootloader` mit der MCUXpresso-Toolchain,
+  **mit** `-flto` (Compile und Link, `-Os`) – ohne LTO wird er ~12,9 KB groß
+  und die App müsste ab `0x3400` liegen.
 
 ---
 
@@ -877,6 +887,7 @@ Reset startet also den ganzen Emulator neu (Bootdauer im ms-Bereich).
 | KNX-RX leer                               | Pinmap und sblib-Konstanten gegenchecken           |
 | Zweite App ersetzt Bootloader nicht / alte Reste | Laden ist **additiv** – vor Vollersatz `erase`     |
 | Bootloader springt nicht in App           | `app_start` ≠ `applicationFirstAddress`, oder `autodesc=off` – Log `[EMU] Boot-Descriptor …` prüfen |
+| Updater: „0 Device(s) in bootloader/programming mode“, ACKs verstümmelt | Bootloader v1.11 (sblib 2.02) sendet im Emulator zu langsam – Bootloader ≥ v1.20 laden (Abschnitt 4d) |
 | `upload` „kein XMODEM-Sender erkannt"     | Transfer nicht binnen 30 s gestartet, oder falscher COM-Port |
 
 ---

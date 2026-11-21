@@ -39,6 +39,7 @@ bool mmio_read8 (uint32_t addr, uint8_t&  out);
 // Wortzugriff auf die Timer CT16/CT32 in einem Schritt (LDR/STR); false = keine
 // Timer-Adresse (dann byteweise ueber mmio_read8/mmio_write8).
 bool ct_word_access(uint32_t addr, bool is_load, uint32_t& value);
+bool gpio_data_read(uint32_t addr, uint32_t size, uint32_t& value);   // GPIO-DATA in einem Durchlauf
 bool mmio_write8(uint32_t addr, uint8_t   val);
 
 // Aktuelle resultierende CPU-Frequenz, die per SYSCON-Schreibvorgängen
@@ -136,6 +137,14 @@ void ct_advance_debug(uint32_t& underflow_guards, uint64_t& max_ticks);
 void ct_tx_debug(int idx, uint32_t& emitted, uint32_t skip[4]);
 int  ct_tx_handle(int idx, int m);
 // Verspaetung (TC-Ticks) des ersten MR0-Writes nach Reset-Match mit IRQ.
+void ct_lat_split(int idx, uint32_t avg[3], uint32_t max[3]);   // Erkennung/Injektion/Handler [us]
+void ct_note_injected(uint8_t irq);
+void ct_note_returned(int irq);
+void ct_trace_start(int idx, bool wait_tx);
+void ct_tccomp_debug(int idx, uint32_t& n, uint32_t& last);
+void ct_trace_dump();
+void ct_capq_debug(int idx, uint32_t& queued, uint32_t& peak, uint32_t& drop, uint32_t& flush, uint32_t& deferred);
+void ct_rx_debug(int idx, uint32_t& cap_n, uint32_t& overrun, uint32_t& hn, uint32_t& havg, uint32_t& hmax, uint32_t& tavg, uint32_t& tmax);
 void ct_lat_debug(int idx, uint32_t& n, uint32_t& avg, uint32_t& max, uint32_t& last);   // Match-PIO-Handle des Kanals (-1 = keins)
 void ct_debug(int idx, bool& enabled, uint32_t& pre, uint32_t& mr0,
               uint32_t& mcr, uint32_t& tc, uint32_t& ir, uint32_t& pends,

@@ -4,6 +4,7 @@
 #include "lpc_irqs.h"
 #include "emulator.h"
 #include "target_halt.h"
+#include "peripherals.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -198,8 +199,9 @@ extern "C" void __not_in_flash_func(pendsv_inject_c)(uint32_t* r4_r11) {
     // SysTick-Exception hat Vorrang (hoehere Exception-Prioritaet als IRQs) und
     // wird ueber denselben Frame-Mechanismus injiziert. Handler = Gast-vtable[15].
     if (g_systick_pending.exchange(false, std::memory_order_acq_rel)) {
-        auto* vt = reinterpret_cast<uint32_t*>(emulator::vtable_base());
-        uint32_t h = vt[15];
+        // vtable[15] zeigt auf den Host-Shim; der eigentliche Gast-Handler ist gemerkt.
+        uint32_t h = emulator::guest_systick_handler();
+        if ((h & ~1u) == 0u) h = reinterpret_cast<uint32_t*>(emulator::vtable_base())[15];
         if (h != 0u && (h & ~1u) != 0u && g_inject_depth < MAX_DEPTH) {
             inject_frame(h, PRIO_SYSTICK, -1);
             return;   // ein Frame pro PendSV-Lauf; IRQs folgen beim naechsten
@@ -227,12 +229,15 @@ extern "C" void __not_in_flash_func(pendsv_inject_c)(uint32_t* r4_r11) {
     }
 
     inject_frame(handler, vnvic::priority(static_cast<uint8_t>(n)), n);
+    peripherals::ct_note_injected(static_cast<uint8_t>(n));
     // KEIN sofortiges Tail-Chain-Re-Pend hier: weitere pending IRQs werden erst
     // beim Ruecksprung DIESES Handlers (note_injected_return) geliefert. Ein
     // sofortiges PENDSVSET wuerde jetzt ohnehin am Tiefen-Gate abprallen.
 }
 
 void __not_in_flash_func(note_injected_return)() {
+    if (g_inject_depth > 0 && g_inject_depth <= MAX_DEPTH)
+        peripherals::ct_note_returned(g_active_irq[g_inject_depth - 1]);
     if (g_inject_depth > 0) --g_inject_depth;
     // Einen evtl. noch pendenden IRQ nachliefern, der den jetzt wieder laufenden
     // Kontext unterbrechen darf (Tail-Chaining). PENDSVSET ist atomar/kontextfrei.

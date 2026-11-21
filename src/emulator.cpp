@@ -35,6 +35,12 @@ std::atomic<uint32_t>        g_start_count{0};
 // reale Core1-SysTick feuert stattdessen isr_systick_shim, der die zeitbasierten
 // LPC-Modelle treibt und dann diesen Gast-Handler aufruft. 0 = keiner.
 std::atomic<uint32_t>        g_guest_systick_handler{0};
+// true = Gast-SysTick-Handler unprivilegiert injizieren statt aus dem Shim zu
+// rufen. Noetig nach dem Bootloader->App-Handover: Der App-Code bleibt pristine
+// (nicht reloziert), sein Handler greift auf rohe LPC-RAM-Adressen (0x1000xxxx)
+// zu. Privilegiert aus dem Shim gerufen, liefe das ohne MPU-Trap ins XIP-Flash
+// des RP2350 - systemTime bliebe 0 (sblib: while(!millis()) haengt ewig).
+std::atomic<bool>            g_guest_systick_inject{false};
 
 // PC-Sampler (Diagnose): der reale Core1-SysTick unterbricht den Gast periodisch;
 // im Handler-Mode liegt der unterbrochene Gast-PC im gestackten PSP-Frame
@@ -215,7 +221,9 @@ extern "C" void __not_in_flash_func(isr_systick_shim)() {
     uint32_t due = peripherals::systick_take_guest_ticks();
     if (due) {
         uint32_t h = g_guest_systick_handler.load(std::memory_order_relaxed);
-        if ((h & ~1u) != 0u) {
+        if ((h & ~1u) != 0u && g_guest_systick_inject.load(std::memory_order_relaxed)) {
+            irq_inject::pend_systick();     // ein Tick je Shim-Lauf (Thread-Mode, getrappt)
+        } else if ((h & ~1u) != 0u) {
             auto fn = reinterpret_cast<void(*)()>(h);
             if (due > 8u) due = 8u;         // Nachhol-Deckel (nach langem Stall)
             for (uint32_t i = 0; i < due; ++i) fn();
@@ -496,6 +504,7 @@ void core1_main() {
             // der die LPC-Timer treibt und dann den Gast-Handler aufruft. Ohne das
             // liefe ein WFI-idlender Interrupt-Blink nur einmal (Timer stand still).
             g_guest_systick_handler.store(dst[15], std::memory_order_relaxed);
+            g_guest_systick_inject.store(false, std::memory_order_relaxed);
             dst[15] = reinterpret_cast<uint32_t>(&isr_systick_shim);
 
             // Opt-in-Patches, die Gast-Instruktionen auf SVC-Traps umlenken
@@ -738,6 +747,7 @@ uint32_t __not_in_flash_func(guest_ram_base)() {
     return reinterpret_cast<uint32_t>(g_guest_ram);
 }
 
+uint32_t __not_in_flash_func(guest_systick_handler)() { return g_guest_systick_handler.load(std::memory_order_relaxed); }
 uint32_t __not_in_flash_func(vtable_base)() {
     uint32_t v = g_vtable_base.load(std::memory_order_acquire);
     return v ? v : reinterpret_cast<uint32_t>(g_firmware_image);
@@ -807,6 +817,27 @@ void activate_bootloader_handover() {
     for (uint32_t i = 1; i < 48; ++i) {
         dst[i] = relocate_vector(dst[i]);
     }
+    // RAM-Literale der Applikation relozieren (wie beim Loader fuer den
+    // Bootloader). Bis hierher blieb der App-Bereich pristine, damit die
+    // Bootloader-CRC passt; die Pruefung ist gelaufen. Ohne Relokation trappte
+    // jeder RAM-Zugriff der App ueber ein Literal (Bus-Handler ~150 us, kein
+    // ACK). Grenze: Ende laut Boot-Descriptor vor der App, sonst Flash-Ende.
+    {
+        uint32_t end = emulator::LPC_LOAD_MAX_SIZE;
+        if (app_off >= 0x100u) {
+            uint32_t d_start, d_end;
+            std::memcpy(&d_start, img + app_off - 0x100u, 4);
+            std::memcpy(&d_end,   img + app_off - 0x100u + 4u, 4);
+            if (d_start == app_off && d_end > app_off && d_end < emulator::LPC_LOAD_MAX_SIZE)
+                end = d_end + 1u;
+        }
+        auto pr = hex_patcher::relocate_ram_refs(img + app_off, end - app_off,
+                                                 0x1000'0000u, emulator::LPC_GUEST_RAM_SIZE,
+                                                 reinterpret_cast<uint32_t>(g_guest_ram));
+        std::printf("[EMU] Handover: %u/%u App-Woerter relociert (0x%04lx-0x%04lx)\n",
+                    static_cast<unsigned>(pr.patched_words), static_cast<unsigned>(pr.scanned_words),
+                    static_cast<unsigned long>(app_off), static_cast<unsigned long>(end - 1u));
+    }
     // System-Fault-Handler + PendSV auf unsere Host-Handler setzen.
     dst[3]  = reinterpret_cast<uint32_t>(&isr_hardfault);
     dst[4]  = reinterpret_cast<uint32_t>(&isr_memmanage);
@@ -817,6 +848,7 @@ void activate_bootloader_handover() {
     // SysTick (Slot 15): Host-Shim wie im Loader (treibt LPC-Timer + ruft den
     // Applikations-SysTick-Handler). Der relozierte App-Handler wird gemerkt.
     g_guest_systick_handler.store(dst[15], std::memory_order_relaxed);
+    g_guest_systick_inject.store(true, std::memory_order_relaxed);   // App-Code pristine
     dst[15] = reinterpret_cast<uint32_t>(&isr_systick_shim);
     // SVC-Dispatcher nur, wenn ein opt-in-Patch (WFI/PRIMASK) aktiv ist.
     // Hinweis: In der zweistufigen Variante bleibt der App-Bereich pristine

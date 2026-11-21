@@ -239,6 +239,74 @@ struct TrapTimer {
     }
 };
 
+// Thumb-1 LDMIA/STMIA (0xC000..0xCFFF) auf eine nicht relozierte Gast-Adresse.
+// Typisch fuer per LTO uebersetzte Bootloader (Selfbus v1.20): Die Vektortabelle
+// der Applikation wird per "stmia r3!, {r6}" an 0x10000000 kopiert, wobei die
+// Adresse berechnet ist (movs/lsls) und daher von hex_patcher nicht reloziert
+// werden kann. Bedient LPC-Flash (lesend), LPC-SRAM und MMIO wortweise.
+namespace {
+bool __not_in_flash_func(ldm_stm_word)(uint32_t addr, bool load, uint32_t& v) {
+    if (addr & 3u) return false;
+    const uint32_t lb = emulator::load_base();
+    const uint32_t rb = emulator::guest_ram_base();
+    uint8_t* host = nullptr;
+    if (addr < emulator::LPC_LOAD_MAX_SIZE) {
+        if (!load) return true;                                   // Flash: Schreiben ignorieren
+        host = reinterpret_cast<uint8_t*>(lb + addr);
+    } else if (addr >= 0x1000'0000u && addr + 4u <= 0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE) {
+        host = reinterpret_cast<uint8_t*>(rb + (addr - 0x1000'0000u));
+    }
+    if (host) {
+        if (load) std::memcpy(&v, host, 4); else std::memcpy(host, &v, 4);
+        return true;
+    }
+    if (peripherals::ct_word_access(addr, load, v)) return true;  // Timer: ganzes Register
+    bool ok = true;
+    if (load) {
+        uint8_t b[4]{};
+        for (int i = 0; i < 4 && ok; ++i) ok = peripherals::mmio_read8(addr + i, b[i]);
+        v = b[0] | (b[1] << 8) | (b[2] << 16) | (static_cast<uint32_t>(b[3]) << 24);
+    } else {
+        for (int i = 0; i < 4 && ok; ++i) ok = peripherals::mmio_write8(addr + i, static_cast<uint8_t>(v >> (8 * i)));
+    }
+    return ok;
+}
+
+bool __not_in_flash_func(emulate_ldm_stm)(trap_decoder::StackedFrame* frame, uint32_t* r4_r11,
+                                          uint32_t& guest_sp) {
+    const uint16_t op = *reinterpret_cast<const uint16_t*>(frame->pc & ~1u);
+    if ((op & 0xF000u) != 0xC000u) return false;
+    const bool load = (op & 0x0800u) != 0;
+    const uint8_t rn = static_cast<uint8_t>((op >> 8) & 7u);
+    const uint32_t list = op & 0xFFu;
+    if (!list) return false;
+    uint32_t* prn = trap_decoder::reg_ptr(frame, r4_r11, &guest_sp, rn);
+    if (!prn) return false;
+    uint32_t addr = *prn;
+    peripherals::begin_access();
+    for (uint8_t r = 0; r < 8; ++r) {
+        if (!(list & (1u << r))) continue;
+        uint32_t* pr = trap_decoder::reg_ptr(frame, r4_r11, &guest_sp, r);
+        if (!pr) return false;
+        uint32_t v = load ? 0u : *pr;
+        if (!ldm_stm_word(addr, load, v)) return false;
+        if (load) *pr = v;
+        addr += 4u;
+    }
+    // Writeback. War die Basis eine rohe LPC-RAM-Adresse, reloziert zurueckgeben:
+    // Vergleichswerte (Schleifenende) im Literal-Pool hat hex_patcher ebenfalls
+    // reloziert - sonst endete z. B. die Vektortabellen-Kopie nie.
+    if (addr >= 0x1000'0000u && addr <= 0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE)
+        addr = emulator::guest_ram_base() + (addr - 0x1000'0000u);
+    if (!load || !(list & (1u << rn))) *prn = addr;
+    if (!load) peripherals::on_post_write_hook();
+    frame->pc += 2u;
+    SCB->CFSR = SCB->CFSR;
+    ++faultsys::g_stats.mem_traps;
+    return true;
+}
+} // namespace
+
 extern "C" void __not_in_flash_func(handle_memfault_c)(trap_decoder::StackedFrame* frame,
                                   uint32_t* r4_r11_lr) {
     using namespace trap_decoder;
@@ -298,6 +366,7 @@ extern "C" void __not_in_flash_func(handle_memfault_c)(trap_decoder::StackedFram
     const uint32_t tp0 = DWT->CYCCNT;
     const bool decoded = decode_mem_access(frame, r4_r11, guest_sp, acc);
     const uint32_t tp1 = DWT->CYCCNT;
+    if (!decoded && emulate_ldm_stm(frame, r4_r11, guest_sp)) return;
     if (!decoded) {
         ++faultsys::g_stats.real_faults;
         faultsys::g_stats.last_fault_pc   = frame->pc;
@@ -431,6 +500,15 @@ extern "C" void __not_in_flash_func(handle_memfault_c)(trap_decoder::StackedFram
     // Images und loesen einen Watchdog-Reset aus.
     const uint32_t acc_bytes = (acc.size == AccessSize::B) ? 1u
                              : (acc.size == AccessSize::H) ? 2u : 4u;
+    // Gemischte Zeigerrechnung: relozierter RAM-Zeiger + Offset, der die rohe
+    // LPC-RAM-Basis 0x10000000 voraussetzt (LTO-Bootloader v1.20: Quelle der
+    // Vektortabellen-Kopie = r3 + (App-Start - 0x10000000)). Die Adresse liegt
+    // dann im (fuer den Gast gesperrten) XIP-Bereich; um das Relokationsdelta
+    // zurueckgerechnet ergibt sich die gemeinte LPC-Adresse.
+    if (acc.address >= 0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE && acc.address < 0x2000'0000u) {
+        const uint32_t t = acc.address - (emulator::guest_ram_base() - 0x1000'0000u);
+        if (t + acc_bytes <= emulator::LPC_LOAD_MAX_SIZE) acc.address = t;
+    }
     if (acc.address + acc_bytes <= emulator::LPC_LOAD_MAX_SIZE) {   // kein Lesen hinter das Image
         if (acc.is_load) {
             auto* img = reinterpret_cast<const uint8_t*>(emulator::load_base());
@@ -560,6 +638,7 @@ extern "C" void __not_in_flash_func(handle_memfault_c)(trap_decoder::StackedFram
             }
             case AccessSize::W: {
                 if (peripherals::ct_word_access(acc.address, true, value)) break;
+                if (peripherals::gpio_data_read(acc.address, 4u, value)) break;
                 uint8_t b[4]{};
                 for (int i = 0; i < 4 && ok; ++i)
                     ok = peripherals::mmio_read8(acc.address + i, b[i]);
@@ -640,6 +719,9 @@ extern "C" void __not_in_flash_func(handle_memfault_c)(trap_decoder::StackedFram
             for (int i = 0; i < 8; ++i) {
                 if (r4_r11[i] == sp_raw) r4_r11[i] = sp_reloc;
             }
+            // LTO-Code (Bootloader v1.20) haelt den StackTop in r0..r3/r12.
+            uint32_t* lo[5] = { &frame->r0, &frame->r1, &frame->r2, &frame->r3, &frame->r12 };
+            for (uint32_t* p : lo) if (*p == sp_raw) *p = sp_reloc;
         }
     }
 

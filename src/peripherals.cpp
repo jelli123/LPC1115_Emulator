@@ -1297,6 +1297,22 @@ void __not_in_flash_func(uart0_write_reg)(uint32_t addr, uint8_t val) {
 // Ein an die Match-PIO gegebener Puls, absolute Zeiten in ns (time_us_64-Basis).
 struct TxPulse { uint64_t base, start, end; };   // base = Periodenbeginn
 
+// Ereignis-Trace des Bus-Timers (CLI 'ct trace'): was der Gast wann sieht/schreibt.
+struct CtTrace { uint32_t t; uint8_t type; uint8_t tm; uint16_t _r; uint32_t a, b; };
+constexpr uint32_t CT_TRACE_N = 64;
+CtTrace  g_ct_trace[CT_TRACE_N];
+volatile uint32_t g_ct_trace_n = 0;      // Anzahl Eintraege
+volatile int      g_ct_trace_irq = -1;   // IRQ-Nummer des aufgezeichneten Timers (-1 = aus)
+volatile bool     g_ct_trace_wait_tx = false;   // erst ab dem ersten Sendepuls aufzeichnen
+inline void __not_in_flash_func(ct_tr)(uint8_t irq, uint8_t type, uint32_t a, uint32_t b) {
+    if (static_cast<int>(irq) != g_ct_trace_irq) return;
+    if (g_ct_trace_wait_tx) { if (type != 16) return; g_ct_trace_wait_tx = false; }
+    const uint32_t n = g_ct_trace_n;
+    if (n >= CT_TRACE_N) return;
+    g_ct_trace[n] = { cyccnt(), type, 0, 0, a, b };
+    g_ct_trace_n = n + 1;
+}
+
 struct CtModel {
     bool     enabled;
     uint32_t pre;
@@ -1335,6 +1351,14 @@ struct CtModel {
     // Verspaetung (TC-Ticks) beim ersten MR-Schreiben nach einem Periodenreset
     // mit Interrupt - zeigt, wie lange Match-IRQ + Handler im Emulator brauchen.
     uint32_t lat_n, lat_max, lat_last; uint64_t lat_sum; bool lat_armed;
+    // Aufteilung der Latenz: Erkennen des Matches (Modell) -> Injektion (PendSV)
+    // -> MR0-Write im Gast-Handler. Zeitstempel in us (fast_time_us).
+    uint64_t lat_t_pend, lat_t_inj;
+    uint32_t cap_n, cap_overrun;      // Capture-Ereignisse / davon CR0 ueberschrieben, bevor IR gelesen
+    uint64_t hdl_t0; uint32_t hdl_n, hdl_max; uint64_t hdl_sum;   // Laufzeit des Gast-Handlers [us]
+    uint32_t hdl_ep0; uint64_t hdl_traps; uint32_t hdl_traps_max;   // MMIO-Traps je Handlerlauf
+    uint64_t lat_sum_det, lat_sum_inj, lat_sum_hdl;
+    uint32_t lat_max_det, lat_max_inj, lat_max_hdl;
     uint64_t adv_now_us;   // time_us_64 des letzten ct_advance (Schnellpfad)
     uint64_t quiet_until_us;   // bis dahin kein Timer-Ereignis (0 = unbekannt)
     uint32_t ir_unseen;        // Match-Flags, gesetzt nach dem letzten IR-Lesen
@@ -1343,6 +1367,23 @@ struct CtModel {
     uint32_t quiet_hz;         // Takt, fuer den quiet_until_us gilt
     uint32_t adv_epoch;    // Trap-Epoche des letzten Fortschreibens aus ct_read/ct_write
     TxPulse  txq[4][2];      // an die Match-PIO gegebene Pulse (laufend, wartend)
+    // Capture-Queue (KNX-Empfang mit langsamem Gast-Handler): Flanken, die
+    // eintreffen, solange der Handler dieses Timers laeuft oder das vorige
+    // Capture noch nicht gesehen wurde, werden mit Zeitstempel zurueckgehalten
+    // und einzeln nachgeliefert (CR0 = TC zum Flankenzeitpunkt). Match-
+    // Interrupts, die zeitlich NACH einer zurueckgehaltenen Flanke liegen,
+    // werden ebenfalls zurueckgehalten, damit der Gast die Ereignisse in der
+    // echten Reihenfolge sieht (Bit-Flanke vor Byte-Timeout).
+    // TC-Latenzausgleich: Zeitpunkt des letzten TC-Lesens im laufenden Handler.
+    uint64_t tc_rd_us; bool tc_rd_valid; uint32_t tc_comp_n, tc_comp_last;
+    static constexpr uint8_t CAPQ = 16;
+    uint64_t capq[CAPQ];       // Flankenzeitpunkte [us], aeltester zuerst
+    uint8_t  capq_n;
+    uint8_t  capq_peak;        // Diagnose: groesste Tiefe
+    uint32_t capq_queued, capq_drop, capq_flush;
+    uint32_t ir_deferred;      // zurueckgehaltene Match-Flags (Bit 0..3)
+    uint64_t def_t;            // Zeitpunkt des fruehesten zurueckgehaltenen Matches
+    uint32_t def_n;            // Diagnose: Anzahl zurueckgehaltener Matches
     uint8_t  txn[4];
     TxPulse  echo_last[4];   // zuletzt beendeter Puls (Echo-Zuordnung)
 };
@@ -1460,13 +1501,16 @@ bool __not_in_flash_func(tx_emit_rel)(CtModel& c, int m, uint64_t ref, const TxP
     if (!pio_glue::tx_emit(c.tx_handle[m], static_cast<uint32_t>(d > 0 ? d : 0),
                            static_cast<uint32_t>(w > 0 ? w : 0))) { ++c.dbg_tx_skip[3]; return false; }
     ++c.dbg_tx_emit;
+    ct_tr(c.irq_num, 16, static_cast<uint32_t>(p.start / 1000u), static_cast<uint32_t>(p.end / 1000u));
     return true;
 }
 
 // Plan txq[m] vollstaendig neu an die PIO geben (Pegel bleibt erhalten).
 void __not_in_flash_func(tx_rebuild)(CtModel& c, int m, uint64_t now_ns) {
     const int h = c.tx_handle[m];
-    bool running = c.txn[m] && c.txq[m][0].start <= now_ns;
+    // Mit 8 us Reserve: die PIO kann die Flanke schon knapp vor dem geplanten
+    // Zeitpunkt ausgegeben haben - ein Neuaufbau als "wartend" schnitte den Puls.
+    bool running = c.txn[m] && c.txq[m][0].start <= now_ns + 8000u;
     // Endet der laufende Puls ohnehin gleich, sein Ende abwarten: ein Anhalten der
     // SM kurz vor der fallenden Flanke liesse ihn sonst bis zu 8 us zu lang stehen.
     if (running && c.txq[m][0].end <= now_ns + 9000u) {
@@ -1515,8 +1559,12 @@ void __not_in_flash_func(ct_tx_schedule)(CtModel& c, int m) {
         if ((c.mcr >> (r * 3)) & 0x2u) { reset_ch = static_cast<uint32_t>(r); break; }
 
     // Ohne Reset-Kanal kein Periodenmodell -> Pin an die Software-PWM zurueck.
+    // sblib schreibt MCR in zwei Schritten (erst 0, dann Reset|Int): ein kurz
+    // fehlender Reset-Kanal ist nur ein Zwischenzustand. Laufende/geplante Pulse
+    // dann unveraendert lassen - Parken zoege den Pin mitten im Puls auf low.
     if (pwm && reset_ch > 3) {
         ++c.dbg_tx_skip[0];
+        if (c.txn[m]) return;
         if (c.tx_handle[m] >= 0) ct_tx_park(c, m);
         return;
     }
@@ -1660,6 +1708,7 @@ void __not_in_flash_func(ct_advance)(CtModel& c) {
     // die Sub-Tick-Restzeit erhalten bleibt (sonst bei schnellem Pollen mit
     // grossem Prescaler kein Fortschritt). Bei ticks==0 last_us unveraendert.
     if (!ticks) { ct_update_pwm(c); return; }
+    const uint64_t t_base = c.last_us;   // Zeitpunkt von tc0 (fuer Match-Zeitpunkte)
     c.last_us += (hz == denom) ? ticks : (ticks * denom) / hz;
     if (ticks > g_ct_max_ticks) g_ct_max_ticks = ticks;   // Diagnose
 
@@ -1723,13 +1772,23 @@ void __not_in_flash_func(ct_advance)(CtModel& c) {
             // tritt ein, wenn der Handler laenger laeuft als eine Periode und sein
             // eigenes Flag noch nicht geloescht hat (s. IR-Schreibzugriff).
             const uint32_t bit = 1u << m;
-            if (!(c.ir & bit) || !(c.ir_unseen & bit)) {
+            const uint64_t t_match = t_base + ((hz == denom) ? k0 : (k0 * denom) / hz);
+            if ((c.capq_n && c.capq[0] < t_match) || c.ir_deferred) {
+                // Eine aeltere Flanke wartet noch auf Zustellung: Match danach melden.
+                ct_tr(c.irq_num, 3, bit, static_cast<uint32_t>(t_match));
+                if (!c.ir_deferred || t_match < c.def_t) c.def_t = t_match;
+                c.ir_deferred |= bit; ++c.def_n;
+                if (mcr & 0x2u) { c.lat_armed = true; c.lat_t_pend = fast_time_us(); c.lat_t_inj = 0; }
+            } else if (!(c.ir & bit) || !(c.ir_unseen & bit)) {
                 c.ir |= bit;
                 c.ir_unseen |= bit;
                 if (c.mr_fresh & bit) c.ir_fresh |= bit;
+                ct_tr(c.irq_num, 5, bit, static_cast<uint32_t>(t_match));
                 irq_inject::pend(c.irq_num);
                 ++c.dbg_pends;
-                if (mcr & 0x2u) c.lat_armed = true;   // Reset+IRQ: Latenz des naechsten MR0-Writes messen
+                if (mcr & 0x2u) {                     // Reset+IRQ: Latenz des naechsten MR0-Writes messen
+                    c.lat_armed = true; c.lat_t_pend = fast_time_us(); c.lat_t_inj = 0;
+                }
             }
         }
         // EMR-Pin: Toggle haengt von der Trefferparitaet ab, Set/Clear ist idempotent.
@@ -1864,30 +1923,109 @@ bool __not_in_flash_func(ct_is_own_echo)(const CtModel& c, uint64_t t_us) {
     return false;
 }
 
+// Sendet der Gast gerade (Match-PIO-Puls geplant/laufend, PWM-Match innerhalb
+// der Periode oder letzter Puls < 500 us her)? Dann keine Capture-Queue: die
+// Flanken sind Echo/Kollisionserkennung, und zurueckgehaltene Perioden-Matches
+// zerstoerten den Sendetakt.
+bool __not_in_flash_func(ct_tx_busy)(const CtModel& c, uint64_t t_us) {
+    const uint64_t t_ns = t_us * 1000u;
+    uint32_t reset_ch = 4;
+    for (uint32_t r = 0; r < 4; ++r)
+        if ((c.mcr >> (r * 3)) & 0x2u) { reset_ch = r; break; }
+    const uint32_t mask = c.is32 ? 0xFFFF'FFFFu : 0xFFFFu;
+    for (int m = 0; m < 4; ++m) {
+        if (c.tx_handle[m] < 0 && !((c.pwmc >> m) & 1u)) continue;
+        if (c.txn[m]) return true;
+        if (c.echo_last[m].end && t_ns < c.echo_last[m].end + 500'000u) return true;
+        if (((c.pwmc >> m) & 1u) && reset_ch < 4 && (c.mr[m] & mask) < (c.mr[reset_ch] & mask)) return true;
+    }
+    return false;
+}
+
+// Naechstes zurueckgehaltenes Ereignis zustellen, sobald der Gast das vorige
+// verarbeitet hat: Handler dieses Timers laeuft nicht und das Capture-Flag ist
+// gelesen (bzw. geloescht). Reihenfolge nach Zeitstempel: Flanke oder
+// zurueckgehaltener Match. Sicherheitsnetz: bleibt die Queue > 5 ms stehen
+// (Gast liest IR nicht, Interrupt gesperrt), alles wie frueher zustellen.
+void __not_in_flash_func(ct_cap_deliver)(CtModel& c) {
+    if (!c.capq_n && !c.ir_deferred) return;
+    const uint64_t oldest = c.capq_n ? c.capq[0] : c.def_t;
+    const bool stale = fast_time_us() - oldest > 5000u;
+    if (!stale) {
+        if (irq_inject::active_irq() == static_cast<int>(c.irq_num)) return;
+        if (c.ir & c.ir_unseen & (1u << 4)) return;      // voriges Capture noch ungelesen
+        if (c.ir & c.ir_unseen & 0xFu) return;           // Match-Flag noch ungelesen (resetFlags loeschte sonst das Capture)
+    }
+    if (stale) {
+        ++c.capq_flush; ct_tr(c.irq_num, 15, c.capq_n, c.ir_deferred);
+        if (c.capq_n) { c.cr0 = ct_tc_at(c, c.capq[c.capq_n - 1]); c.ir |= (1u << 4); c.ir_unseen |= (1u << 4); }
+        c.capq_n = 0;
+        c.ir |= c.ir_deferred; c.ir_unseen |= c.ir_deferred; c.ir_fresh |= c.ir_deferred & c.mr_fresh;
+        c.ir_deferred = 0;
+        irq_inject::pend(c.irq_num);
+        return;
+    }
+    if (c.capq_n && (!c.ir_deferred || c.capq[0] <= c.def_t)) {
+        const uint64_t t = c.capq[0];
+        for (uint8_t i = 1; i < c.capq_n; ++i) c.capq[i - 1] = c.capq[i];
+        --c.capq_n;
+        c.cr0 = ct_tc_at(c, t);
+        c.ir |= (1u << 4); c.ir_unseen |= (1u << 4);
+        ct_tr(c.irq_num, 2, c.cr0, c.tc);
+        if (c.ccr & 0x4u) irq_inject::pend(c.irq_num);
+        return;
+    }
+    // Zurueckgehaltene Matches: jetzt (nach der letzten aelteren Flanke) melden.
+    const uint32_t bits = c.ir_deferred;
+    c.ir_deferred = 0;
+    ct_tr(c.irq_num, 4, bits, c.tc);
+    c.ir |= bits; c.ir_unseen |= bits; c.ir_fresh |= bits & c.mr_fresh;
+    irq_inject::pend(c.irq_num);
+}
+
 void __not_in_flash_func(ct_sample_capture_pio)(CtModel& c) {
     // Jede Flanke kommt mit absolutem Zeitstempel und Pegel aus der PIO. CR0 ist
     // der TC-Wert ZUM FLANKENZEITPUNKT (nicht zum Verarbeitungszeitpunkt), damit
     // die sblib ihr eigenes Echo korrekt gegen MR0 pruefen kann. Frueher wurde
     // CR0 nur aus Flankenabstaenden aufaddiert (Timer-Resets ignoriert, Anker =
     // Verarbeitungszeit) -> jede Sendung endete als "Kollision".
+    //
+    // Fremde Flanken mit freigegebenem Capture-Interrupt laufen ueber die
+    // Capture-Queue (s. CtModel::capq): erst einreihen, DANN fortschreiben -
+    // so sieht ct_advance die Flanken und haelt spaetere Matches zurueck.
     const bool rise_arm = (c.ccr & 0x1u) != 0;
     const bool fall_arm = (c.ccr & 0x2u) != 0;
     uint64_t t_edge; bool level;
     bool advanced = false;
     while (pio_glue::ts_read_edge(c.pio_handle, t_edge, level)) {
-        if (!advanced) { ct_advance(c); advanced = true; }
-        if ((level && rise_arm) || (!level && fall_arm)) {
-            const uint32_t dly = config::tmatch_delay_us();
-            const bool own = dly && ct_is_own_echo(c, t_edge);
-            c.cr0 = ct_tc_at(c, own ? t_edge - dly : t_edge);
-            c.ir |= (1u << 4);
-            // Latenzausgleich: das eigene Echo loest keinen eigenen Interrupt
-            // aus - das Flag liest der ohnehin folgende Perioden-Interrupt mit.
-            // Am LPC ist der Echo-Handler in ~1 us durch; im Emulator kostet
-            // jeder Handlerlauf ~50 us und verschob den MR0-Schreibzugriff der
-            // naechsten Periode ueber die Pulsflanke hinaus.
-            if ((c.ccr & 0x4u) && !own) irq_inject::pend(c.irq_num);  // CAP0I
+        if (!((level && rise_arm) || (!level && fall_arm))) continue;
+        const uint32_t dly = config::tmatch_delay_us();
+        const bool own = dly && ct_is_own_echo(c, t_edge);
+        ++c.cap_n;
+        if (!own && (c.ccr & 0x4u) && (c.capq_n || !ct_tx_busy(c, t_edge))) {
+            ct_tr(c.irq_num, 1, static_cast<uint32_t>(t_edge), c.capq_n);
+            if (c.capq_n < CtModel::CAPQ) c.capq[c.capq_n++] = t_edge;
+            else { c.capq[CtModel::CAPQ - 1] = t_edge; ++c.capq_drop; }
+            ++c.capq_queued;
+            if (c.capq_n > c.capq_peak) c.capq_peak = c.capq_n;
+            continue;
         }
+        // Eigenes Echo bzw. Capture ohne Interrupt: direkt (wie bisher).
+        if (!advanced) { ct_advance(c); advanced = true; }
+        if ((c.ir & c.ir_unseen & (1u << 4)) && !own) ++c.cap_overrun;
+        c.cr0 = ct_tc_at(c, own ? t_edge - dly : t_edge);
+        c.ir |= (1u << 4);
+        c.ir_unseen |= (1u << 4);
+        // Latenzausgleich: das eigene Echo loest keinen eigenen Interrupt
+        // aus - das Flag liest der ohnehin folgende Perioden-Interrupt mit.
+        // Am LPC ist der Echo-Handler in ~1 us durch; im Emulator kostet
+        // jeder Handlerlauf ~50 us und verschob den MR0-Schreibzugriff der
+        // naechsten Periode ueber die Pulsflanke hinaus.
+        if ((c.ccr & 0x4u) && !own) irq_inject::pend(c.irq_num);  // CAP0I
+    }
+    if (c.capq_n || c.ir_deferred) {
+        if (!advanced) ct_advance(c);
+        ct_cap_deliver(c);
     }
 }
 void __not_in_flash_func(ct_sample_capture)(CtModel& c) {
@@ -1902,9 +2040,13 @@ uint32_t __not_in_flash_func(ct_read_reg)(uint32_t idx, uint32_t reg) {
     // sich den Stand). Capture wurde in begin_access() fuer diesen Trap schon abgetastet.
     if (c.adv_epoch != g_trap_epoch) { ct_advance(c); c.adv_epoch = g_trap_epoch; }
     switch (reg) {
-        case 0x00: c.ir_unseen = 0; c.mr_fresh = 0; c.ir_fresh = 0; return c.ir;
+        case 0x00: ct_tr(c.irq_num, 6, c.ir, c.tc); c.ir_unseen = 0; c.mr_fresh = 0; c.ir_fresh = 0; return c.ir;
         case 0x04: return c.enabled ? 1u : 0u;
-        case 0x08: return c.tc;
+        case 0x08:
+            // Merken fuer den TC-Latenzausgleich (s. ct_write_reg 0x08).
+            c.tc_rd_us = fast_time_us();
+            c.tc_rd_valid = (irq_inject::active_irq() == static_cast<int>(c.irq_num));
+            return c.tc;
         case 0x0C: return c.pre;
         case 0x10: return c.pc;
         case 0x14: return c.mcr;
@@ -1930,6 +2072,15 @@ void __not_in_flash_func(ct_note_latency)(CtModel& c) {
     c.lat_last = c.tc;                        // Ticks seit dem Periodenreset
     c.lat_sum += c.tc; ++c.lat_n;
     if (c.tc > c.lat_max) c.lat_max = c.tc;
+    const uint64_t now = fast_time_us();
+    const uint32_t since_pend = static_cast<uint32_t>(now - c.lat_t_pend);
+    const uint32_t det = (c.tc > since_pend) ? c.tc - since_pend : 0u;   // Reset -> Erkennung
+    const uint32_t inj = c.lat_t_inj ? static_cast<uint32_t>(c.lat_t_inj - c.lat_t_pend) : since_pend;
+    const uint32_t hdl = c.lat_t_inj ? static_cast<uint32_t>(now - c.lat_t_inj) : 0u;
+    c.lat_sum_det += det; c.lat_sum_inj += inj; c.lat_sum_hdl += hdl;
+    if (det > c.lat_max_det) c.lat_max_det = det;
+    if (inj > c.lat_max_inj) c.lat_max_inj = inj;
+    if (hdl > c.lat_max_hdl) c.lat_max_hdl = hdl;
 }
 
 // Von ct_write_byte markiert, in on_post_write_hook() einmal je Trap abgearbeitet.
@@ -1962,6 +2113,7 @@ void __not_in_flash_func(ct_write_reg)(uint32_t idx, uint32_t reg, uint32_t val,
             if (irq_inject::active_irq() == static_cast<int>(c.irq_num))
                 m &= ~(c.ir_unseen & c.ir_fresh & 0xFu);
             c.ir &= ~m;
+            ct_tr(c.irq_num, 7, m, c.ir);
             // Pegel-Interrupt: steht kein freigegebenes Flag mehr an, auch die noch
             // pendende Anforderung zuruecknehmen (sonst liefe der Handler ohne
             // Ereignis erneut und werte z. B. ein altes CR0 aus).
@@ -1980,18 +2132,45 @@ void __not_in_flash_func(ct_write_reg)(uint32_t idx, uint32_t reg, uint32_t val,
             bool was = c.enabled;
             c.enabled = (v & 0x1u) != 0;
             if (v & 0x2u) { c.tc = 0; c.pc = 0; }
+            ct_tr(c.irq_num, 14, v, c.tc);
             if (!was && c.enabled) c.last_us = fast_time_us();
             break;
         }
-        case 0x08: patch(c.tc);    break;
+        case 0x08: {
+            patch(c.tc);
+            // Latenzausgleich: sblib rechnet im Handler "TC lesen -> Timer neu
+            // starten -> TC = verstrichene Zeit + 2" (2 us = Laufzeit am LPC).
+            // Im Emulator liegen zwischen Lesen und Schreiben ~40 us Traps; ohne
+            // Ausgleich laeuft die Zeitbasis des Bytes um diese Zeit nach und
+            // jede Datenflanke erscheint zu frueh (sblib-Fenster: -35 us) ->
+            // verworfene Bits. Daher die real verstrichene Zeit seit dem TC-
+            // Lesen desselben Handlers (abzueglich der 2 us, die die Firmware
+            // schon einrechnet) aufschlagen.
+            if (c.tc_rd_valid && irq_inject::active_irq() == static_cast<int>(c.irq_num)) {
+                const uint64_t now = fast_time_us();
+                const uint64_t el_us = now - c.tc_rd_us;
+                if (el_us < 2000u) {
+                    const uint64_t hz = g_current_hz ? static_cast<uint64_t>(g_current_hz) : 1u;
+                    const uint64_t el = el_us * hz / (1'000'000ull * (static_cast<uint64_t>(c.pre) + 1u));
+                    if (el > 2u) {
+                        const uint32_t add = static_cast<uint32_t>(el - 2u);
+                        c.tc += add; c.tc_comp_last = add; ++c.tc_comp_n;
+                        if (!c.is32) c.tc &= 0xFFFFu;
+                    }
+                }
+            }
+            c.tc_rd_valid = false;
+            ct_tr(c.irq_num, 8, c.tc, c.tc_comp_last);
+            break;
+        }
         case 0x0C: patch(c.pre);   break;
         case 0x10: patch(c.pc);    break;
-        case 0x14: patch(c.mcr);   break;
-        case 0x18: patch(c.mr[0]); c.mr_fresh |= 1u; if (mask & 0xFF00'0000u) ct_note_latency(c); break;
+        case 0x14: patch(c.mcr); ct_tr(c.irq_num, 10, c.mcr, c.tc); break;
+        case 0x18: patch(c.mr[0]); c.mr_fresh |= 1u; if (mask & 0xFF00'0000u) ct_note_latency(c); ct_tr(c.irq_num, 17, c.mr[0], c.tc); break;
         case 0x1C: patch(c.mr[1]); c.mr_fresh |= 2u; break;
-        case 0x20: patch(c.mr[2]); c.mr_fresh |= 4u; break;
+        case 0x20: patch(c.mr[2]); c.mr_fresh |= 4u; ct_tr(c.irq_num, 9, 2, c.mr[2] | (c.tc << 16)); break;
         case 0x24: patch(c.mr[3]); c.mr_fresh |= 8u; break;
-        case 0x28: patch(c.ccr);   break;
+        case 0x28: patch(c.ccr); ct_tr(c.irq_num, 13, c.ccr, c.tc); break;
         case 0x2C: /* CR0 read-only */ break;
         case 0x3C: {
             // EMR-Schreibzugriff: EMC-Steuerbits übernehmen; manuelle EM0..3-
@@ -2951,9 +3130,18 @@ void live_map_poll(bool force) {
 
 uint32_t __not_in_flash_func(gpio_live_port_data)(uint32_t port) {
     if (port >= 4) return 0;
-    uint32_t live[4];
-    gpio_live_all(live);
-    return live[port];
+    // Nur den angefragten Port: ein Pad-Zugriff, Eingaenge live, Ausgaenge aus dem Schatten.
+    const LiveMap& g_live = live_map();
+    const uint64_t in = gpio_get_all64();
+    uint32_t data = g_gpio[port].data;
+    const uint32_t dir = g_gpio[port].dir;
+    for (uint8_t k = 0; k < g_live.n[port]; ++k) {
+        const uint8_t pin = g_live.pin[port][k];
+        if ((dir >> pin) & 1u) continue;
+        const uint32_t lvl = static_cast<uint32_t>((in >> g_live.gpio[port][k]) & 1u);
+        data = (data & ~(1u << pin)) | (lvl << pin);
+    }
+    return data;
 }
 
 // Wird bei jedem MMIO-Trap aufgerufen: liest echte Eingänge, erkennt Flanken
@@ -3090,6 +3278,26 @@ bool __not_in_flash_func(ct_word_access)(uint32_t addr, bool is_load, uint32_t& 
     g_last_mmio_addr = addr; g_last_mmio_write = !is_load;
     if (is_load) { g_stats.mmio_reads += 4; value = ct_read_reg(idx, reg); }
     else         { g_stats.mmio_writes += 4; ct_write_reg(idx, reg, value, 0xFFFF'FFFFu); }
+    return true;
+}
+
+// Lesezugriff (Byte/Halbwort/Wort, ausgerichtet) auf den maskierten GPIO-DATA-
+// Bereich in EINEM Durchlauf - der byteweise Standardpfad las den Port je Byte
+// neu ein (Wort-LDR = 4 Durchlaeufe, ~1400 Takte; sblib digitalRead im
+// KNX-Spike-Filter). false = keine GPIO-DATA-Adresse -> Standardpfad.
+bool __not_in_flash_func(gpio_data_read)(uint32_t addr, uint32_t size, uint32_t& value) {
+    if (addr < GPIO_BASE || addr >= GPIO_PORTS_END || (addr & (size - 1u))) return false;
+    const uint32_t port_off = addr - GPIO_BASE;
+    const uint32_t port     = port_off / GPIO_PORT_STRIDE;
+    const uint32_t local    = port_off % GPIO_PORT_STRIDE;
+    if (port >= 4 || local >= GPIO_DATA_END) return false;
+    g_stats.mmio_reads += size;
+    g_last_mmio_addr = addr; g_last_mmio_write = false;
+    const uint32_t mask = (local >> 2) & 0xFFFu;
+    const uint32_t data = gpio_live_port_data(port) & mask;
+    const uint32_t shift = (addr & 3u) * 8u;
+    const uint32_t vmask = (size >= 4u) ? 0xFFFF'FFFFu : ((1u << (size * 8u)) - 1u);
+    value = (data >> shift) & vmask;
     return true;
 }
 
@@ -3438,6 +3646,72 @@ void ct_lat_debug(int idx, uint32_t& n, uint32_t& avg, uint32_t& max, uint32_t& 
     const CtModel& c = g_ct[idx & 3];
     n = c.lat_n; max = c.lat_max; last = c.lat_last;
     avg = c.lat_n ? static_cast<uint32_t>(c.lat_sum / c.lat_n) : 0u;
+}
+
+void ct_lat_split(int idx, uint32_t avg[3], uint32_t max[3]) {
+    const CtModel& c = g_ct[idx & 3];
+    const uint32_t n = c.lat_n ? c.lat_n : 1u;
+    avg[0] = static_cast<uint32_t>(c.lat_sum_det / n); max[0] = c.lat_max_det;
+    avg[1] = static_cast<uint32_t>(c.lat_sum_inj / n); max[1] = c.lat_max_inj;
+    avg[2] = static_cast<uint32_t>(c.lat_sum_hdl / n); max[2] = c.lat_max_hdl;
+}
+
+// Von irq_inject nach dem Synthetisieren eines Frames: Injektionszeitpunkt fuer
+// die Latenzaufteilung merken (nur der erste Frame nach dem Pend zaehlt).
+void __not_in_flash_func(ct_note_injected)(uint8_t irq) {
+    for (auto& c : g_ct) {
+        if (c.irq_num != irq) continue;
+        const uint64_t now = fast_time_us();
+        c.hdl_t0 = now; c.hdl_ep0 = g_trap_epoch;
+        ct_tr(c.irq_num, 11, c.ir, c.capq_n);
+        if (c.lat_armed && !c.lat_t_inj) c.lat_t_inj = now;
+    }
+}
+
+void __not_in_flash_func(ct_note_returned)(int irq) {
+    for (auto& c : g_ct) {
+        if (static_cast<int>(c.irq_num) != irq || !c.hdl_t0) continue;
+        const uint32_t d = static_cast<uint32_t>(fast_time_us() - c.hdl_t0);
+        c.hdl_t0 = 0; ++c.hdl_n; c.hdl_sum += d;
+        ct_tr(c.irq_num, 12, c.ir, c.capq_n);
+        if (d > c.hdl_max) c.hdl_max = d;
+        const uint32_t t = g_trap_epoch - c.hdl_ep0;
+        c.hdl_traps += t; if (t > c.hdl_traps_max) c.hdl_traps_max = t;
+        if (c.capq_n || c.ir_deferred) { ct_advance(c); ct_cap_deliver(c); }
+    }
+}
+
+void ct_capq_debug(int idx, uint32_t& queued, uint32_t& peak, uint32_t& drop, uint32_t& flush, uint32_t& deferred) {
+    const CtModel& c = g_ct[idx & 3];
+    queued = c.capq_queued; peak = c.capq_peak; drop = c.capq_drop; flush = c.capq_flush; deferred = c.def_n;
+}
+void ct_tccomp_debug(int idx, uint32_t& n, uint32_t& last) {
+    const CtModel& c = g_ct[idx & 3]; n = c.tc_comp_n; last = c.tc_comp_last;
+}
+
+void ct_trace_start(int idx, bool wait_tx) { g_ct_trace_n = 0; g_ct_trace_wait_tx = wait_tx; g_ct_trace_irq = g_ct[idx & 3].irq_num; }
+void ct_trace_dump() {
+    const uint32_t n = g_ct_trace_n;
+    g_ct_trace_irq = -1;
+    static const char* nm[18] = {"?","cap-ein","cap-zu","match-hold","match-nach","match","IR-rd","IR-wr",
+                                 "TC-wr","MR2-wr","MCR-wr","inject","return","CCR-wr","TCR-wr","flush","tx-puls","MR0-wr"};
+    const uint32_t t0 = n ? g_ct_trace[0].t : 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const CtTrace& e = g_ct_trace[i];
+        const uint32_t dt = (e.t - t0) / 15u;   // 0.1 us bei 150 MHz
+        std::printf("%6lu.%lu %-10s %08lx %08lx\n", static_cast<unsigned long>(dt / 10u), static_cast<unsigned long>(dt % 10u), nm[e.type < 18 ? e.type : 0],
+                    static_cast<unsigned long>(e.a), static_cast<unsigned long>(e.b));
+        if ((i & 31) == 31) sleep_ms(20);   // UART-Puffer nicht ueberlaufen lassen
+    }
+    std::printf("-- %lu Eintraege\n", static_cast<unsigned long>(n));
+}
+
+void ct_rx_debug(int idx, uint32_t& cap_n, uint32_t& overrun, uint32_t& hn, uint32_t& havg, uint32_t& hmax,
+                 uint32_t& tavg, uint32_t& tmax) {
+    const CtModel& c = g_ct[idx & 3];
+    tavg = c.hdl_n ? static_cast<uint32_t>(c.hdl_traps / c.hdl_n) : 0u; tmax = c.hdl_traps_max;
+    cap_n = c.cap_n; overrun = c.cap_overrun; hn = c.hdl_n; hmax = c.hdl_max;
+    havg = c.hdl_n ? static_cast<uint32_t>(c.hdl_sum / c.hdl_n) : 0u;
 }
 
 int ct_tx_handle(int idx, int m) { return g_ct[idx & 3].tx_handle[m & 3]; }

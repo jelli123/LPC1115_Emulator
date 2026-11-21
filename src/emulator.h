@@ -30,6 +30,7 @@ uint32_t guest_ram_base();  // Adresse des Guest-RAM-Puffers
 // der gestarteten Applikation (load_base() + Flash-Offset). Die IRQ-Injektion
 // liest hierueber den passenden LPC-Handler.
 uint32_t vtable_base();
+uint32_t guest_systick_handler();   // relozierter Gast-SysTick-Handler (ohne Shim)
 
 // Wird vom SYSCON-Modell aufgerufen, sobald der Gast SYSMEMREMAP in einen
 // User-Mode schreibt (LPC-typischer Bootloader->Applikation-Uebergang).

@@ -655,8 +655,8 @@ das der Fall, läuft der Modus „zweistufig".
 ### Pristine-App-Grenze (CRC-Korrektheit)
 
 Im zweistufigen Modus werden die Load-Time-Patches (`relocate_ram_refs`,
-WFI-/CPS-Patches) **nur auf den Bootloader-Bereich `[0, app_start)`**
-angewandt (`reloc_len = app_start`). Die App-Bytes bleiben damit **exakt
+WFI-/CPS-Patches) beim Laden **nur auf den Bootloader-Bereich `[0, app_start)`**
+angewandt (die RAM-Relokation der App folgt im Handover) (`reloc_len = app_start`). Die App-Bytes bleiben damit **exakt
 so wie geladen** — sonst wiche die Laufzeit-CRC von der Descriptor-CRC ab
 und der Bootloader bliebe im Updater-Modus. Die App läuft trotzdem korrekt,
 weil Flash-Zugriffe ohnehin getrappt und auf das relozierte Image
@@ -685,7 +685,30 @@ Der Sprung BL→App läuft über den bestehenden SYSMEMREMAP-Hook
 (`activate_bootloader_handover()`, siehe Boot-Diagramm): App-Vektoren werden
 **erst nach** der Bootloader-CRC-Prüfung relociert, VTOR auf `app_start`
 gesetzt; ein SP-Fixup sorgt dafür, dass der rohe LPC-StackTop auf gültigen
-RP2350-SRAM zeigt.
+RP2350-SRAM zeigt (gesucht in r4–r11 **und** r0–r3/r12).
+
+**App nach dem Handover.** Bis zur CRC-Prüfung des Bootloaders bleibt der
+App-Bereich pristine; im Handover werden dann (wie beim Loader für den
+Bootloader) die RAM-Literale der App reloziert, begrenzt auf `[app_start,
+Descriptor-Ende]`. Ohne das trappte jeder RAM-Zugriff der App (sblib-Bus-Handler
+~150 µs, kein ACK). Den App-SysTick-Handler ruft der Host-Shim nicht mehr
+privilegiert auf, sondern injiziert ihn unprivilegiert (`pend_systick`, Handler
+aus `guest_systick_handler()`): Privilegiert liefen nicht relozierte Zugriffe
+auf `0x1000xxxx` ohne MPU-Trap ins XIP-Flash – `systemTime` blieb 0, und
+sblib-Apps hingen in `while (!millis())` (keine Prog-LED/-Taste).
+
+**LTO-Bootloader (Selfbus v1.20).** Der mit `-flto` übersetzte Bootloader
+kopiert die App-Vektortabelle per `stmia r3!, {r6}` nach `0x10000000`; die
+Zieladresse ist berechnet (`movs`/`lsls`), die Quelle `r3 + (app_start −
+0x10000000)`. Dafür:
+
+* `emulate_ldm_stm()` bedient Thumb-1 `LDMIA/STMIA` auf LPC-Flash (lesend),
+  LPC-SRAM und MMIO. Eine rohe LPC-RAM-Basis wird **reloziert**
+  zurückgeschrieben, weil `hex_patcher` den Vergleichswert des Schleifenendes
+  (`0x100000C0`) im Literal-Pool ebenfalls reloziert hat.
+* Ein Zugriff in den XIP-Bereich `[0x10000000+RAM, 0x20000000)` wird um das
+  RAM-Relokationsdelta zurückgerechnet; landet das Ergebnis im LPC-Flash, wird
+  von dort gelesen (relozierter Zeiger + roher Offset).
 
 ---
 
@@ -877,6 +900,45 @@ Löschen ausgenommen und der Interrupt nach dem Rücksprung erneut zugestellt �
 am LPC wäre der Handler längst fertig gewesen. Treffer mit dem *alten* Wert
 (Handler schrieb MRm zu spät) werden wie am LPC gelöscht; bleibt kein
 freigegebenes Flag, wird auch die pendende Anforderung zurückgenommen.
+
+**Capture-Queue (Empfang).** Kommen fremde Flanken schneller, als der Gast
+sie abarbeitet (sblib 2.02: Handler ~100–130 µs, 0-Bits im 104-µs-Raster),
+würde CR0 überschrieben. Flanken mit freigegebenem `CAP0I` laufen daher über
+eine zeitlich geordnete Queue (`CtModel::capq`, 16 Einträge): Zugestellt wird
+immer nur das älteste Ereignis, und erst wenn der Handler des Timers nicht
+läuft und das vorige Capture-/Match-Flag gelesen hat (`ir_unseen`). Matches,
+die zeitlich *nach* einer noch wartenden Flanke liegen, werden zurückgehalten
+(`ir_deferred`) und in der richtigen Reihenfolge nachgereicht. Eine Queue,
+die älter als 5 ms ist, wird notfalls am Stück geleert. Während der Gast sendet
+(`ct_tx_busy`: Puls geplant/laufend, Echo < 500 µs her), bleibt die Queue aus,
+damit das eigene Echo nicht verzögert wird.
+
+**TC-Latenzausgleich.** sblib rechnet beim Startbit „TC lesen → Timer neu
+starten → TC = verstrichene Zeit + 2“. Im Emulator liegen zwischen Lesen und
+Schreiben ~40 µs Traps; schreibt derselbe Handler TC innerhalb von 2 ms nach
+dem Lesen, schlägt das Modell die real verstrichene Zeit (abzüglich der 2 µs,
+die die Firmware einrechnet) auf. Ohne Ausgleich lief die Byte-Zeitbasis
+nach, und Datenflanken fielen aus dem sblib-Fenster.
+
+**MCR-Zwischenzustand.** sblib setzt MCR in zwei Schritten (erst 0, dann
+Reset|Int). Der kurz fehlende Reset-Kanal parkt die Match-PIO nicht mehr,
+solange ein Puls geplant ist – das Parken zog den Pin mitten im Startbit auf
+low, das Echo galt dann als fremde Flanke. Ein Neuaufbau des PIO-Plans
+behandelt einen Puls bis 8 µs vor seinem Start bereits als laufend.
+
+**Grenze sblib 2.02 (Bootloader v1.11).** Empfang funktioniert mit Queue und
+TC-Ausgleich, Senden nicht: Der Perioden-Handler eines 0-Bits braucht im
+Emulator ~12 Traps (~95–155 µs) und damit länger als eine Bitzeit; jede zweite
+Periode geht verloren (Pulse im 210/418-µs-Raster). sblib 2.10 (Bootloader
+v1.20) braucht ~8 Traps je Handler und sendet bitgenau. Für den Bus-Updater
+daher Bootloader ≥ v1.20 verwenden (`examples/`, lokal gebaut, siehe
+Benutzerhandbuch).
+
+**Diagnose.** `ct trace <idx> [tx]` zeichnet die Timer-Ereignisse (Capture
+ein/zu, Match, IR-/MR-/MCR-/CCR-/TC-Zugriffe, Inject/Return, TX-Pulse) mit
+0,1-µs-Auflösung auf, mit `tx` erst ab dem ersten Sendepuls; `ct trace` gibt
+sie aus. `stats` zeigt je Timer zusätzlich TC-Ausgleich, Capture-Queue,
+Handlerdauer und Traps je Handler.
 
 **Messwerte** (RP2350 150 MHz, TPUART2-Emu v0.10, Brücke GP3→GP4): MR0 im
 Mittel 62 µs nach dem Reset geschrieben (max. ~106 µs);
