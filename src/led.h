@@ -1,6 +1,6 @@
 #pragma once
 //
-// Status-LED auf der Onboard-LED des Pi Pico 2 (PICO_DEFAULT_LED_PIN = 25).
+// Status-LED auf PICO_DEFAULT_LED_PIN (Pi Pico 2: GP25; Boards ohne LED: aus).
 //
 //   Idle/Bereit  → 1 Hz Heartbeat (50 % duty, 500 ms an / 500 ms aus)
 //   Running      → dauerhaft an

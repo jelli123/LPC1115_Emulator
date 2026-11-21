@@ -8,20 +8,28 @@
 namespace led {
 namespace {
 
-#ifndef PICO_DEFAULT_LED_PIN
-#  define PICO_DEFAULT_LED_PIN 25
+// Status-LED = PICO_DEFAULT_LED_PIN des Board-Headers (Pico 2: GP25). Definiert
+// das Board keine LED (z. B. selfbus_io8_rp2354: GP25 ist dort EIB_IN), bleibt
+// die Status-LED aus und der Pin unangetastet.
+#ifdef PICO_DEFAULT_LED_PIN
+constexpr int LED_GPIO = PICO_DEFAULT_LED_PIN;
+#else
+constexpr int LED_GPIO = -1;
 #endif
 
-constexpr uint LED_GPIO = PICO_DEFAULT_LED_PIN;
-
-void set(bool on) { gpio_put(LED_GPIO, on); }
+void set(bool on) {
+    if constexpr (LED_GPIO >= 0) gpio_put(static_cast<uint>(LED_GPIO), on);
+    else (void)on;
+}
 
 } // namespace
 
 void init() {
-    gpio_init(LED_GPIO);
-    gpio_set_dir(LED_GPIO, true);
-    set(false);
+    if constexpr (LED_GPIO >= 0) {
+        gpio_init(static_cast<uint>(LED_GPIO));
+        gpio_set_dir(static_cast<uint>(LED_GPIO), true);
+        set(false);
+    }
 }
 
 void poll() {
