@@ -873,7 +873,12 @@ Host-SysTick nur, wenn sich ein Interrupt-Termin ändern kann.
 
 **Capture (`timer_edge_ts`, `tcap_pio`).** Jede Flanke kommt mit Zeitstempel
 und Pegel aus der PIO; CR0 ist der TC-Wert *zum Flankenzeitpunkt*
-(`ct_tc_at`), nicht zur Verarbeitungszeit.
+(`ct_tc_at`), nicht zur Verarbeitungszeit. Der PIO-Zähler liefert nur
+31 Bit (Überlauf alle ~35,8 min); `ts_read_edge` legt die Überläufe anhand
+der aktuellen Zeit fest statt sie zwischen Flanken zu zählen. Früher kostete
+ein Bus, der länger als 35,8 min ruhig war, einen Überlauf – danach lagen alle
+Zeitstempel 2³¹ µs zurück, jede Flanke lief über den 5-ms-Notfall-Flush der
+Capture-Queue, und die Firmware empfing nichts mehr (bis zum Neustart).
 
 **Match (`match_pulse`, `tmatch_pio`).** Je PWM-Kanal führt `txq[]` höchstens
 zwei an die PIO gegebene Pulse (laufend + wartend), jeweils einer

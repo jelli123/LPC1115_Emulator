@@ -34,8 +34,6 @@ struct Ts {
     uint8_t  gpio;
     uint64_t t0_us;      // time_us_64 beim Start der SM (X = 0xFFFFFFFF)
     float    rate;       // Zaehlschritte je Sekunde
-    uint32_t last_e31;   // zuletzt gesehene verstrichene Schritte (31 Bit)
-    uint64_t wrap;       // aufsummierte 2^31-Ueberlaeufe
 };
 Ts   g_ts[MAX_HANDLES]{};
 
@@ -100,7 +98,7 @@ int ts_setup(uint8_t rp_gpio, float& out_rate_hz, bool claim_pin) {
     const uint64_t t0 = fast_time_us();
     restore_interrupts(irq);
 
-    g_ts[slot] = { true, g_ts_pio, static_cast<uint>(sm), rp_gpio, t0, out_rate_hz, 0, 0 };
+    g_ts[slot] = { true, g_ts_pio, static_cast<uint>(sm), rp_gpio, t0, out_rate_hz };
     return slot;
 }
 
@@ -112,13 +110,19 @@ bool __not_in_flash_func(ts_read_edge)(int handle, uint64_t& t_us, bool& level) 
     const uint32_t raw = pio_sm_get(t.pio, t.sm);
     level = (raw & 1u) != 0;
     // X laeuft ab 0xFFFFFFFF abwaerts; FIFO-Wert = X[30:0] << 1 | Pegel.
+    // Die 31-Bit-Schrittzahl laeuft alle ~35,8 min ueber. Die Ueberlaeufe nicht
+    // zwischen zwei Flanken zaehlen (ein ruhiger Bus > 35,8 min verschluckte
+    // einen, danach lagen alle Zeitstempel 2^31 us zurueck -> jede Flanke
+    // "veraltet"), sondern an der aktuellen Zeit festmachen: die Flanke liegt
+    // hoechstens wenige us zurueck, also das k mit k*2^31 + e31 ~ Schritte jetzt.
     const uint32_t e31 = 0x7FFF'FFFFu - (raw >> 1);        // verstrichene Schritte (31 Bit)
-    if (e31 < t.last_e31) t.wrap += (1ull << 31);         // 31-Bit-Ueberlauf
-    t.last_e31 = e31;
-    const uint64_t steps = t.wrap + e31;
-    t_us = t.t0_us + ((t.rate > 999'999.0f && t.rate < 1'000'001.0f)
-                          ? steps
-                          : static_cast<uint64_t>(static_cast<double>(steps) * 1e6 / t.rate));
+    const bool one_mhz = t.rate > 999'999.0f && t.rate < 1'000'001.0f;
+    const uint64_t el_us = fast_time_us() - t.t0_us;
+    const uint64_t steps_now = one_mhz ? el_us
+                                       : static_cast<uint64_t>(static_cast<double>(el_us) * t.rate / 1e6);
+    const uint64_t k = (steps_now + (1ull << 30) >= e31) ? (steps_now + (1ull << 30) - e31) >> 31 : 0u;
+    const uint64_t steps = (k << 31) + e31;
+    t_us = t.t0_us + (one_mhz ? steps : static_cast<uint64_t>(static_cast<double>(steps) * 1e6 / t.rate));
     return true;
 }
 
