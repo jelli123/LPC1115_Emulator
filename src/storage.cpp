@@ -22,6 +22,14 @@ namespace {
 
 constexpr uint32_t MAGIC_CONFIG   = 0xC0FE'1115u;
 constexpr uint32_t MAGIC_FIRMWARE = 0xF00D'1115u;
+constexpr uint32_t MAGIC_INI      = 0x1A1C'1115u;
+
+struct IniImportHeader {
+    uint32_t magic;
+    uint32_t length;       // Laenge des INI-Texts in Bytes
+    uint32_t crc32;        // CRC32 ueber den Text
+    uint32_t reserved;     // 0xFFFFFFFF
+};
 
 struct ConfigHeader {
     uint32_t magic;
@@ -51,11 +59,13 @@ constexpr std::size_t firmware_region_size =
     ((FIRMWARE_SLOT_BYTES + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE;
 constexpr std::size_t marker_region_size   = SECTOR_SIZE;
 
+constexpr std::size_t ini_import_size      = SECTOR_SIZE;
+
 static_assert(config_region_size + firmware_region_size + marker_region_size
-                  <= flash_size_bytes,
+                  + ini_import_size <= flash_size_bytes,
               "Storage-Reservierung passt nicht in den verfügbaren Flash");
 static_assert(config_region_size + firmware_region_size + marker_region_size
-                  < flash_size_bytes / 4,
+                  + ini_import_size < flash_size_bytes / 4,
               "Storage darf maximal das letzte Viertel des Flash belegen");
 
 constexpr std::size_t config_region_offset =
@@ -64,6 +74,9 @@ constexpr std::size_t firmware_region_offset =
     config_region_offset - firmware_region_size;
 constexpr std::size_t marker_offset =
     firmware_region_offset - marker_region_size;
+// INI-Import unterhalb des Markers: bestehende Offsets bleiben unveraendert.
+constexpr std::size_t ini_import_offset =
+    marker_offset - ini_import_size;
 
 // In-RAM Konfig-Snapshot.
 // Groessen so gewaehlt, dass alle Eintraege + ConfigHeader in EINEN Flash-
@@ -467,6 +480,19 @@ bool firmware_finalize(std::size_t total_len) {
     firmware_sequence = hdr.sequence;
     return true;
 }
+
+const char* ini_import(uint32_t& len, uint32_t& crc) {
+    const auto* h = reinterpret_cast<const IniImportHeader*>(xip_ptr(ini_import_offset));
+    if (h->magic != MAGIC_INI) return nullptr;
+    if (h->length == 0 || h->length > ini_import_size - sizeof(IniImportHeader)) return nullptr;
+    const uint8_t* text = reinterpret_cast<const uint8_t*>(h + 1);
+    if (crc32(text, h->length) != h->crc32) return nullptr;
+    len = h->length;
+    crc = h->crc32;
+    return reinterpret_cast<const char*>(text);
+}
+
+uint32_t ini_import_flash_offset() { return static_cast<uint32_t>(ini_import_offset); }
 
 const uint8_t* firmware_data() {
     return xip_ptr(firmware_region_offset);

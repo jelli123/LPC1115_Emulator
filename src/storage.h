@@ -59,6 +59,16 @@ struct ConfigPersistInfo {
 };
 ConfigPersistInfo config_persist_info();
 
+// INI-Import-Sektor: ein 4-KiB-Sektor direkt unterhalb des Firmware-Markers,
+// den der Emulator selbst nie beschreibt. Ein externes Werkzeug (tools/
+// mkimage.py, per SWD/OpenOCD oder UF2) legt dort CONFIG.INI-Text ab:
+//   uint32 magic (0x1A1C1115), uint32 laenge, uint32 crc32(text), uint32 0xFFFFFFFF,
+//   danach <laenge> Bytes INI-Text.
+// Beim Boot wird der Text einmalig uebernommen (config-Key ini_crc merkt sich
+// die CRC). Gueltig -> Zeiger auf den Text (XIP), len/crc gesetzt; sonst nullptr.
+const char* ini_import(uint32_t& len, uint32_t& crc);
+uint32_t    ini_import_flash_offset();   // Flash-Offset des Sektors (Diagnose)
+
 // Firmware-Slot
 bool firmware_erase();
 bool firmware_write(std::size_t offset, const void* data, std::size_t len);
