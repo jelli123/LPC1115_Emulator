@@ -756,9 +756,104 @@ Entsprechende CONFIG.INI-Schlüssel: `uart0_cdc`, `uart0_tx`, `uart0_rx`.
 
 ---
 
+## 7c. Boards ohne USB (z. B. Selfbus IO-8x fused 35x25 FM, RP2354A)
+
+Das IO-Modul hat kein USB. Emulator und Konfiguration kommen über **SWD**
+(JP7) aufs Board, die CLI liegt auf einer UART (115200 8N1) – per Default
+auf **JP7** (ISP_TXD/ISP_RXD), also am selben 10-poligen Stecker wie SWD.
+
+### Bauen
+
+```bash
+cmake -S . -B build-io8 -G Ninja -DPICO_BOARD=selfbus_io8_rp2354 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-io8
+```
+
+Der Board-Header [boards/selfbus_io8_rp2354.h](../boards/selfbus_io8_rp2354.h)
+legt 2 MB Flash fest (RP2354A; mit `pico2` = 4 MB läge der Config-Bereich
+jenseits des echten Flash) und **keine** Status-LED (GPIO25 ist dort EIB_IN).
+[boards/selfbus_io8_rp2354.cmake](../boards/selfbus_io8_rp2354.cmake) schaltet
+`EMU_STDIO_UART` ein und wählt die CLI-UART per `-DEMU_CLI_UART=…`:
+
+| `EMU_CLI_UART` | CLI auf | Folgen |
+|----------------|---------|--------|
+| `jp7` (Default) | JP7.5 ISP_TXD (GP16), JP7.3 ISP_RXD (GP17), uart0 | Eine Leitung zur Probe (SWD + UART, z. B. dap42). Gast-UART0 und ISP über Pins **nicht** verfügbar; LPC-Firmware per `upload` (XMODEM) oder SWD/`mkimage.py`. |
+| `jp6` | JP6.1 DBG_TXD (GP4), JP6.2 DBG_RXD (GP5), uart1 | JP7 bleibt Gast-UART0 + emuliertem LPC-ISP (FlashMagic, lpc21isp). |
+
+Die CLI-Pins sind reserviert: Belegt eine Konfiguration sie trotzdem (Board-
+Profil, INI-Import, CONFIG.INI, `cfg set`, `pinmap set`, `uart pins`), wird das
+mit einer `[CFG]`-/`[UART0]`-Meldung abgeschaltet. Bei `jp7` betrifft das
+`uart0_tx/rx` und `isp_pins` aus dem Board-Profil.
+
+### Board-Profil (Default-Konfiguration)
+
+[boards/selfbus_io8_rp2354.ini](../boards/selfbus_io8_rp2354.ini) wird ins Image
+eingebettet und gilt, **solange im Flash keine gespeicherte Konfiguration
+liegt** (frisches Board, `cfg clear`). Es enthält Pinmap IO1..IO8 + Prog,
+KNX (`tcap.1=25`, `tmat.1.0=24`), BUS_V (`adc.7=29`), I²C/FRAM (i2c1, GP18/19),
+UART0 auf den ISP-Pads (GP16/17), ISP über ISP_EN (P0_1 → GP23) und
+`autostart=on`. `cfg board` setzt das Profil später wieder und speichert es.
+
+| LPC-Pin | Signal  | RP-GPIO | | LPC-Pin | Signal   | RP-GPIO |
+|---------|---------|---------|-|---------|----------|---------|
+| P3_4    | IO1     | 27      | | P2_0    | PROG     | 2       |
+| P0_3    | IO2     | 28      | | P1_8    | EIB_IN   | 25 (tcap.1) |
+| P2_5    | IO3     | 26      | | P1_9    | EIB_OUT  | 24 (tmat.1.0) |
+| P0_7    | IO4     | 22      | | P1_11   | BUS_V    | 29 (adc.7) |
+| P3_5    | IO5     | 21      | | P0_4/5  | SCL/SDA  | 19/18 (i2c1) |
+| P2_1    | IO6     | 20      | | P1_7/6  | TXD/RXD  | 16/17 (uart0) |
+| P0_6    | IO7     | 6       | | P0_1    | ISP_EN   | 23 |
+| P2_9    | IO8     | 11      | | RESET   | RUN      | (Hardware-Reset des RP2354) |
+
+### Konfiguration + LPC-Firmware per SWD: `scripts/mkimage.py`
+
+Das Skript erzeugt einen **INI-Import-Sektor** (CONFIG.INI-Text) und optional
+den **LPC-Firmware-Slot** (Bootloader/App aus Intel-HEX) – auf Wunsch zusammen
+mit dem Emulator in **einer** HEX-Datei:
+
+```bash
+scripts/mkimage.py --board selfbus_io8_rp2354 --ini meine.ini \
+    --hex bootloader.hex --hex app.hex \
+    --emulator build-io8/emulator.hex -o io8_komplett.hex
+openocd -f interface/cmsis-dap.cfg -f target/rp2350.cfg \
+    -c "adapter speed 1000" -c "program io8_komplett.hex verify reset exit"
+```
+
+OpenOCD aus der Pico-VS-Code-Erweiterung braucht den Skriptpfad:
+`~/.pico-sdk/openocd/0.12.0+dev/openocd -s ~/.pico-sdk/openocd/0.12.0+dev/scripts …`.
+Die SWD-Leitungen des IO-8x laufen über Serienwiderstände + TVS – bei
+Verbindungsfehlern (`cannot read IDR`) die Adaptergeschwindigkeit senken
+(mit dap42 getestet: 100…500 kHz).
+
+* Der Import wird beim nächsten Boot **einmalig** übernommen und gespeichert
+  (`[CFG] INI-Import uebernommen …`); der Key `ini_crc` verhindert eine
+  Wiederholung. Ein neues Image mit anderem Inhalt wird wieder übernommen.
+* Der Import **ergänzt/überschreibt** die bestehende Konfiguration (Merge);
+  Einträge entfernen mit `-1` (z. B. `pin.0_1=-1`, `tcap.1=-1`). `--board`
+  stellt das Board-Profil voran, sodass das Ergebnis unabhängig vom
+  bisherigen Flash-Inhalt ist.
+* Mit `--hex` wird der **gesamte** 64-KiB-Slot neu geschrieben (inkl. Selfbus-
+  User-EEPROM in Sektor 15). Ohne `--hex` bleibt die Firmware unangetastet.
+* Der Config-Bereich (Wear-Leveling) wird nie beschrieben.
+* `--flash-size 4M` für Pico-2-Boards; `--uf2` erzeugt dieselben Daten als UF2
+  (Family „absolute“) für BOOTSEL/picotool.
+
+### Danach: ISP und OTA wie beim echten LPC (nur `EMU_CLI_UART=jp6`)
+
+Mit dem Board-Profil verhält sich der Emulator am JP7 wie ein LPC1115: ISP_EN
+beim Reset low → emulierter ISP über ISP_TXD/ISP_RXD (FlashMagic, lpc21isp,
+Selfbus-Programmer, Autobaud). Bei `jp7` geht stattdessen `upload` (XMODEM)
+über die CLI. In beiden Fällen geht die Applikation per KNX-OTA, sobald der
+Selfbus-Bootloader läuft. Der Reset-Pin ist der RUN-Pin des RP2354, ein
+Reset startet also den ganzen Emulator neu (Bootdauer im ms-Bereich).
+
+---
+
 ## 8. Persistenz
 
 * **Konfig** (`cfg`) → 8-Sektor-Wear-Leveling am Flash-Ende.
+* **INI-Import-Sektor** → 4 KiB unterhalb des Firmware-Markers, nur von
+  `scripts/mkimage.py` beschrieben (siehe Abschnitt 7c).
 * **Firmware-Slot** → ein zusammenhängender 64-KiB-Slot (entspricht
   LPC1115-Flash).
 * **Selfbus-EEPROM** → wird per **IAP-Stub** auf den Firmware-Slot

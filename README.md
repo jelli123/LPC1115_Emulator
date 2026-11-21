@@ -279,6 +279,17 @@ gezogen. In dieser Arbeitskopie wird das von der Pico-VS-Code-Erweiterung
 verwaltete **SDK 2.2.0** benutzt; das Build-Artefakt ist `build/emulator.uf2`
 und wird per BOOTSEL aufs Board kopiert.
 
+## Boards ohne USB / Board-Profile
+
+Eigene Boards: `-DPICO_BOARD=<name>` mit `boards/<name>.h` (Board-Header),
+optional `boards/<name>.cmake` (Build-Optionen, z. B. `EMU_STDIO_UART` = CLI
+auf der Standard-UART) und `boards/<name>.ini` (Board-Profil, ins Image
+eingebettet, gilt bei leerem Config-Slot). Konfiguration und LPC-Firmware
+lassen sich ohne USB per SWD einspielen: [scripts/mkimage.py](scripts/mkimage.py)
+erzeugt einen INI-Import-Sektor + Firmware-Slot (Intel-HEX/UF2). Erstes Board:
+Selfbus IO-8x fused 35x25 FM (RP2354A) – Details in
+[USERGUIDE §7c](docs/USERGUIDE.md#7c-boards-ohne-usb-z-b-selfbus-io-8x-fused-35x25-fm-rp2354a).
+
 ## ISP-Bootloader (FlashMagic / lpc21isp)
 
 [isp.cpp](src/isp.cpp) bildet den UART-ISP-Bootloader des LPC1115 nach
@@ -339,6 +350,7 @@ KNX-Bus** in den emulierten Bootloader geschrieben werden (IAP-Pfad).
 | `help`                        | Hilfe                                         |
 | `status`                      | State, MMIO-/GPIO-/PLL-/NVIC-Stats, GDB-Status|
 | `config get/set/save/dump`    | persistierte Konfiguration                    |
+| `cfg board`                   | Board-Profil (`boards/<board>.ini`) setzen + speichern |
 | `pin set <lpc> <rp\|-1>`      | Pin-Mapping setzen                            |
 | `pin show`                    | aktuelles Pin-Mapping                         |
 | `upload` (Alias `xmodem`)     | Intel-HEX per XMODEM (**additiv/mergend**)    |
