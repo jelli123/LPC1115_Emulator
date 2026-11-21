@@ -7,3 +7,6 @@ pico_sdk_import.cmake
 /examples/
 /tools/
 /devtools/
+
+# Board-spezifische Build-Verzeichnisse (z. B. build-io8, build-pico2)
+build-*/
