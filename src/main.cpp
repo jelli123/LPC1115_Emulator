@@ -21,6 +21,7 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/watchdog.h"
+#include "hardware/structs/timer.h"
 
 extern "C" void usb_stdio_init(void);
 extern "C" bool usb_stdio_connected(void);
@@ -31,6 +32,10 @@ int main() {
     // hängt (Heartbeat = bereit). Siehe led.cpp für Statemachine.
     led::init();
     stdio_init_all();
+    // Systemtimer nicht anhalten, wenn ein Kern per SWD im Debug-Halt steht
+    // (RP2350-Default DBGPAUSE: Timer pausiert). Sonst friert ein angehaltener
+    // Core1 alle Zeitfunktionen auf Core0 ein (CLI, XMODEM, Lockout-Timeout).
+    timer_hw->dbgpause = 0;
 
     // WICHTIG: Storage + Config VOR usb_stdio_init(), denn der USB-Deskriptor
     // wird beim tusb_init() aus der Config gebaut (welche CDCs — CLI/GDB/Serial —

@@ -1,4 +1,5 @@
 #include "storage.h"
+#include "emulator.h"
 
 #include <cstring>
 #include <cstdio>
@@ -115,20 +116,44 @@ uint32_t crc32(const uint8_t* data, std::size_t len, uint32_t seed = 0xFFFF'FFFF
 // Von Core1 (IAP) aus sperrt das Core0 aus, der aber KEIN Victim war -> Deadlock.
 // Jetzt wird gezielt der andere Core ausgesperrt, sofern er als Victim
 // initialisiert ist.
+//
+// Absicherung: Antwortet Core1 nicht auf den Lockout (z. B. von einem Debugger
+// angehalten, oder haengt), wartete Core0 frueher endlos -> 'upload'/'cfg save'
+// hingen. Jetzt: Timeout, dann Core1 per emulator::stop() hart zuruecksetzen und
+// neu starten (Gast stoppt) und erneut versuchen. Klappt auch das nicht, Core1
+// im Reset lassen (Bootrom, kein XIP-Zugriff) und ohne Lockout schreiben; das
+// naechste stop()/reset startet ihn wieder. Der Core1-Pfad (IAP sperrt Core0)
+// bleibt blockierend: Core0 ist immer erreichbar.
+constexpr uint64_t LOCKOUT_TIMEOUT_US = 100'000;
+
 struct FlashGuard {
     uint32_t ints;
     bool     locked;
     FlashGuard() : ints(0), locked(false) {
         const uint other = get_core_num() ^ 1u;
         if (multicore_lockout_victim_is_initialized(other)) {
-            multicore_lockout_start_blocking();
-            locked = true;
+            if (other == 0u) {
+                multicore_lockout_start_blocking();
+                locked = true;
+            } else if (multicore_lockout_start_timeout_us(LOCKOUT_TIMEOUT_US)) {
+                locked = true;
+            } else {
+                std::puts("[FLASH] Core1 antwortet nicht auf Lockout -> Core1-Neustart");
+                emulator::stop();
+                if (multicore_lockout_start_timeout_us(LOCKOUT_TIMEOUT_US)) {
+                    locked = true;
+                } else {
+                    std::puts("[FLASH] Core1 weiter stumm -> im Reset gehalten, schreibe ohne Lockout");
+                    multicore_reset_core1();
+                }
+            }
         }
         ints = save_and_disable_interrupts();
     }
     ~FlashGuard() {
         restore_interrupts(ints);
-        if (locked) multicore_lockout_end_blocking();
+        if (locked && !multicore_lockout_end_timeout_us(LOCKOUT_TIMEOUT_US))
+            std::puts("[FLASH] Core1 bestaetigt Lockout-Ende nicht");
     }
     FlashGuard(const FlashGuard&)            = delete;
     FlashGuard& operator=(const FlashGuard&) = delete;
