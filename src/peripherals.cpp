@@ -20,6 +20,7 @@
 #include "hardware/spi.h"
 #include "hardware/adc.h"
 #include "hardware/timer.h"
+#include "hardware/structs/m33_eppb.h"
 #include "hardware/irq.h"
 #include "hardware/sync.h"
 #include "hardware/powman.h"
@@ -1317,7 +1318,7 @@ uint8_t           g_ct_snap[192];
 // Kompaktes Telegramm-Log (Ringmodus): nur Ereignisse des laufenden Telegramms,
 // geleert bei jedem Telegrammbeginn, eingefroren bei fehlendem ACK.
 struct CtFl { uint16_t t; uint8_t type; uint8_t _r; uint16_t a, b; };
-constexpr uint32_t CT_FL_N = 160;
+constexpr uint32_t CT_FL_N = 64;
 CtFl              g_fl[CT_FL_N];
 volatile uint32_t g_fl_n = 0;
 inline void __not_in_flash_func(ct_tr)(uint8_t irq, uint8_t type, uint32_t a, uint32_t b) {
@@ -1381,7 +1382,8 @@ struct CtModel {
     // -> MR0-Write im Gast-Handler. Zeitstempel in us (fast_time_us).
     uint64_t lat_t_pend, lat_t_inj;
     uint32_t cap_n, cap_overrun;      // Capture-Ereignisse / davon CR0 ueberschrieben, bevor IR gelesen
-    uint64_t hdl_t0; uint32_t hdl_n, hdl_max; uint64_t hdl_sum;   // Laufzeit des Gast-Handlers [us]
+    uint64_t hdl_t0; uint32_t hdl_n, hdl_max; uint64_t hdl_sum;
+    uint32_t hdl_c0[4]; uint64_t hdl_cyc[4];   // Diagnose: Takte gesamt/Trap/Alarm/Shim je Handlerlauf   // Laufzeit des Gast-Handlers [us]
     uint32_t hdl_ep0; uint64_t hdl_traps; uint32_t hdl_traps_max;   // MMIO-Traps je Handlerlauf
     uint64_t lat_sum_det, lat_sum_inj, lat_sum_hdl;
     uint32_t lat_max_det, lat_max_inj, lat_max_hdl;
@@ -1709,8 +1711,8 @@ uint32_t __not_in_flash_func(ct_idx_for)(uint32_t addr) {
     return 0xFFFFFFFFu;
 }
 uint32_t __not_in_flash_func(ct_base_for)(uint32_t i) {
-    static const uint32_t b[4] = { CT16B0_BASE, CT16B1_BASE, CT32B0_BASE, CT32B1_BASE };
-    return b[i];
+    // switch statt const-Tabelle: die laege im XIP-Flash (Cache-Miss im Trap).
+    switch (i) { case 0: return CT16B0_BASE; case 1: return CT16B1_BASE; case 2: return CT32B0_BASE; default: return CT32B1_BASE; }
 }
 
 // Treibt den CT-Timer um die seit dem letzten Aufruf verstrichene Zeit weiter.
@@ -1877,6 +1879,19 @@ void __not_in_flash_func(ct_advance)(CtModel& c) {
     }
 }
 
+// Laeuft gerade der injizierte Gast-Handler eines Timers mit Capture-Eingang
+// (sblib-Bus-Handler)? Dann werden Flanken ohnehin erst nach seinem Ruecksprung
+// zugestellt (ct_cap_deliver) - das allgemeine Abtasten je Trap (alle Timer,
+// GPIO-Interrupts), der Capture-Alarm und die Host-SysTick-Neuplanung koennen
+// warten. Der Handler kostete im Emulator ~90 us je Flanke, 80 % davon in Traps.
+CtModel* __not_in_flash_func(ct_active_capture_handler)() {
+    const int irq = irq_inject::active_irq();
+    if (irq < 0) return nullptr;
+    for (auto& c : g_ct)
+        if (static_cast<int>(c.irq_num) == irq && c.cap_pin >= 0 && c.enabled) return &c;
+    return nullptr;
+}
+
 // --- Capture-Alarm ----------------------------------------------------------
 // PIO-Capture-Flanken loesen auf Core1 keinen Interrupt aus (die RP-IRQ-Nummern
 // der PIO zeigen in Core1s Gast-Vektortabelle auf LPC-IRQs). Abgeholt wurden sie
@@ -1896,8 +1911,13 @@ int s_cap_alarm = -1;   // TIMER0-Alarmnummer, -1 = keiner
 void ct_sample_capture(CtModel& c);   // unten
 
 void __not_in_flash_func(isr_capture_alarm)() {
+    CycAcc cyc_acc(g_cyc_alarm);
     timer_hw->intr = 1u << s_cap_alarm;
     bool armed = false;
+    if (ct_active_capture_handler()) {   // Handler laeuft: seine Traps tasten selbst ab
+        timer_hw->alarm[s_cap_alarm] = timer_hw->timerawl + CAPTURE_ALARM_US;
+        return;
+    }
     for (auto& c : g_ct) {
         if (c.cap_pin >= 0 && c.pio_handle >= 0 && (c.ccr & 0x4u) && (c.ccr & 0x3u)) {
             armed = true;
@@ -2130,8 +2150,12 @@ void __not_in_flash_func(ct_sample_capture)(CtModel& c) {
 uint32_t __not_in_flash_func(ct_read_reg)(uint32_t idx, uint32_t reg) {
     CtModel& c = g_ct[idx];
     // Einmal pro Trap fortschreiben (Byte-/Halbwortzugriffe eines Traps teilen
-    // sich den Stand). Capture wurde in begin_access() fuer diesen Trap schon abgetastet.
-    if (c.adv_epoch != g_trap_epoch) { ct_advance(c); c.adv_epoch = g_trap_epoch; }
+    // sich den Stand). Capture wurde in begin_access() fuer diesen Trap schon
+    // abgetastet - ausser im Bus-Handler (s. begin_access): dann hier.
+    if (c.adv_epoch != g_trap_epoch) {
+        if (ct_active_capture_handler() == &c) ct_sample_capture(c);
+        ct_advance(c); c.adv_epoch = g_trap_epoch;
+    }
     switch (reg) {
         case 0x00: ct_tr(c.irq_num, 6, c.ir, c.tc); c.ir_unseen = 0; c.mr_fresh = 0; c.ir_fresh = 0; return c.ir;
         case 0x04: return c.enabled ? 1u : 0u;
@@ -2197,7 +2221,10 @@ static void __noinline __not_in_flash_func(ct_drop_deferred)(CtModel& c, uint32_
 
 void __not_in_flash_func(ct_write_reg)(uint32_t idx, uint32_t reg, uint32_t val, uint32_t mask) {
     CtModel& c = g_ct[idx];
-    if (c.adv_epoch != g_trap_epoch) { ct_advance(c); c.adv_epoch = g_trap_epoch; }
+    if (c.adv_epoch != g_trap_epoch) {
+        if (ct_active_capture_handler() == &c) ct_sample_capture(c);
+        ct_advance(c); c.adv_epoch = g_trap_epoch;
+    }
     auto patch = [&](uint32_t& v) { v = (v & ~mask) | (val & mask); };
     const uint32_t off = reg;
     c.quiet_until_us = 0;          // Registeraenderung: naechstes Ereignis neu bestimmen
@@ -2993,6 +3020,60 @@ ShadowEntry g_mmio_shadow[SHADOW_SLOTS]{};
 
 } // namespace
 
+// --- Diagnose: PC-Sampling-Profiler auf Core1 (CLI 'ct prof') ---------------
+// Ein TIMER0-Alarm ist per EPPB-NMI-Maske auf Core1 als NMI verdrahtet und
+// unterbricht damit auch Traps, SysTick-Shim und Capture-Alarm (alle Prio 0).
+// Jede Probe: (Exception-Nummer << 24) | PC[23:0] in g_diag_buf.
+uint32_t g_diag_buf[1000];
+volatile uint32_t g_prof_n = 0, g_prof_max = 0, g_prof_period = 13;
+volatile bool g_prof_ct_only = false;
+namespace { int s_prof_alarm = -1; uint32_t s_prof_lfsr = 1; }
+extern "C" void __not_in_flash_func(prof_nmi_c)(const uint32_t* f) {
+    timer_hw->intr = 1u << s_prof_alarm;
+    const uint32_t n = g_prof_n;
+    if (n >= g_prof_max) return;
+    s_prof_lfsr = s_prof_lfsr * 1103515245u + 12345u;
+    // Optional nur im injizierten Handler eines Capture-Timers (Bus-Handler).
+    if (g_prof_ct_only && !ct_active_capture_handler()) {
+        timer_hw->alarm[s_prof_alarm] = timer_hw->timerawl + 5u;
+        return;
+    }
+    g_diag_buf[n] = ((f[7] & 0xFFu) << 24) | (f[6] & 0x00FF'FFFFu);
+    g_prof_n = n + 1;
+    s_prof_lfsr = s_prof_lfsr * 1103515245u + 12345u;
+    timer_hw->alarm[s_prof_alarm] = timer_hw->timerawl + g_prof_period + ((s_prof_lfsr >> 16) & 7u);
+}
+extern "C" __attribute__((naked, section(".time_critical.isr_prof_nmi"))) void isr_prof_nmi() {
+    __asm volatile (
+        "tst   lr, #4      \n"
+        "ite   eq          \n"
+        "mrseq r0, msp     \n"
+        "mrsne r0, psp     \n"
+        "b     prof_nmi_c  \n"
+    );
+}
+namespace {
+void prof_install(uint32_t* vtable) {
+    if (s_prof_alarm < 0) {
+        s_prof_alarm = hardware_alarm_claim_unused(false);
+        if (s_prof_alarm < 0) return;
+    }
+    vtable[2] = reinterpret_cast<uint32_t>(&isr_prof_nmi);
+    __dsb();
+    hw_set_bits(&timer_hw->inte, 1u << s_prof_alarm);
+    eppb_hw->nmi_mask[0] |= 1u << (TIMER0_IRQ_0 + static_cast<uint32_t>(s_prof_alarm));
+}
+}
+namespace peripherals {
+void prof_start(uint32_t period_us, uint32_t n, bool ct_only) {
+    if (s_prof_alarm < 0) return;
+    g_prof_ct_only = ct_only;
+    g_prof_n = 0; g_prof_period = period_us ? period_us : 13u;
+    g_prof_max = n > 1000u ? 1000u : n;
+    timer_hw->alarm[s_prof_alarm] = timer_hw->timerawl + g_prof_period;
+}
+}
+
 namespace peripherals {
 
 void init() {
@@ -3130,7 +3211,9 @@ void __not_in_flash_func(on_post_write_hook)() {
         // "Alarm" neu berechnen, damit ein (ggf. Sub-ms-)Match-Interrupt
         // rechtzeitig einen Wakeup bekommt, auch wenn der Gast danach in
         // __WFI() idlet (und selbst wenn der Gast den SysTick nicht nutzt).
-        if (g_ct_dl_dirty) { g_ct_dl_dirty = false; systick_program_hw(); }
+        // Im Bus-Handler erst beim Ruecksprung (ct_note_returned): seine Traps
+        // schreiben das Modell ohnehin fort, Matches sieht er beim IR-Lesen.
+        if (g_ct_dl_dirty && !ct_active_capture_handler()) { g_ct_dl_dirty = false; systick_program_hw(); }
     }
     if (g_pll_reconfig_pending) {
         g_pll_reconfig_pending = false;
@@ -3372,6 +3455,9 @@ bool capture_armed() {
 uint64_t g_samp_cyc_sum = 0; uint32_t g_samp_n = 0, g_samp_max = 0;
 void __not_in_flash_func(begin_access)() {
     ++g_trap_epoch;
+    // Im Bus-Handler: nur der eigene Timer wird abgetastet, und zwar vor seinem
+    // Fortschreiben in ct_read_reg/ct_write_reg (Reihenfolge Flanke vor Match).
+    if (ct_active_capture_handler()) return;
     const uint32_t t0 = cyccnt();
     sample_pin_interrupts();
     const uint32_t d = cyccnt() - t0;
@@ -3776,6 +3862,7 @@ void __not_in_flash_func(ct_note_injected)(uint8_t irq) {
         if (c.irq_num != irq) continue;
         const uint64_t now = fast_time_us();
         c.hdl_t0 = now; c.hdl_ep0 = g_trap_epoch;
+        c.hdl_c0[0] = cyccnt(); c.hdl_c0[1] = g_cyc_trap; c.hdl_c0[2] = g_cyc_alarm; c.hdl_c0[3] = g_cyc_shim;
         ct_tr(c.irq_num, 11, c.ir, c.capq_n);
         if (c.lat_armed && !c.lat_t_inj) c.lat_t_inj = now;
     }
@@ -3786,11 +3873,15 @@ void __not_in_flash_func(ct_note_returned)(int irq) {
         if (static_cast<int>(c.irq_num) != irq || !c.hdl_t0) continue;
         const uint32_t d = static_cast<uint32_t>(fast_time_us() - c.hdl_t0);
         c.hdl_t0 = 0; ++c.hdl_n; c.hdl_sum += d;
+        c.hdl_cyc[0] += cyccnt() - c.hdl_c0[0]; c.hdl_cyc[1] += g_cyc_trap - c.hdl_c0[1];
+        c.hdl_cyc[2] += g_cyc_alarm - c.hdl_c0[2]; c.hdl_cyc[3] += g_cyc_shim - c.hdl_c0[3];
         ct_tr(c.irq_num, 12, c.ir, c.capq_n);
         if (d > c.hdl_max) c.hdl_max = d;
         const uint32_t t = g_trap_epoch - c.hdl_ep0;
         c.hdl_traps += t; if (t > c.hdl_traps_max) c.hdl_traps_max = t;
+        if (c.cap_pin >= 0) ct_sample_capture(c);   // im Handler nur teilweise abgetastet
         if (c.capq_n || c.ir_deferred) { ct_advance(c); ct_cap_deliver(c); }
+        if (g_ct_dl_dirty) { g_ct_dl_dirty = false; systick_program_hw(); }
     }
 }
 
@@ -3870,6 +3961,10 @@ void ct_rx_debug(int idx, uint32_t& cap_n, uint32_t& overrun, uint32_t& hn, uint
     cap_n = c.cap_n; overrun = c.cap_overrun; hn = c.hdl_n; hmax = c.hdl_max;
     havg = c.hdl_n ? static_cast<uint32_t>(c.hdl_sum / c.hdl_n) : 0u;
 }
+void ct_hdl_cyc(int idx, uint32_t out[4]) {
+    const CtModel& c = g_ct[idx & 3];
+    for (int i = 0; i < 4; ++i) out[i] = c.hdl_n ? static_cast<uint32_t>(c.hdl_cyc[i] / c.hdl_n) : 0u;
+}
 
 int ct_tx_handle(int idx, int m) { return g_ct[idx & 3].tx_handle[m & 3]; }
 
@@ -3913,6 +4008,7 @@ void __not_in_flash_func(systick_hw_rearm)() { systick_program_hw(); }
 // ihrer Tabelle auf, bevor sie VTOR umstellen; ein Core1-Reset loescht die
 // NVIC-Freigabe wieder.
 void capture_alarm_install(uint32_t* vtable) {
+    prof_install(vtable);
     if (s_cap_alarm < 0) {
         s_cap_alarm = hardware_alarm_claim_unused(false);
         if (s_cap_alarm < 0) { std::printf("[EMU] Capture-Alarm: kein freier TIMER0-Alarm\n"); return; }

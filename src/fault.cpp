@@ -227,6 +227,7 @@ void print_exc_diag(const char* tag, const uint32_t* f, const uint32_t* r4_r11) 
 
 // Misst die Dauer des Trap-Handlers (DWT-Zyklenzaehler) fuer 'stats'.
 uint32_t g_tprof[5];
+volatile uint32_t g_cyc_trap = 0, g_cyc_alarm = 0, g_cyc_shim = 0;
 uint32_t g_rprof[8][2];   // je Region: Takte, Anzahl   // Summen: bis Decode, Decode, Abtastung, Zugriff, Anzahl MMIO-Traps
 struct TrapTimer {
     uint32_t t0;
@@ -234,6 +235,7 @@ struct TrapTimer {
     ~TrapTimer() {
         const uint32_t d = DWT->CYCCNT - t0;
         faultsys::g_stats.trap_cyc_sum += d;
+        g_cyc_trap += d;
         ++faultsys::g_stats.trap_cyc_n;
         if (d > faultsys::g_stats.trap_cyc_max) faultsys::g_stats.trap_cyc_max = d;
     }
@@ -777,7 +779,7 @@ extern "C" __attribute__((naked, section(".time_critical.isr_memmanage"))) void 
 // Pin-Flanken/Timer, setzen bei fälligem IRQ PendSV (bleibt unter PRIMASK
 // pending und feuert, sobald der Gast die Interrupts wieder freigibt) und
 // kehren hinter das WFI zurück. PRIMASK des Gastes bleibt unangetastet.
-extern "C" void hardfault_c(uint32_t* exc_frame, uint32_t* r4_r11) {
+extern "C" void __not_in_flash_func(hardfault_c)(uint32_t* exc_frame, uint32_t* r4_r11) {
     // Rueckkehr eines injizierten LPC-IRQ-Handlers, der unter PRIMASK lief und
     // dessen 0xFFFFFFFD-Ruecksprung daher zu HardFault eskalierte. Zuerst
     // pruefen (vor jeder PC-Dereferenzierung wie dem WFI-Check unten).

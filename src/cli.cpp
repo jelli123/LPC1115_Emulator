@@ -325,6 +325,8 @@ void cmd_status() {
                                 static_cast<unsigned long>(qq), static_cast<unsigned long>(qp),
                                 static_cast<unsigned long>(qd), static_cast<unsigned long>(qf),
                                 static_cast<unsigned long>(qm));
+                { uint32_t hc[4]; peripherals::ct_hdl_cyc(i, hc);
+                  if (hc[0]) std::printf("  Handler-Takte je Lauf: gesamt=%lu Traps=%lu Alarm=%lu Shim=%lu Rest=%lu\n", (unsigned long)hc[0], (unsigned long)hc[1], (unsigned long)hc[2], (unsigned long)hc[3], (unsigned long)(hc[0]-hc[1]-hc[2]-hc[3])); }
                 if (mdd) std::printf("  Zurueckgehaltene Matches verworfen (Handler setzte TC/MR neu): %lu\n", static_cast<unsigned long>(mdd));
                 if (cn || hn)
                     std::printf("  Capture: n=%lu ueberschrieben=%lu | Gast-Handler: n=%lu mittel=%lu max=%lu us, Traps mittel=%lu max=%lu\n",
@@ -1181,6 +1183,17 @@ void handle_command(char* line) {
         return;
     }
 
+    if (std::strcmp(tokens[0], "ct") == 0 && n >= 2 && std::strcmp(tokens[1], "prof") == 0) {
+        // ct prof <periode_us> [anzahl] [ct]: Proben starten (ct = nur im Bus-Handler); ct prof: ausgeben
+        if (n >= 3) { peripherals::prof_start(std::strtoul(tokens[2], nullptr, 0), n >= 4 ? std::strtoul(tokens[3], nullptr, 0) : 1000u,
+                                              n >= 5 && std::strcmp(tokens[4], "ct") == 0);
+                      std::puts("[PROF] laeuft"); return; }
+        const uint32_t cnt = g_prof_n;
+        std::printf("[PROF] %lu/%lu Proben\n", (unsigned long)cnt, (unsigned long)g_prof_max);
+        for (uint32_t i = 0; i < cnt; ++i) std::printf("%08lx%c", (unsigned long)g_diag_buf[i], (i % 8 == 7) ? '\n' : ' ');
+        std::puts("");
+        return;
+    }
     if (std::strcmp(tokens[0], "ct") == 0 && n >= 2 && std::strcmp(tokens[1], "trace") == 0) {
         // ct trace <timer 0..3>: Aufzeichnung starten; ct trace: ausgeben + stoppen
         if (n >= 3) { peripherals::ct_trace_snap(n >= 5 ? std::strtoul(tokens[4], nullptr, 0) : 0u);
@@ -1209,7 +1222,7 @@ void handle_command(char* line) {
                         count, pin_arg, level ? "high" : "low");
             // Erst sammeln, dann ausgeben: printf je Flanke ist langsamer als ein
             // KNX-Bit, die 8er-FIFO wuerde ueberlaufen (verlorene Flanken).
-            static uint32_t dt_us[1000];            // Bit 31 = Pegel nach der Flanke
+            uint32_t* const dt_us = g_diag_buf;      // Bit 31 = Pegel nach der Flanke
             uint64_t prev = 0; bool have_prev = false; long got = 0;
             absolute_time_t deadline = make_timeout_time_ms(5000);
             while (got < count && !time_reached(deadline)) {

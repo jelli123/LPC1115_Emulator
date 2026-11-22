@@ -181,6 +181,7 @@ __attribute__((naked, section(".time_critical.isr_svc"))) void isr_svc() {
 // Exception-Return dieses Shims wird ein evtl. gependeter LPC-IRQ per PendSV
 // (tail-chained) in den Gast injiziert.
 extern "C" void __not_in_flash_func(isr_systick_shim)() {
+    CycAcc cyc_acc(g_cyc_shim);
     g_shim_enter.fetch_add(1, std::memory_order_relaxed);
     // Debugger-Halt: Anforderung umsetzen; ist der Gast angehalten (Halt im
     // PendSV), weder Gast-Handler noch Zeitmodelle weiterlaufen lassen.

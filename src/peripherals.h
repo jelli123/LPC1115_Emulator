@@ -6,6 +6,16 @@
 
 #include <cstdint>
 
+// Diagnose: aufsummierte Core1-Takte (DWT) in Traps, Capture-Alarm und SysTick-Shim.
+extern uint32_t g_diag_buf[1000];          // gemeinsamer CLI-Diagnosepuffer
+extern volatile uint32_t g_prof_n, g_prof_max;
+extern volatile uint32_t g_cyc_trap, g_cyc_alarm, g_cyc_shim;
+struct CycAcc {
+    volatile uint32_t& acc; uint32_t t0;
+    explicit CycAcc(volatile uint32_t& a) : acc(a), t0(*reinterpret_cast<volatile uint32_t*>(0xE0001004u)) {}
+    ~CycAcc() { acc += *reinterpret_cast<volatile uint32_t*>(0xE0001004u) - t0; }
+};
+
 struct uart_inst;
 typedef struct uart_inst uart_inst_t;   // wie hardware/uart.h
 
@@ -69,6 +79,8 @@ bool capture_armed();
 // (Details in peripherals.cpp). Traegt den Handler in die uebergebene Gast-
 // Vektortabelle ein und gibt den IRQ auf dem aufrufenden Core frei.
 void capture_alarm_install(uint32_t* vtable);
+void prof_start(uint32_t period_us, uint32_t n, bool ct_only);   // PC-Sampling-Profiler Core1 (Diagnose)
+void ct_hdl_cyc(int idx, uint32_t out[4]);   // mittlere Takte je Handlerlauf: gesamt/Trap/Alarm/Shim
 
 struct Stats {
     uint64_t mmio_writes;
