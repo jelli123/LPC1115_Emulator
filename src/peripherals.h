@@ -140,7 +140,9 @@ int  ct_tx_handle(int idx, int m);
 void ct_lat_split(int idx, uint32_t avg[3], uint32_t max[3]);   // Erkennung/Injektion/Handler [us]
 void ct_note_injected(uint8_t irq);
 void ct_note_returned(int irq);
-void ct_trace_start(int idx, bool wait_tx);
+void ct_trace_start(int idx, bool wait_tx, bool ring = false);
+void ct_trace_snap(uint32_t lpc_addr);
+void ct_ack_debug(int idx, uint32_t& frames, uint32_t& missing, uint32_t& def_drop);
 void ct_tccomp_debug(int idx, uint32_t& n, uint32_t& last);
 void ct_trace_dump();
 void ct_capq_debug(int idx, uint32_t& queued, uint32_t& peak, uint32_t& drop, uint32_t& flush, uint32_t& deferred);

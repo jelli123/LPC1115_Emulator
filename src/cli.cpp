@@ -34,6 +34,7 @@ extern "C" void usb_stdio_task(void);
 #include "hardware/structs/pads_bank0.h"
 #include "hardware/structs/io_bank0.h"
 
+
 namespace {
 
 constexpr std::size_t LINE_MAX = 192;
@@ -314,6 +315,9 @@ void cmd_status() {
                 uint32_t qq, qp, qd, qf, qm;
                 peripherals::ct_capq_debug(i, qq, qp, qd, qf, qm);
                 uint32_t tcn, tcl; peripherals::ct_tccomp_debug(i, tcn, tcl);
+                uint32_t maf, mam, mdd; peripherals::ct_ack_debug(i, maf, mam, mdd);
+                if (maf) std::printf("  ACK erwartet (fremde Telegramme): %lu | ohne eigenen Sendepuls: %lu\n",
+                                     static_cast<unsigned long>(maf), static_cast<unsigned long>(mam));
                 if (tcn) std::printf("  TC-Latenzausgleich: n=%lu letzt=+%lu Ticks\n",
                                      static_cast<unsigned long>(tcn), static_cast<unsigned long>(tcl));
                 if (qq || qm)
@@ -321,6 +325,7 @@ void cmd_status() {
                                 static_cast<unsigned long>(qq), static_cast<unsigned long>(qp),
                                 static_cast<unsigned long>(qd), static_cast<unsigned long>(qf),
                                 static_cast<unsigned long>(qm));
+                if (mdd) std::printf("  Zurueckgehaltene Matches verworfen (Handler setzte TC/MR neu): %lu\n", static_cast<unsigned long>(mdd));
                 if (cn || hn)
                     std::printf("  Capture: n=%lu ueberschrieben=%lu | Gast-Handler: n=%lu mittel=%lu max=%lu us, Traps mittel=%lu max=%lu\n",
                                 static_cast<unsigned long>(cn), static_cast<unsigned long>(co),
@@ -1178,7 +1183,8 @@ void handle_command(char* line) {
 
     if (std::strcmp(tokens[0], "ct") == 0 && n >= 2 && std::strcmp(tokens[1], "trace") == 0) {
         // ct trace <timer 0..3>: Aufzeichnung starten; ct trace: ausgeben + stoppen
-        if (n >= 3) { peripherals::ct_trace_start(std::atoi(tokens[2]), n >= 4 && !std::strcmp(tokens[3], "tx")); std::puts("[CT] Trace laeuft"); }
+        if (n >= 3) { peripherals::ct_trace_snap(n >= 5 ? std::strtoul(tokens[4], nullptr, 0) : 0u);
+                      peripherals::ct_trace_start(std::atoi(tokens[2]), n >= 4 && !std::strcmp(tokens[3], "tx"), n >= 4 && !std::strcmp(tokens[3], "ack")); std::puts("[CT] Trace laeuft"); }
         else        peripherals::ct_trace_dump();
         return;
     }
@@ -1203,8 +1209,7 @@ void handle_command(char* line) {
                         count, pin_arg, level ? "high" : "low");
             // Erst sammeln, dann ausgeben: printf je Flanke ist langsamer als ein
             // KNX-Bit, die 8er-FIFO wuerde ueberlaufen (verlorene Flanken).
-            static uint32_t dt_us[1000];
-            static bool     lv[1000];
+            static uint32_t dt_us[1000];            // Bit 31 = Pegel nach der Flanke
             uint64_t prev = 0; bool have_prev = false; long got = 0;
             absolute_time_t deadline = make_timeout_time_ms(5000);
             while (got < count && !time_reached(deadline)) {
@@ -1217,13 +1222,12 @@ void handle_command(char* line) {
                 // Das Programm startet in der High-Schleife: bei Startpegel low
                 // meldet es sofort eine (Schein-)Fallflanke -> ueberspringen.
                 if (!have_prev && !level && !lvl) { prev = t; have_prev = true; continue; }
-                dt_us[got] = have_prev ? static_cast<uint32_t>(t - prev) : 0u;
-                lv[got] = lvl;
+                dt_us[got] = (have_prev ? static_cast<uint32_t>(t - prev) & 0x7FFF'FFFFu : 0u) | (lvl ? 0x8000'0000u : 0u);
                 prev = t; have_prev = true; ++got;
             }
             for (long i = 0; i < got; ++i)
-                std::printf("  [%ld] %s  +%lu us\n", i, lv[i] ? "steigend" : "fallend ",
-                            static_cast<unsigned long>(dt_us[i]));
+                std::printf("  [%ld] %s  +%lu us\n", i, (dt_us[i] >> 31) ? "steigend" : "fallend ",
+                            static_cast<unsigned long>(dt_us[i] & 0x7FFF'FFFFu));
             if (got < count) std::printf("  Timeout nach %ld Flanken\n", got);
             pio_glue::ts_teardown(h);
             return;

@@ -923,7 +923,20 @@ eine zeitlich geordnete Queue (`CtModel::capq`, 16 Einträge): Zugestellt wird
 immer nur das älteste Ereignis, und erst wenn der Handler des Timers nicht
 läuft und das vorige Capture-/Match-Flag gelesen hat (`ir_unseen`). Matches,
 die zeitlich *nach* einer noch wartenden Flanke liegen, werden zurückgehalten
-(`ir_deferred`) und in der richtigen Reihenfolge nachgereicht. Eine Queue,
+(`ir_deferred`) und in der richtigen Reihenfolge nachgereicht. Setzt der
+Handler dieser älteren Flanke TC neu, setzt den Timer zurück oder schreibt das
+betroffene MRm, wird der zurückgehaltene Match verworfen (`ct_drop_deferred`):
+Am LPC läuft der Handler zum Flankenzeitpunkt, also vor dem Matchzeitpunkt,
+und der Match findet mit der neuen Konfiguration nie statt. Typischer Fall
+ist sblib beim Startbit, das knapp vor dem MR2-Timeout „warte auf Startbit“
+kommt. Ohne Verwerfen meldete der nachgereichte alte Timeout einen Byte-Abbruch.
+Das Byte war dann verfälscht, das Telegramm wurde ohne LL-ACK verworfen
+(in16-bim112/sblib 2.10: etwa jedes vierte Telegramm, SB-Project-Download
+brach ab). CR0 verspätet zugestellter Flanken wird bewusst mit der *aktuellen*
+Konfiguration zurückgerechnet: Der latenzausgeglichene TC-Schreibzugriff
+verankert die neue Zeitbasis an der vorigen Flanke. Eine Berechnung mit der
+Konfiguration zum Flankenzeitpunkt (Segment-Historie) wurde getestet und
+verschlechterte den Empfang vollständig. Eine Queue,
 die älter als 5 ms ist, wird notfalls am Stück geleert. Während der Gast sendet
 (`ct_tx_busy`: Puls geplant/laufend, Echo < 500 µs her), bleibt die Queue aus,
 damit das eigene Echo nicht verzögert wird.

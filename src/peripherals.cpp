@@ -1299,15 +1299,34 @@ struct TxPulse { uint64_t base, start, end; };   // base = Periodenbeginn
 
 // Ereignis-Trace des Bus-Timers (CLI 'ct trace'): was der Gast wann sieht/schreibt.
 struct CtTrace { uint32_t t; uint8_t type; uint8_t tm; uint16_t _r; uint32_t a, b; };
-constexpr uint32_t CT_TRACE_N = 64;
+constexpr uint32_t CT_TRACE_N = 16;
 CtTrace  g_ct_trace[CT_TRACE_N];
 volatile uint32_t g_ct_trace_n = 0;      // Anzahl Eintraege
 volatile int      g_ct_trace_irq = -1;   // IRQ-Nummer des aufgezeichneten Timers (-1 = aus)
 volatile bool     g_ct_trace_wait_tx = false;   // erst ab dem ersten Sendepuls aufzeichnen
+volatile bool     g_ct_trace_ring = false;      // Ringpuffer, eingefroren bei fehlendem ACK
+volatile bool     g_ct_trace_frozen = false;
+uint32_t          g_ct_snap_addr = 0;           // LPC-RAM-Adresse, beim Einfrieren gesichert
+uint8_t           g_ct_snap[48];
+// Kompaktes Telegramm-Log (Ringmodus): nur Ereignisse des laufenden Telegramms,
+// geleert bei jedem Telegrammbeginn, eingefroren bei fehlendem ACK.
+struct CtFl { uint16_t t; uint8_t type; uint8_t _r; uint16_t a, b; };
+constexpr uint32_t CT_FL_N = 128;
+CtFl              g_fl[CT_FL_N];
+volatile uint32_t g_fl_n = 0;
 inline void __not_in_flash_func(ct_tr)(uint8_t irq, uint8_t type, uint32_t a, uint32_t b) {
     if (static_cast<int>(irq) != g_ct_trace_irq) return;
     if (g_ct_trace_wait_tx) { if (type != 16) return; g_ct_trace_wait_tx = false; }
     const uint32_t n = g_ct_trace_n;
+    if (g_ct_trace_ring) {
+        if (g_ct_trace_frozen) return;
+        if (type == 1 || type == 6 || type == 7 || type == 11 || type == 12) return;
+        if (type == 9) { a = b & 0xFFFFu; b >>= 16; }
+        g_ct_trace_n = n + 1;
+        const uint32_t k = g_fl_n;
+        if (k < CT_FL_N) { g_fl[k] = { static_cast<uint16_t>(cyccnt() >> 7), type, 0, static_cast<uint16_t>(a), static_cast<uint16_t>(b) }; g_fl_n = k + 1; }
+        return;
+    }
     if (n >= CT_TRACE_N) return;
     g_ct_trace[n] = { cyccnt(), type, 0, 0, a, b };
     g_ct_trace_n = n + 1;
@@ -1381,7 +1400,20 @@ struct CtModel {
     uint8_t  capq_n;
     uint8_t  capq_peak;        // Diagnose: groesste Tiefe
     uint32_t capq_queued, capq_drop, capq_flush;
+    // Verlauf der Zaehler-Konfiguration (TC/TCR/PR/MCR/MR-Schreibzugriffe): CR0
+    // einer verzoegert zugestellten Flanke wird mit der Konfiguration ZUM
+    // Flankenzeitpunkt berechnet. Frueher galt die aktuelle - hatte der Handler
+    // inzwischen TC zurueckgesetzt oder MR2/MCR geaendert, lag CR0 daneben und
+    // die sblib setzte Bytes falsch zusammen (kein LL_ACK).
+    // Diagnose "fehlendes ACK": fremdes langes Telegramm ohne eigenen Sendepuls danach.
+    uint64_t ma_last;      // letzte fallende Flanke (us)
+    uint16_t ma_falls;     // fallende Flanken im laufenden Telegramm
+    bool     ma_tx_frame;  // waehrend des laufenden Telegramms Sendepuls geplant
+    bool     ma_tx_after;  // seit Telegrammende Sendepuls geplant
+    bool     ma_check;     // vorheriges Telegramm war lang + fremd -> ACK erwartet
+    uint32_t ma_missing, ma_frames;
     uint32_t ir_deferred;      // zurueckgehaltene Match-Flags (Bit 0..3)
+    uint32_t def_drop;         // verworfen, weil der Handler TC/MRm vorher neu setzte
     uint64_t def_t;            // Zeitpunkt des fruehesten zurueckgehaltenen Matches
     uint32_t def_n;            // Diagnose: Anzahl zurueckgehaltener Matches
     uint8_t  txn[4];
@@ -1462,7 +1494,8 @@ uint64_t __not_in_flash_func(ct_period)(const CtModel& c) {
 // TC-Wert zum (vergangenen) Zeitpunkt t_us - Grundlage fuer CR0. Rechnet vom
 // aktuellen Modellstand (c.tc gilt ab c.last_us) zurueck, inklusive Periodenresets.
 uint32_t __not_in_flash_func(ct_tc_at)(const CtModel& c, uint64_t t_us) {
-    if (!c.enabled || t_us >= c.last_us) return c.tc;
+    if (t_us >= c.last_us) return c.tc;
+    if (!c.enabled) return c.tc;
     const uint64_t hz    = g_current_hz ? static_cast<uint64_t>(g_current_hz) : 1u;
     const uint64_t back  = (c.last_us - t_us) * hz / (1'000'000ull * (static_cast<uint64_t>(c.pre) + 1u));
     const uint64_t period = ct_period(c);
@@ -1501,6 +1534,7 @@ bool __not_in_flash_func(tx_emit_rel)(CtModel& c, int m, uint64_t ref, const TxP
     if (!pio_glue::tx_emit(c.tx_handle[m], static_cast<uint32_t>(d > 0 ? d : 0),
                            static_cast<uint32_t>(w > 0 ? w : 0))) { ++c.dbg_tx_skip[3]; return false; }
     ++c.dbg_tx_emit;
+    c.ma_tx_frame = true; c.ma_tx_after = true;
     ct_tr(c.irq_num, 16, static_cast<uint32_t>(p.start / 1000u), static_cast<uint32_t>(p.end / 1000u));
     return true;
 }
@@ -1971,7 +2005,7 @@ void __not_in_flash_func(ct_cap_deliver)(CtModel& c) {
         --c.capq_n;
         c.cr0 = ct_tc_at(c, t);
         c.ir |= (1u << 4); c.ir_unseen |= (1u << 4);
-        ct_tr(c.irq_num, 2, c.cr0, c.tc);
+        ct_tr(c.irq_num, 2, c.cr0, g_ct_trace_ring ? static_cast<uint32_t>(t) : c.tc);
         if (c.ccr & 0x4u) irq_inject::pend(c.irq_num);
         return;
     }
@@ -1998,6 +2032,26 @@ void __not_in_flash_func(ct_sample_capture_pio)(CtModel& c) {
     uint64_t t_edge; bool level;
     bool advanced = false;
     while (pio_glue::ts_read_edge(c.pio_handle, t_edge, level)) {
+        if (!level) {
+            // Telegrammgrenze: > 1 ms Ruhe. Erwartet war ein ACK (langes fremdes
+            // Telegramm), aber seit dessen Ende kein eigener Sendepuls -> zaehlen.
+            if (t_edge - c.ma_last > 1000u) {
+                if (c.ma_check && !c.ma_tx_after) {
+                    ++c.ma_missing;
+                    if (g_ct_trace_ring && !g_ct_trace_frozen && static_cast<int>(c.irq_num) == g_ct_trace_irq) {
+                        ct_tr(c.irq_num, 18, static_cast<uint32_t>(t_edge - c.ma_last), c.ma_falls);
+                        g_ct_trace_frozen = true;
+                        if (g_ct_snap_addr >= 0x1000'0000u && g_ct_snap_addr + sizeof g_ct_snap <= 0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE)
+                            std::memcpy(g_ct_snap, reinterpret_cast<const uint8_t*>(emulator::guest_ram_base() + (g_ct_snap_addr - 0x1000'0000u)), sizeof g_ct_snap);
+                    }
+                }
+                if (g_ct_trace_ring && !g_ct_trace_frozen) g_fl_n = 0;
+                c.ma_check = c.ma_falls >= 30 && !c.ma_tx_frame;
+                if (c.ma_check) ++c.ma_frames;
+                c.ma_falls = 0; c.ma_tx_frame = false; c.ma_tx_after = false;
+            }
+            c.ma_last = t_edge; ++c.ma_falls;
+        }
         if (!((level && rise_arm) || (!level && fall_arm))) continue;
         const uint32_t dly = config::tmatch_delay_us();
         const bool own = dly && ct_is_own_echo(c, t_edge);
@@ -2090,6 +2144,18 @@ bool     g_ct_dl_dirty = false;   // Interrupt-Termin kann sich geaendert haben 
 // Registerschreibzugriff; mask waehlt die geschriebenen Bytes (Wort: alle,
 // STRB/STRH: nur deren Lanes). Ein Wortzugriff laeuft so EINMAL durch das
 // Modell statt viermal byteweise (Trap-Kosten, sblib-Sendetakt).
+// Zurueckgehaltener Match (s. ct_advance) wartete nur auf die Zustellung einer
+// AELTEREN Flanke. Setzt deren Handler TC, den Timer oder MRm neu, haette der
+// Match am LPC nie stattgefunden: dort laeuft der Handler zum Flankenzeitpunkt,
+// also vor dem Matchzeitpunkt. Ohne Verwerfen meldete die sblib nach dem
+// Startbit einen Byte-Timeout (MR2 alt) -> Byte verloren, Telegramm ohne ACK.
+static void __noinline __not_in_flash_func(ct_drop_deferred)(CtModel& c, uint32_t bits) {
+    if (!(c.ir_deferred & bits)) return;
+    if (irq_inject::active_irq() != static_cast<int>(c.irq_num)) return;
+    c.ir_deferred &= ~bits; ++c.def_drop;
+    ct_tr(c.irq_num, 19, bits, c.ir_deferred);
+}
+
 void __not_in_flash_func(ct_write_reg)(uint32_t idx, uint32_t reg, uint32_t val, uint32_t mask) {
     CtModel& c = g_ct[idx];
     if (c.adv_epoch != g_trap_epoch) { ct_advance(c); c.adv_epoch = g_trap_epoch; }
@@ -2131,9 +2197,10 @@ void __not_in_flash_func(ct_write_reg)(uint32_t idx, uint32_t reg, uint32_t val,
             patch(v);
             bool was = c.enabled;
             c.enabled = (v & 0x1u) != 0;
-            if (v & 0x2u) { c.tc = 0; c.pc = 0; }
+            if (v & 0x2u) { c.tc = 0; c.pc = 0; ct_drop_deferred(c, 0xFu); }
             ct_tr(c.irq_num, 14, v, c.tc);
             if (!was && c.enabled) c.last_us = fast_time_us();
+           
             break;
         }
         case 0x08: {
@@ -2160,16 +2227,18 @@ void __not_in_flash_func(ct_write_reg)(uint32_t idx, uint32_t reg, uint32_t val,
                 }
             }
             c.tc_rd_valid = false;
+            ct_drop_deferred(c, 0xFu);
             ct_tr(c.irq_num, 8, c.tc, c.tc_comp_last);
+           
             break;
         }
-        case 0x0C: patch(c.pre);   break;
+        case 0x0C: patch(c.pre); break;
         case 0x10: patch(c.pc);    break;
         case 0x14: patch(c.mcr); ct_tr(c.irq_num, 10, c.mcr, c.tc); break;
-        case 0x18: patch(c.mr[0]); c.mr_fresh |= 1u; if (mask & 0xFF00'0000u) ct_note_latency(c); ct_tr(c.irq_num, 17, c.mr[0], c.tc); break;
-        case 0x1C: patch(c.mr[1]); c.mr_fresh |= 2u; break;
-        case 0x20: patch(c.mr[2]); c.mr_fresh |= 4u; ct_tr(c.irq_num, 9, 2, c.mr[2] | (c.tc << 16)); break;
-        case 0x24: patch(c.mr[3]); c.mr_fresh |= 8u; break;
+        case 0x18: patch(c.mr[0]); ct_drop_deferred(c, 1u); c.mr_fresh |= 1u; if (mask & 0xFF00'0000u) ct_note_latency(c); ct_tr(c.irq_num, 17, c.mr[0], c.tc); break;
+        case 0x1C: patch(c.mr[1]); ct_drop_deferred(c, 2u); c.mr_fresh |= 2u; break;
+        case 0x20: patch(c.mr[2]); ct_drop_deferred(c, 4u); c.mr_fresh |= 4u; ct_tr(c.irq_num, 9, 2, c.mr[2] | (c.tc << 16)); break;
+        case 0x24: patch(c.mr[3]); ct_drop_deferred(c, 8u); c.mr_fresh |= 8u; break;
         case 0x28: patch(c.ccr); ct_tr(c.irq_num, 13, c.ccr, c.tc); break;
         case 0x2C: /* CR0 read-only */ break;
         case 0x3C: {
@@ -3689,21 +3758,63 @@ void ct_tccomp_debug(int idx, uint32_t& n, uint32_t& last) {
     const CtModel& c = g_ct[idx & 3]; n = c.tc_comp_n; last = c.tc_comp_last;
 }
 
-void ct_trace_start(int idx, bool wait_tx) { g_ct_trace_n = 0; g_ct_trace_wait_tx = wait_tx; g_ct_trace_irq = g_ct[idx & 3].irq_num; }
+void ct_trace_snap(uint32_t lpc_addr) { g_ct_snap_addr = lpc_addr; }
+void ct_trace_start(int idx, bool wait_tx, bool ring) {
+    g_ct_trace_irq = -1; g_ct_trace_n = 0; g_ct_trace_wait_tx = wait_tx;
+    g_ct_trace_ring = ring; g_ct_trace_frozen = false; g_fl_n = 0;
+    g_ct_trace_irq = g_ct[idx & 3].irq_num;
+}
+void ct_ack_debug(int idx, uint32_t& frames, uint32_t& missing, uint32_t& def_drop) {
+    frames = g_ct[idx & 3].ma_frames; missing = g_ct[idx & 3].ma_missing; def_drop = g_ct[idx & 3].def_drop;
+}
 void ct_trace_dump() {
-    const uint32_t n = g_ct_trace_n;
+    uint32_t n = g_ct_trace_n;
     g_ct_trace_irq = -1;
-    static const char* nm[18] = {"?","cap-ein","cap-zu","match-hold","match-nach","match","IR-rd","IR-wr",
-                                 "TC-wr","MR2-wr","MCR-wr","inject","return","CCR-wr","TCR-wr","flush","tx-puls","MR0-wr"};
+    if (g_ct_trace_ring) {
+        std::printf("-- Ring %s, %lu Eintraege gesamt\n", g_ct_trace_frozen ? "eingefroren (fehlendes ACK)" : "nicht ausgeloest",
+                    static_cast<unsigned long>(n));
+        if (n > CT_TRACE_N) {   // in zeitliche Reihenfolge bringen (Rotation in-place)
+            uint32_t k = n % CT_TRACE_N;
+            for (uint32_t r = 0; r < k; ++r) {
+                const CtTrace first = g_ct_trace[0];
+                for (uint32_t i = 0; i + 1 < CT_TRACE_N; ++i) g_ct_trace[i] = g_ct_trace[i + 1];
+                g_ct_trace[CT_TRACE_N - 1] = first;
+            }
+            n = CT_TRACE_N;
+        }
+        g_ct_trace_ring = false;
+        n = 0;
+        if (g_ct_trace_frozen && g_ct_snap_addr) {
+            for (uint32_t i = 0; i < sizeof g_ct_snap; i += 16) {
+                std::printf("  RAM %08lx:", static_cast<unsigned long>(g_ct_snap_addr + i));
+                for (uint32_t j = 0; j < 16; ++j) std::printf(" %02x", g_ct_snap[i + j]);
+                std::printf("\n");
+            }
+        }
+    }
+    static const char* nm[20] = {"?","cap-ein","cap-zu","match-hold","match-nach","match","IR-rd","IR-wr",
+                                 "TC-wr","MR2-wr","MCR-wr","inject","return","CCR-wr","TCR-wr","flush","tx-puls","MR0-wr","ACK-fehlt","match-weg"};
     const uint32_t t0 = n ? g_ct_trace[0].t : 0;
     for (uint32_t i = 0; i < n; ++i) {
         const CtTrace& e = g_ct_trace[i];
         const uint32_t dt = (e.t - t0) / 15u;   // 0.1 us bei 150 MHz
-        std::printf("%6lu.%lu %-10s %08lx %08lx\n", static_cast<unsigned long>(dt / 10u), static_cast<unsigned long>(dt % 10u), nm[e.type < 18 ? e.type : 0],
+        std::printf("%6lu.%lu %-10s %08lx %08lx\n", static_cast<unsigned long>(dt / 10u), static_cast<unsigned long>(dt % 10u), nm[e.type < 20 ? e.type : 0],
                     static_cast<unsigned long>(e.a), static_cast<unsigned long>(e.b));
         if ((i & 31) == 31) sleep_ms(20);   // UART-Puffer nicht ueberlaufen lassen
     }
     std::printf("-- %lu Eintraege\n", static_cast<unsigned long>(n));
+    const uint32_t fn = g_fl_n;
+    if (fn) {
+        std::printf("-- Telegramm-Log (t in us, cap-zu: CR0 / Flanke-us)\n");
+        const uint32_t f0 = g_fl[0].t;
+        for (uint32_t i = 0; i < fn; ++i) {
+            const CtFl& e = g_fl[i];
+            const uint32_t dt = (static_cast<uint32_t>(static_cast<uint16_t>(e.t - f0)) * 128u) / 150u;
+            std::printf("%6lu %-10s %04x %04x\n", static_cast<unsigned long>(dt), nm[e.type < 20 ? e.type : 0], e.a, e.b);
+            if ((i & 31) == 31) sleep_ms(20);
+        }
+        g_fl_n = 0;
+    }
 }
 
 void ct_rx_debug(int idx, uint32_t& cap_n, uint32_t& overrun, uint32_t& hn, uint32_t& havg, uint32_t& hmax,
