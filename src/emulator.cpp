@@ -563,6 +563,7 @@ void core1_main() {
         uint32_t load_base = reinterpret_cast<uint32_t>(g_firmware_image);
         SCB->VTOR = load_base;
         __DSB(); __ISB();
+        peripherals::capture_alarm_install(dst);   // PIO-Capture zeitnah abholen
 
         // Aktive Vektortabelle = Anfang des Images (Bootloader bzw. direkt
         // geflashte Applikation). Ein evtl. spaeterer Handover stellt das um.
@@ -863,6 +864,7 @@ void activate_bootloader_handover() {
         dst[11] = reinterpret_cast<uint32_t>(&isr_svc);
     }
 
+    peripherals::capture_alarm_install(dst);   // auch in der App-Tabelle, vor dem Umschalten
     uint32_t base = reinterpret_cast<uint32_t>(img) + app_off;
     SCB->VTOR = base;
     __DSB(); __ISB();

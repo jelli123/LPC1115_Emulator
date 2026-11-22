@@ -20,6 +20,8 @@
 #include "hardware/spi.h"
 #include "hardware/adc.h"
 #include "hardware/timer.h"
+#include "hardware/irq.h"
+#include "hardware/sync.h"
 #include "hardware/powman.h"
 #include "hardware/structs/powman.h"
 #include "hardware/structs/clocks.h"
@@ -278,8 +280,12 @@ bool resolve_uart_pins(int tx, int rx, uart_inst_t*& inst,
 // als digitalen Aus-/Eingang übersteuern, sonst kollidiert es mit der Bridge.
 bool bridge_owns_gpio(int g) {
     if (g < 0) return false;
-    // ADC: feste RP2350A-ADC-Pins GP26..29.
-    if (config::adc_bridge_enabled() && g >= 26 && g <= 29) return true;
+    // ADC: nur die GP26..29, die tatsaechlich einem LPC-ADC-Kanal zugeordnet
+    // sind (adc.<ch>=<gpio>). Frueher alle vier - auf dem IO-8x (nur AD7 ->
+    // GP29) waren so die Digitalkanaele IO1..IO3 an GP26..28 tot.
+    if (config::adc_bridge_enabled() && g >= 26 && g <= 29)
+        for (int ch = 0; ch < 8; ++ch)
+            if (config::adc_gpio(ch) == g) return true;
     // SPI: SCK/MOSI/MISO.
     if (config::spi_bridge_enabled()) {
         if (g == config::spi_bridge_sck_pin() ||
@@ -1307,11 +1313,11 @@ volatile bool     g_ct_trace_wait_tx = false;   // erst ab dem ersten Sendepuls 
 volatile bool     g_ct_trace_ring = false;      // Ringpuffer, eingefroren bei fehlendem ACK
 volatile bool     g_ct_trace_frozen = false;
 uint32_t          g_ct_snap_addr = 0;           // LPC-RAM-Adresse, beim Einfrieren gesichert
-uint8_t           g_ct_snap[48];
+uint8_t           g_ct_snap[192];
 // Kompaktes Telegramm-Log (Ringmodus): nur Ereignisse des laufenden Telegramms,
 // geleert bei jedem Telegrammbeginn, eingefroren bei fehlendem ACK.
 struct CtFl { uint16_t t; uint8_t type; uint8_t _r; uint16_t a, b; };
-constexpr uint32_t CT_FL_N = 128;
+constexpr uint32_t CT_FL_N = 160;
 CtFl              g_fl[CT_FL_N];
 volatile uint32_t g_fl_n = 0;
 inline void __not_in_flash_func(ct_tr)(uint8_t irq, uint8_t type, uint32_t a, uint32_t b) {
@@ -1320,11 +1326,12 @@ inline void __not_in_flash_func(ct_tr)(uint8_t irq, uint8_t type, uint32_t a, ui
     const uint32_t n = g_ct_trace_n;
     if (g_ct_trace_ring) {
         if (g_ct_trace_frozen) return;
-        if (type == 1 || type == 6 || type == 7 || type == 11 || type == 12) return;
+        if (type == 1 || type == 6 || type == 7 || type == 9 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14) return;
         if (type == 9) { a = b & 0xFFFFu; b >>= 16; }
         g_ct_trace_n = n + 1;
         const uint32_t k = g_fl_n;
-        if (k < CT_FL_N) { g_fl[k] = { static_cast<uint16_t>(cyccnt() >> 7), type, 0, static_cast<uint16_t>(a), static_cast<uint16_t>(b) }; g_fl_n = k + 1; }
+        // Ring: die letzten CT_FL_N Ereignisse vor dem Einfrieren (fehlendes ACK am Telegrammende)
+        g_fl[k % CT_FL_N] = { static_cast<uint16_t>(cyccnt() >> 7), type, 0, static_cast<uint16_t>(a), static_cast<uint16_t>(b) }; g_fl_n = k + 1;
         return;
     }
     if (n >= CT_TRACE_N) return;
@@ -1870,6 +1877,36 @@ void __not_in_flash_func(ct_advance)(CtModel& c) {
     }
 }
 
+// --- Capture-Alarm ----------------------------------------------------------
+// PIO-Capture-Flanken loesen auf Core1 keinen Interrupt aus (die RP-IRQ-Nummern
+// der PIO zeigen in Core1s Gast-Vektortabelle auf LPC-IRQs). Abgeholt wurden sie
+// bisher nur bei MMIO-Traps und im SysTick-Shim (<= 1 ms). Rechnet der Gast eine
+// Weile nur im RAM (z. B. in16: userEeprom-Accessoren in der Hauptschleife, oder
+// natives WFI), sah die sblib das Startbit erst bis zu ~0,5 ms spaeter, dekodierte
+// Muell und quittierte nichts mehr - sobald die Applikation lief (Download brach
+// bei "Applikation: Laden abschliessen" ab, danach keine Verbindung mehr).
+// Abhilfe: ein freier TIMER0-Alarm, dessen RP-IRQ (TIMER0_IRQ_0..3) in den
+// LPC-Slot PIO0_0..PIO0_3 (Start-Logik/Deep-Sleep-Wakeup, von der sblib nicht
+// genutzt) faellt. Der Handler prueft nur die Capture-FIFOs (~1 us) und taktet
+// sich bei scharfer Capture alle CAPTURE_ALARM_US neu, sonst jede 1 ms.
+// Prioritaet wie SysTick-Shim/Traps (0): unterbricht Gast-Code und injizierte
+// Gast-Handler, aber keine Traps und nicht den Shim.
+constexpr uint32_t CAPTURE_ALARM_US = 20;
+int s_cap_alarm = -1;   // TIMER0-Alarmnummer, -1 = keiner
+void ct_sample_capture(CtModel& c);   // unten
+
+void __not_in_flash_func(isr_capture_alarm)() {
+    timer_hw->intr = 1u << s_cap_alarm;
+    bool armed = false;
+    for (auto& c : g_ct) {
+        if (c.cap_pin >= 0 && c.pio_handle >= 0 && (c.ccr & 0x4u) && (c.ccr & 0x3u)) {
+            armed = true;
+            ct_sample_capture(c);
+        }
+    }
+    timer_hw->alarm[s_cap_alarm] = timer_hw->timerawl + (armed ? CAPTURE_ALARM_US : 1000u);
+}
+
 // Ermittelt die absolute Zeit (time_us_64-Domain) des naechsten faelligen
 // Match-INTERRUPTS ueber alle aktiven CT-Timer, ~0 wenn keiner ansteht. Nur
 // Matches mit gesetztem MCR-Interrupt-Bit zaehlen (die einen Wakeup aus __WFI()
@@ -2043,6 +2080,8 @@ void __not_in_flash_func(ct_sample_capture_pio)(CtModel& c) {
                         g_ct_trace_frozen = true;
                         if (g_ct_snap_addr >= 0x1000'0000u && g_ct_snap_addr + sizeof g_ct_snap <= 0x1000'0000u + emulator::LPC_GUEST_RAM_SIZE)
                             std::memcpy(g_ct_snap, reinterpret_cast<const uint8_t*>(emulator::guest_ram_base() + (g_ct_snap_addr - 0x1000'0000u)), sizeof g_ct_snap);
+                        else if (g_ct_snap_addr >= 0x2000'0000u && g_ct_snap_addr + sizeof g_ct_snap <= 0x2008'2000u)
+                            std::memcpy(g_ct_snap, reinterpret_cast<const uint8_t*>(g_ct_snap_addr), sizeof g_ct_snap);   // Gast-Heap im RP-SRAM
                     }
                 }
                 if (g_ct_trace_ring && !g_ct_trace_frozen) g_fl_n = 0;
@@ -3284,7 +3323,12 @@ void __not_in_flash_func(sample_pin_interrupts)() {
 // fällige IRQs. ct_advance/wdt_advance/g_ct/g_wdt liegen im anonymen
 // Namespace oben, sind in dieser TU aber sichtbar.
 void __not_in_flash_func(poll_timed_sources)() {
-    for (auto& c : g_ct) { ct_advance(c); ct_sample_capture(c); }
+    // Erst Flanken aus der PIO-FIFO einreihen, DANN fortschreiben: sonst meldet
+    // ct_advance einen Match (sblib: Inter-Char-Timeout MR2), obwohl die naechste
+    // Startflanke schon vorher kam und nur noch nicht abgeholt war. Der Gast sah
+    // dann Telegrammende mitten im Telegramm -> zwei ungueltige Teile, kein ACK
+    // (v. a. T_ACKs der Gegenstelle -> 3 s Wiederholung, Download-Abbruch).
+    for (auto& c : g_ct) { ct_sample_capture(c); ct_advance(c); }
     wdt_advance();
     systick_advance();
     ncn5130::poll();   // virtueller NCN5130: TX-Abschluss/L_Data.con (Core1)
@@ -3806,9 +3850,11 @@ void ct_trace_dump() {
     const uint32_t fn = g_fl_n;
     if (fn) {
         std::printf("-- Telegramm-Log (t in us, cap-zu: CR0 / Flanke-us)\n");
-        const uint32_t f0 = g_fl[0].t;
-        for (uint32_t i = 0; i < fn; ++i) {
-            const CtFl& e = g_fl[i];
+        const uint32_t first = fn > CT_FL_N ? fn - CT_FL_N : 0u;
+        if (first) std::printf("-- (die ersten %lu Ereignisse des Telegramms verdraengt)\n", static_cast<unsigned long>(first));
+        const uint32_t f0 = g_fl[first % CT_FL_N].t;
+        for (uint32_t i = first; i < fn; ++i) {
+            const CtFl& e = g_fl[i % CT_FL_N];
             const uint32_t dt = (static_cast<uint32_t>(static_cast<uint16_t>(e.t - f0)) * 128u) / 150u;
             std::printf("%6lu %-10s %04x %04x\n", static_cast<unsigned long>(dt), nm[e.type < 20 ? e.type : 0], e.a, e.b);
             if ((i & 31) == 31) sleep_ms(20);
@@ -3861,6 +3907,25 @@ void uart0_init_debug(uint32_t& init_enter, uint32_t& init_exit) {
 // Vom Host-SysTick-Shim (emulator.cpp) genutzt: programmiert den realen Core1-
 // SysTick auf den naechsten Deadline (adaptiver "HW-Alarm").
 void __not_in_flash_func(systick_hw_rearm)() { systick_program_hw(); }
+
+// Capture-Alarm (s. isr_capture_alarm) in eine Gast-Vektortabelle eintragen und
+// auf dem aufrufenden Core (Core1) freigeben. Loader und Handover rufen das mit
+// ihrer Tabelle auf, bevor sie VTOR umstellen; ein Core1-Reset loescht die
+// NVIC-Freigabe wieder.
+void capture_alarm_install(uint32_t* vtable) {
+    if (s_cap_alarm < 0) {
+        s_cap_alarm = hardware_alarm_claim_unused(false);
+        if (s_cap_alarm < 0) { std::printf("[EMU] Capture-Alarm: kein freier TIMER0-Alarm\n"); return; }
+    }
+    const uint32_t irq = TIMER0_IRQ_0 + static_cast<uint32_t>(s_cap_alarm);
+    vtable[16u + irq] = reinterpret_cast<uint32_t>(&isr_capture_alarm);
+    __dsb();
+    irq_set_priority(irq, 0u);
+    hw_set_bits(&timer_hw->inte, 1u << s_cap_alarm);
+    timer_hw->alarm[s_cap_alarm] = timer_hw->timerawl + 1000u;
+    irq_clear(irq);
+    irq_set_enabled(irq, true);
+}
 
 // Vom Host-SysTick-Shim konsumiert: Anzahl seit dem letzten Aufruf faelliger
 // Gast-SysTick-Perioden (die der Shim durch entsprechend viele Aufrufe des

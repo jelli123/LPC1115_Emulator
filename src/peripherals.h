@@ -65,6 +65,11 @@ void live_map_poll(bool force = false);
 // 50-µs-Pause), damit KNX-Busflanken (~104 µs/Bit) zeitlich aufgelöst werden.
 bool capture_armed();
 
+// Capture-Alarm: TIMER0-Alarm, der PIO-Capture-Flanken alle ~20 us abholt
+// (Details in peripherals.cpp). Traegt den Handler in die uebergebene Gast-
+// Vektortabelle ein und gibt den IRQ auf dem aufrufenden Core frei.
+void capture_alarm_install(uint32_t* vtable);
+
 struct Stats {
     uint64_t mmio_writes;
     uint64_t mmio_reads;
