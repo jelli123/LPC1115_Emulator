@@ -435,6 +435,8 @@ bool firmware_read(std::size_t offset, void* dst, std::size_t len) {
 
 void firmware_flush() { fw_flush_sector(); }
 
+uint32_t firmware_seq() { return firmware_sequence; }
+
 bool firmware_commit() {
     fw_flush_sector();
     const uint8_t* img = xip_ptr(firmware_region_offset);

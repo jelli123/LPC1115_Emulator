@@ -1,5 +1,6 @@
 #include "fast_time.h"
 #include "emulator.h"
+#include "iap.h"
 #include "mmu.h"
 #include "fault.h"
 #include "peripherals.h"
@@ -212,6 +213,7 @@ extern "C" void __not_in_flash_func(isr_systick_shim)() {
     // sonst spaetestens jede 1 ms. Treibt die zeitbasierten LPC-Modelle und
     // weckt den Gast aus __WFI().
     peripherals::poll_timed_sources();      // CT16/CT32/WWDT + SysTick-Schatten
+    iap::core1_poll();                      // verzoegerte Gast-Flash-Schreibzugriffe (1 s)
     peripherals::sample_pin_interrupts();
 
     // Gast-SysTick_Handler nur so oft aufrufen, wie echte Gast-Perioden
@@ -440,6 +442,8 @@ void core1_main() {
         // Wie ein echter LPC-Reset: Peripherie-Register und vNVIC zuruecksetzen.
         peripherals::guest_reset();
         vnvic::reset();
+
+        iap::flush_pending(0);   // offene Gast-Flash-Schreibzugriffe vor dem Neuladen sichern
 
         // Firmware in RP2350-SRAM kopieren. Quelle ist storage::firmware_data()
         // — ein Pointer in den memory-mapped XIP-Bereich.

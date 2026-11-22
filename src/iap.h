@@ -45,6 +45,13 @@ struct Stats {
 };
 Stats stats();
 
+// Verzoegerte Gast-Flash-Schreibzugriffe ins RP2350-Flash uebernehmen, wenn der
+// letzte mindestens min_age_ms zurueckliegt (0: sofort, z. B. vor Gast-Reload).
+// Liefert true, wenn geschrieben wurde.
+bool flush_pending(uint32_t min_age_ms);
+// Nur Core1 (SysTick-Shim): schreibt, sobald der letzte Zugriff 1 s alt ist.
+void core1_poll();
+
 // Eindeutige ID (4 Worte) wie IAP 58 / ISP 'N'.
 void read_uid(uint32_t w[4]);
 

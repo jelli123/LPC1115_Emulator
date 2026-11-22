@@ -83,6 +83,9 @@ void firmware_discard();
 bool firmware_read(std::size_t offset, void* dst, std::size_t len);
 // Schreibt den Sektor-Puffer ins Flash (ohne Marker).
 void firmware_flush();
+// Zaehlt bei jedem Finalize/Commit hoch (0 nach Erase): erkennt ueberholte
+// verzoegerte Schreibvorgaenge (iap::flush_pending).
+uint32_t firmware_seq();
 // Flusht und setzt den Marker auf die tatsaechliche Laenge (letztes Nicht-0xFF-
 // Byte + 1). Ist der Slot leer, wird der Marker geloescht (= keine Firmware).
 // Fuer den ISP, wo Loeschen/Programmieren die Laenge auch verkleinern kann.

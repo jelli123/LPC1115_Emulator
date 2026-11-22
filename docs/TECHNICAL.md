@@ -499,8 +499,8 @@ crasht der betroffene Core. Betroffen sind zwei Pfade:
   in der SDK-Spin-Schleife steht (SDK-VTOR). `stop()` legt zudem Core 0s
   `SIO_IRQ_FIFO` während Reset+Relaunch still, damit der Lockout-Handler nicht
   die Multicore-Handshake-Bytes wegdrainiert.
-* **Core 1 schreibt** (IAP `persist()` im Fault-Handler, z. B. Selfbus-EEPROM/
-  OTA): sperrt Core 0 per `multicore_lockout_start_blocking()` aus. Dafür ist
+* **Core 1 schreibt** (verzögerte IAP-Persistenz `iap::flush_pending()` aus
+  dem SysTick-Shim bzw. vor dem Gast-Reload, z. B. Selfbus-EEPROM/OTA): sperrt Core 0 per `multicore_lockout_start_blocking()` aus. Dafür ist
   Core 0 in [main.cpp](../src/main.cpp) als `multicore_lockout_victim_init()`
   registriert; sein VTOR bleibt stets die SDK-Tabelle, der Lockout-Handler ist
   also immer erreichbar.
@@ -613,9 +613,19 @@ Mechanik (Read-Modify-Write je 4-KiB-Sektor):
   Firmware-Marker. Der Marker liegt in einem **eigenen Sektor direkt vor**
   dem 64-KiB-Slot – nicht im LPC-Sektor 15, damit Gast-Daten dort (sblib-
   EEPROM) und Marker sich nicht gegenseitig löschen.
-* IAP-Schreibzugriffe des Gasts (`copy`/`erase`/`erase page`) rufen nach dem
-  Schreiben ebenfalls `firmware_finalize()` auf und sind damit sofort
-  power-cycle-fest.
+* IAP-Schreibzugriffe des Gasts (`copy`/`erase`/`erase page`) ändern sofort
+  das RAM-Abbild; `persist()` merkt nur den Bereich vor. Ins RP2350-Flash
+  (`firmware_write` + `firmware_finalize`) geht er, sobald der letzte Zugriff
+  1 s zurückliegt (`iap::core1_poll()` im SysTick-Shim), spätestens vor dem
+  nächsten Gast-Reload. Früher lief jedes Kommando synchron (Sektor löschen +
+  programmieren, CRC über 64 KiB, Marker neu): Das Speichern des sblib-
+  User-EEPROMs (Erase + 3× Copy) hielt den Gast Hunderte ms an, und ein
+  T_Connect direkt nach `IndividualAddressWrite` ging verloren (ETS/
+  SB-Project: „send data connected failed“). Nicht von Core 0 aus: Core 1 ist
+  bei laufendem Gast nicht per Lockout anhaltbar (Gast würde gestoppt).
+  Ein Stromausfall innerhalb dieser Sekunde verliert den letzten Schreibvorgang.
+  Ist die Firmware inzwischen per Upload/ISP/Erase neu geschrieben
+  (`storage::firmware_seq()` geändert), wird der offene Bereich verworfen.
 * `firmware_discard()` verwirft den Sektor-Puffer nach einem Parse-/
   Transferfehler.
 

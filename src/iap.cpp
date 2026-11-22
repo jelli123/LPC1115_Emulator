@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstring>
 #include "pico/unique_id.h"
+#include "pico/critical_section.h"
+#include "fast_time.h"
 
 namespace iap {
 
@@ -43,16 +45,31 @@ bool dst_in_flash(uint32_t addr, uint32_t bytes) {
 // Laengen-/CRC-Marker. Ohne finalize ging der zuletzt beschriebene Sektor (z. B.
 // sblib-EEPROM) beim Power-Cycle verloren, und ein geflushter Sektor passte
 // nicht mehr zur Marker-CRC -> "keine Firmware" nach dem naechsten Boot.
+// Gast-Schreibzugriffe aendern sofort das RAM-Abbild; ins RP2350-Flash
+// geschrieben wird verzoegert (flush_pending). Frueher lief jedes IAP-Kommando
+// synchron: Sektor loeschen + programmieren, CRC ueber 64 KiB, Header neu -
+// beim Speichern des User-EEPROMs (sblib: Erase + 3x Copy) ~8 Loeschvorgaenge,
+// der Gast stand Hunderte ms. Ein T_Connect direkt nach IndividualAddressWrite
+// ging dabei verloren (ETS/SB-Project: "send data connected failed").
+// Geschrieben wird nur auf Core1 (SysTick-Shim bzw. vor dem Gast-Reload):
+// Core0 kann Core1 bei laufendem Gast nicht per Lockout anhalten.
+critical_section_t g_pend_cs;
+uint32_t g_pend_lo = 0, g_pend_hi = 0;     // [lo, hi), hi == 0: nichts offen
+uint64_t g_pend_t  = 0;                    // Zeit des letzten Gast-Schreibzugriffs
+uint32_t g_pend_seq = 0;                   // storage::firmware_seq() beim Eintrag
+
 void persist(uint32_t offset, uint32_t bytes) {
-    storage::firmware_write(offset, flash_image() + offset, bytes);
-    storage::firmware_finalize(offset + bytes);
+    critical_section_enter_blocking(&g_pend_cs);
+    if (g_pend_hi == 0) { g_pend_lo = offset; g_pend_hi = offset + bytes; g_pend_seq = storage::firmware_seq(); }
+    else {
+        if (offset < g_pend_lo) g_pend_lo = offset;
+        if (offset + bytes > g_pend_hi) g_pend_hi = offset + bytes;
+    }
+    g_pend_t = fast_time_us();
+    critical_section_exit(&g_pend_cs);
     g_dirty = true;
 }
 
-// Uebersetzt eine vom Gast uebergebene Adresse (LPC-Adressraum ODER bereits
-// relocierte RP2350-Adresse) in einen Host-Pointer auf Gast-RAM bzw. Flash-Image.
-// nullptr, wenn [addr, addr+bytes) nicht vollstaendig in einem der beiden liegt —
-// verhindert, dass der Gast ueber IAP beliebigen Host-Speicher liest.
 const uint8_t* guest_ptr(uint32_t addr, uint32_t bytes, bool allow_flash = true) {
     const uint32_t ram  = emulator::guest_ram_base();
     const uint32_t img  = emulator::load_base();
@@ -194,6 +211,7 @@ void read_uid(uint32_t w[4]) {
 }
 
 void init() {
+    if (!critical_section_is_initialized(&g_pend_cs)) critical_section_init(&g_pend_cs);
     g_stats = {};
     g_prepared_mask = 0;
     g_dirty = false;
@@ -257,5 +275,23 @@ void dispatch(uint32_t* param, uint32_t* result) {
 }
 
 Stats stats() { return g_stats; }
+
+void __not_in_flash_func(core1_poll)() {
+    if (g_pend_hi != 0 && fast_time_us() - g_pend_t >= 1'000'000u) flush_pending(1000);
+}
+
+bool flush_pending(uint32_t min_age_ms) {
+    critical_section_enter_blocking(&g_pend_cs);
+    const uint32_t lo = g_pend_lo, hi = g_pend_hi, seq = g_pend_seq;
+    const bool due = hi != 0 && fast_time_us() - g_pend_t >= static_cast<uint64_t>(min_age_ms) * 1000u;
+    if (due) g_pend_hi = 0;
+    critical_section_exit(&g_pend_cs);
+    if (!due) return false;
+    // Inzwischen per Upload/ISP/Erase neu geschrieben: altes Abbild verwerfen.
+    if (storage::firmware_seq() != seq) return false;
+    storage::firmware_write(lo, flash_image() + lo, hi - lo);
+    storage::firmware_finalize(hi);
+    return true;
+}
 
 } // namespace iap
