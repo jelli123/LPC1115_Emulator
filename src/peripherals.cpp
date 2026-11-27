@@ -2804,13 +2804,15 @@ void __not_in_flash_func(ssp_write_byte)(uint32_t idx, uint32_t off, uint8_t val
 // STAT-Codes) auf SDK-Transfers ab:
 //   • Schreib-Transaktionen werden gepuffert und beim STOP bzw. beim
 //     wiederholten START (nostop=true) auf den Bus geschrieben.
-//   • Lese-Transaktionen lesen Byte-für-Byte lazy (nostop bis zum letzten,
-//     gesteuert über das AA-Bit) — funktioniert für die üblichen
-//     Auto-Increment-Slaves (Sensoren, EEPROMs, write-reg-then-read).
+//   • Lese-Transaktionen lesen Byte für Byte direkt über den Controller in
+//     einer Bus-Transaktion; AA=0 kennzeichnet das letzte Byte (mit STOP).
 //
-// Ist die Bridge nicht aktiviert/initialisiert, fällt das Modell auf das
-// alte Stub-Verhalten zurück (STAT=0xF8 idle, NAK 0x20 auf START), damit
-// Apps ohne angeschlossenen Slave weiter booten.
+// Wie beim LPC setzt jeder Zustandswechsel SI; der nächste Schritt beginnt,
+// wenn der Gast SI löscht. Das gilt im Interrupt- wie im Polling-Modus (sblib
+// pollt SI ohne Timeout – ohne SI hing jede Übertragung für immer).
+//
+// Ist die Bridge nicht aktiviert/initialisiert, meldet das Modell START und
+// danach NAK auf die Adresse (0x20/0x48), damit Apps ohne Slave weiterlaufen.
 //
 // Bekannte Grenze: Adress-ACK bei reinen Schreib-Transaktionen wird optimi-
 // stisch (0x18/0x28) gemeldet; das echte NAK-Ergebnis steht erst beim Flush
@@ -2822,9 +2824,10 @@ struct I2cModel {
     // Bridge-Transaktionszustand
     uint8_t  addr7;       // 7-Bit-Slave-Adresse der aktuellen Transaktion
     bool     is_read;     // Richtung
-    bool     started;     // START gesendet, Adresse noch nicht
+    bool     in_txn;      // START gesendet, noch kein STOP
+    bool     pending;     // SI wurde gelöscht, Hardware-Schritt steht an
     bool     addr_done;   // Adressbyte verarbeitet
-    bool     any_started; // schon mindestens ein START in dieser Sitzung
+    bool     rfirst;      // nächstes gelesenes Byte ist das erste der Transaktion
     uint8_t  wbuf[64];    // Puffer für Schreibdaten
     uint8_t  wlen;
 };
@@ -2856,21 +2859,156 @@ void i2c_bridge_init() {
     g_i2c_ready = true;
 }
 
-// Puffer-Schreibtransaktion auf den Bus schieben. nostop=true hält den Bus
-// für einen folgenden (Repeated-START-)Lesezugriff offen.
-void i2c_flush_write(bool nostop) {
-    if (!g_i2c_ready || g_i2c.wlen == 0) { g_i2c.wlen = 0; return; }
-    int r = i2c_write_timeout_us(g_i2c_hw, g_i2c.addr7, g_i2c.wbuf,
-                                 g_i2c.wlen, nostop, 5000u * (g_i2c.wlen + 1));
-    if (r < 0) g_i2c.stat = 0x30u;  // Datentransfer NAK
+// Schreibpuffer auf den Bus schieben. nostop=true hält den Bus für einen
+// folgenden Repeated START offen. Liefert false bei NAK/Timeout.
+bool i2c_flush_write(bool nostop) {
+    uint8_t n = g_i2c.wlen;
     g_i2c.wlen = 0;
+    if (n == 0) return true;
+    if (!g_i2c_ready) return false;
+    int r = i2c_write_timeout_us(g_i2c_hw, g_i2c.addr7, g_i2c.wbuf, n,
+                                 nostop, 5000u * (n + 1u));
+    return r == n;
+}
+
+// Ein Byte direkt über den DW-I²C-Controller lesen. Anders als
+// i2c_read_timeout_us() schaltet das den Controller zwischen den Bytes nicht
+// ab und schickt keinen Repeated START: alle Bytes einer LPC-Lese-
+// transaktion bleiben eine Bus-Transaktion (wichtig z. B. für SHT4x).
+bool i2c_hw_read_byte(bool last, uint8_t& out) {
+    if (!g_i2c_ready) return false;
+    i2c_hw_t* hw = i2c_get_hw(g_i2c_hw);
+    bool first = g_i2c.rfirst;
+    g_i2c.rfirst = false;
+    if (first && (hw->tar & 0x3FFu) != g_i2c.addr7) {
+        hw->enable = 0;
+        hw->tar    = g_i2c.addr7;
+        hw->enable = 1;
+    }
+    hw->data_cmd = bool_to_bit(first && g_i2c_hw->restart_on_next) << I2C_IC_DATA_CMD_RESTART_LSB |
+                   bool_to_bit(last) << I2C_IC_DATA_CMD_STOP_LSB |
+                   I2C_IC_DATA_CMD_CMD_BITS;
+    uint64_t deadline = time_us_64() + 5000u;
+    for (;;) {
+        if (hw->raw_intr_stat & I2C_IC_RAW_INTR_STAT_TX_ABRT_BITS) {
+            (void)hw->clr_tx_abrt;           // Abbruch (z. B. Adress-NAK), STOP kam von der HW
+            g_i2c_hw->restart_on_next = false;
+            return false;
+        }
+        if (hw->rxflr) {
+            out = static_cast<uint8_t>(hw->data_cmd & 0xFFu);
+            g_i2c_hw->restart_on_next = !last;
+            return true;
+        }
+        if (time_us_64() > deadline) {
+            hw->enable = 0;                  // Controller zurücksetzen
+            hw->enable = 1;
+            g_i2c_hw->restart_on_next = false;
+            return false;
+        }
+    }
+}
+
+// Lesetransaktion ohne abschließendes STOP-Byte beenden (Gast setzt STO,
+// bevor das letzte Byte mit AA=0 gelesen wurde).
+void i2c_hw_release() {
+    if (!g_i2c_ready || !g_i2c_hw->restart_on_next) return;
+    i2c_hw_t* hw = i2c_get_hw(g_i2c_hw);
+    hw_set_bits(&hw->enable, I2C_IC_ENABLE_ABORT_BITS);
+    uint64_t deadline = time_us_64() + 2000u;
+    while ((hw->enable & I2C_IC_ENABLE_ABORT_BITS) && time_us_64() < deadline) {}
+    (void)hw->clr_tx_abrt;
+    g_i2c_hw->restart_on_next = false;
 }
 
 void i2c_reset_txn() {
-    g_i2c.started   = false;
+    g_i2c.in_txn    = false;
+    g_i2c.pending   = false;
     g_i2c.addr_done = false;
     g_i2c.wlen      = 0;
     g_i2c.stat      = 0xF8u;
+}
+
+// Neuer Zustand: STAT setzen, SI setzen, ggf. Interrupt.
+void i2c_set_state(uint32_t code) {
+    g_i2c.stat    = code;
+    g_i2c.conset |= I2C_SI;
+    if (g_i2c.conset & I2C_I2EN) irq_inject::pend(lpc_irq::I2C0);
+}
+
+// Hardware-Schritt. Wie beim LPC handelt die Hardware nur bei SI=0: START aus
+// dem Ruhezustand sofort, sonst einmal nach jedem Löschen von SI.
+void i2c_step() {
+    if (!(g_i2c.conset & I2C_I2EN) || (g_i2c.conset & I2C_SI)) return;
+    const bool sta = (g_i2c.conset & I2C_STA) != 0;
+    const bool sto = (g_i2c.conset & I2C_STO) != 0;
+
+    if (!g_i2c.in_txn) {
+        if (sto) g_i2c.conset &= ~I2C_STO;
+        if (sta) {
+            g_i2c.in_txn    = true;
+            g_i2c.addr_done = false;
+            i2c_set_state(0x08u);
+        }
+        return;
+    }
+    if (!g_i2c.pending) return;
+    g_i2c.pending = false;
+
+    if (sto) {
+        if (g_i2c.addr_done) {
+            if (g_i2c.is_read) i2c_hw_release();
+            else               i2c_flush_write(/*nostop=*/false);
+        }
+        g_i2c.conset &= ~I2C_STO;           // STO ist selbstlöschend
+        i2c_reset_txn();
+        if (sta) {                           // STOP + START
+            g_i2c.in_txn = true;
+            i2c_set_state(0x08u);
+        }
+        return;
+    }
+    if (sta) {                               // Repeated START
+        bool ok = true;
+        if (g_i2c.addr_done && !g_i2c.is_read) ok = i2c_flush_write(/*nostop=*/true);
+        g_i2c.addr_done = false;
+        // Die gepufferten Schreibdaten wurden erst jetzt gesendet: ein NAK
+        // darauf als "Daten-NAK" melden, damit der Gast abbricht.
+        i2c_set_state(ok ? 0x10u : 0x30u);
+        return;
+    }
+
+    switch (g_i2c.stat) {
+        case 0x08u:
+        case 0x10u:                          // Adressbyte (SLA+R/W) aus DAT
+            g_i2c.addr7     = static_cast<uint8_t>((g_i2c.dat >> 1) & 0x7Fu);
+            g_i2c.is_read   = (g_i2c.dat & 1u) != 0;
+            g_i2c.addr_done = true;
+            g_i2c.wlen      = 0;
+            g_i2c.rfirst    = true;
+            if (!g_i2c_ready)        i2c_set_state(g_i2c.is_read ? 0x48u : 0x20u);  // kein Slave
+            else                     i2c_set_state(g_i2c.is_read ? 0x40u : 0x18u);  // ACK optimistisch
+            break;
+        case 0x18u:
+        case 0x28u:                          // Datenbyte senden (gepuffert)
+            if (g_i2c.wlen < sizeof g_i2c.wbuf) g_i2c.wbuf[g_i2c.wlen++] = static_cast<uint8_t>(g_i2c.dat);
+            i2c_set_state(0x28u);
+            break;
+        case 0x40u:
+        case 0x50u: {                        // Byte empfangen, AA=0 → letztes Byte
+            bool last = (g_i2c.conset & I2C_AA) == 0;
+            uint8_t b = 0;
+            if (!i2c_hw_read_byte(last, b)) {
+                i2c_set_state(0x48u);        // NAK (Adresse oder Slave weg)
+            } else {
+                g_i2c.dat = b;
+                i2c_set_state(last ? 0x58u : 0x50u);
+            }
+            break;
+        }
+        default:                             // NAK-/Endzustände: nur STA/STO führen weiter
+            break;
+    }
 }
 
 uint8_t i2c_read_byte(uint32_t addr) {
@@ -2878,81 +3016,32 @@ uint8_t i2c_read_byte(uint32_t addr) {
     switch (addr & ~3u) {
         case I2C_CONSET: return static_cast<uint8_t>((g_i2c.conset >> lane) & 0xFFu);
         case I2C_STAT:   return static_cast<uint8_t>((g_i2c.stat   >> lane) & 0xFFu);
-        case I2C_DAT: {
-            // Lazy-Read: nächstes Byte vom realen Slave holen.
-            if (g_i2c_ready && g_i2c.addr_done && g_i2c.is_read) {
-                bool last = (g_i2c.conset & I2C_AA) == 0;   // AA=0 → letztes Byte
-                uint8_t b = 0;
-                int r = i2c_read_timeout_us(g_i2c_hw, g_i2c.addr7, &b, 1,
-                                            /*nostop=*/!last, 5000u);
-                if (r < 0) {
-                    g_i2c.stat = 0x48u;        // (Adress-)NAK beim Empfang
-                } else {
-                    g_i2c.dat  = b;
-                    g_i2c.stat = last ? 0x58u : 0x50u;
-                }
-            }
-            return static_cast<uint8_t>((g_i2c.dat >> lane) & 0xFFu);
-        }
+        case I2C_DAT:    return static_cast<uint8_t>((g_i2c.dat    >> lane) & 0xFFu);
         default: return 0;
     }
 }
 
 void i2c_write_byte(uint32_t addr, uint8_t val) {
-    uint32_t lane = (addr & 3u) * 8u;
-    auto patch = [&](uint32_t& v) {
-        v = (v & ~(0xFFu << lane)) | (static_cast<uint32_t>(val) << lane);
-    };
+    // Alle relevanten Bits liegen im untersten Byte; der Gast schreibt Wörter
+    // als 4 Einzelbytes, die oberen Lanes werden ignoriert.
+    if ((addr & 3u) != 0u) return;
     uint32_t reg = addr & ~3u;
 
-    if (reg == I2C_CONCLR) {
-        g_i2c.conset &= ~(static_cast<uint32_t>(val) << lane);
-        return;
-    }
     if (reg == I2C_DAT) {
-        if (g_i2c.started && !g_i2c.addr_done) {
-            // Adressbyte (SLA + R/W)
-            g_i2c.addr7     = static_cast<uint8_t>(val >> 1);
-            g_i2c.is_read   = (val & 1u) != 0;
-            g_i2c.addr_done = true;
-            g_i2c.stat      = g_i2c.is_read ? 0x40u : 0x18u;  // SLA+R/W ACK (optimistisch)
-        } else if (g_i2c.addr_done && !g_i2c.is_read) {
-            // Schreibdaten puffern
-            if (g_i2c.wlen < sizeof g_i2c.wbuf) g_i2c.wbuf[g_i2c.wlen++] = static_cast<uint8_t>(val);
-            g_i2c.stat = 0x28u;  // Daten gesendet, ACK
-        }
-        patch(g_i2c.dat);
-        if (g_i2c.conset & I2C_I2EN) irq_inject::pend(lpc_irq::I2C0);
+        g_i2c.dat = val;
         return;
     }
-    if (reg != I2C_CONSET) { patch(g_i2c.dat); return; }
-
-    // --- CONSET ---
-    patch(g_i2c.conset);
-
-    if (g_i2c.conset & I2C_STO) {
-        // STOP: ausstehende Schreibtransaktion abschließen.
-        if (g_i2c.addr_done && !g_i2c.is_read) i2c_flush_write(/*nostop=*/false);
-        g_i2c.conset &= ~I2C_STO;   // STO ist selbstlöschend
-        i2c_reset_txn();
+    if (reg == I2C_CONCLR) {
+        bool si_cleared = (g_i2c.conset & I2C_SI) && (val & I2C_SI);
+        g_i2c.conset &= ~static_cast<uint32_t>(val);
+        if (val & I2C_I2EN) { i2c_reset_txn(); return; }
+        if (si_cleared && g_i2c.in_txn) g_i2c.pending = true;
+        i2c_step();
         return;
     }
-    if (g_i2c.conset & I2C_STA) {
-        // (Wiederholter) START. Bei laufender Schreibtransaktion zuerst den
-        // Bus mit nostop=true offenhalten, dann neu adressieren.
-        if (g_i2c.addr_done && !g_i2c.is_read && g_i2c.wlen > 0)
-            i2c_flush_write(/*nostop=*/true);
-        bool repeated = g_i2c.any_started;
-        g_i2c.started     = true;
-        g_i2c.any_started = true;
-        g_i2c.addr_done   = false;
-        if (!g_i2c_ready) {
-            // Stub: kein Slave → START gemeldet, danach NAK beim Adress-Send.
-            g_i2c.stat = 0x20u;
-        } else {
-            g_i2c.stat = repeated ? 0x10u : 0x08u;
-        }
-        if (g_i2c.conset & I2C_I2EN) irq_inject::pend(lpc_irq::I2C0);
+    if (reg == I2C_CONSET) {
+        g_i2c.conset |= val;
+        i2c_step();
         return;
     }
 }
@@ -3152,7 +3241,6 @@ void reset() {
     g_i2c = {};
     g_i2c.stat = 0xF8u;
     i2c_reset_txn();
-    g_i2c.any_started = false;
     std::memset(g_pmu, 0, sizeof g_pmu);
     g_start_aprp = g_start_erp = g_start_srp = 0;
     g_start_primed = false;
